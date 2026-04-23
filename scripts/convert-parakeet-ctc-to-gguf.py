@@ -52,7 +52,21 @@ import yaml
 
 
 ARCH = "parakeet-ctc"
-QUANT_CHOICES = ["f32", "f16"]
+QUANT_CHOICES = ["f32", "f16", "q8_0", "q5_0", "q4_0"]
+
+QUANT_MAP = {
+    "q8_0": gguf.GGMLQuantizationType.Q8_0,
+    "q5_0": gguf.GGMLQuantizationType.Q5_0,
+    "q4_0": gguf.GGMLQuantizationType.Q4_0,
+}
+
+FILE_TYPE_MAP = {
+    "f32":  gguf.LlamaFileType.ALL_F32,
+    "f16":  gguf.LlamaFileType.MOSTLY_F16,
+    "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
+    "q5_0": gguf.LlamaFileType.MOSTLY_Q5_0,
+    "q4_0": gguf.LlamaFileType.MOSTLY_Q4_0,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,7 +167,7 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
 
     writer.add_name("parakeet-ctc-0.6b")
     writer.add_description("NVIDIA Parakeet-CTC-0.6B FastConformer ASR (CC-BY-4.0)")
-    writer.add_file_type(gguf.LlamaFileType.ALL_F32 if quant == "f32" else gguf.LlamaFileType.MOSTLY_F16)
+    writer.add_file_type(FILE_TYPE_MAP[quant])
 
     writer.add_uint32("parakeet.encoder.d_model",                     d_model)
     writer.add_uint32("parakeet.encoder.n_layers",                    n_layers)
@@ -217,13 +231,25 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     window = as_np(sd["preprocessor.featurizer.window"], np.float32)
     writer.add_tensor("preproc.window", window)
 
-    weight_dtype = np.float16 if quant == "f16" else np.float32
+    if quant == "f32":
+        fallback_dtype = np.float32
+    else:
+        fallback_dtype = np.float16
 
-    def add_2d(name: str, t: torch.Tensor):
-        writer.add_tensor(name, as_np(t, weight_dtype))
+    qtype = QUANT_MAP.get(quant)
 
     def add_f32(name: str, t: torch.Tensor):
         writer.add_tensor(name, as_np(t, np.float32))
+
+    def add_2d(name: str, t: torch.Tensor):
+        arr = as_np(t, np.float32)
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr.squeeze(-1)
+        if qtype is None or arr.shape[-1] % 32 != 0:
+            writer.add_tensor(name, arr.astype(fallback_dtype, copy=False))
+            return
+        packed = gguf.quants.quantize(arr, qtype)
+        writer.add_tensor(name, packed, raw_dtype=qtype)
 
     add_2d ("encoder.subsampling.conv0.weight",  sd["encoder.pre_encode.conv.0.weight"])
     add_f32("encoder.subsampling.conv0.bias",    sd["encoder.pre_encode.conv.0.bias"])
@@ -251,12 +277,22 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
 
         add_f32(f"{p}.norm_attn.weight",  sd[f"{k}.norm_self_att.weight"])
         add_f32(f"{p}.norm_attn.bias",    sd[f"{k}.norm_self_att.bias"])
-        add_2d (f"{p}.attn.q.weight",     sd[f"{k}.self_attn.linear_q.weight"])
-        add_f32(f"{p}.attn.q.bias",       sd[f"{k}.self_attn.linear_q.bias"])
-        add_2d (f"{p}.attn.k.weight",     sd[f"{k}.self_attn.linear_k.weight"])
-        add_f32(f"{p}.attn.k.bias",       sd[f"{k}.self_attn.linear_k.bias"])
-        add_2d (f"{p}.attn.v.weight",     sd[f"{k}.self_attn.linear_v.weight"])
-        add_f32(f"{p}.attn.v.bias",       sd[f"{k}.self_attn.linear_v.bias"])
+        q_w = sd[f"{k}.self_attn.linear_q.weight"]
+        k_w = sd[f"{k}.self_attn.linear_k.weight"]
+        v_w = sd[f"{k}.self_attn.linear_v.weight"]
+        q_b = sd[f"{k}.self_attn.linear_q.bias"]
+        k_b = sd[f"{k}.self_attn.linear_k.bias"]
+        v_b = sd[f"{k}.self_attn.linear_v.bias"]
+
+        add_2d (f"{p}.attn.q.weight",     q_w)
+        add_f32(f"{p}.attn.q.bias",       q_b)
+        add_2d (f"{p}.attn.k.weight",     k_w)
+        add_f32(f"{p}.attn.k.bias",       k_b)
+        add_2d (f"{p}.attn.v.weight",     v_w)
+        add_f32(f"{p}.attn.v.bias",       v_b)
+
+        add_2d (f"{p}.attn.qkv.weight",   torch.cat([q_w, k_w, v_w], dim=0))
+        add_f32(f"{p}.attn.qkv.bias",     torch.cat([q_b, k_b, v_b], dim=0))
         add_2d (f"{p}.attn.out.weight",   sd[f"{k}.self_attn.linear_out.weight"])
         add_f32(f"{p}.attn.out.bias",     sd[f"{k}.self_attn.linear_out.bias"])
         add_2d (f"{p}.attn.pos.weight",   sd[f"{k}.self_attn.linear_pos.weight"])

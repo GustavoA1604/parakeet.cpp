@@ -484,18 +484,324 @@ ms.  FFN + Conv are a close 3-way tie around 20% each.
 Cumulative: **40% reduction in encoder best-case** (1032 → 627 ms).
 RTF best 0.058 = **17.4× real-time** on CPU alone.
 
-### 5.10 — still planned
+### 5.11 — round 5: attention optimisation attempts  _(investigated, shipped as dormant infrastructure)_
 
-  - **Attention optimisation.**  Now the biggest single slice at 232
-    ms / 26%.  Candidate wins: fuse q/k/v into one matmul with a
-    packed weight (3× d_model rows in one matrix), reconsider the
-    many `ggml_permute + ggml_cont` in rel-pos MHA, or just let
-    BLAS-backed GEMM handle the bigger matmul sizes there where the
-    comparison shifts in Accelerate's favor.
-  - Block-quantized weights (Q4_0 / Q5_0 / Q8_0).  Would halve /
-    quarter memory bandwidth on the FFN's 1024×4096 matrices, which
-    are the largest in the model — potentially another 80–150 ms.
-    Needs converter change + verification that parity stays tight.
-  - Metal backend + `ggml_backend_sched` for GPU offload (future
-    phase outside CPU-only scope).  The backend-buffer rework from
-    round 2 is what the sched will need to plumb through.
+Two attention-path experiments, both motivated by PROGRESS 5.8's
+attention-as-biggest-slice finding (26 % of encoder wall time after
+the Round 4 conv rewrite).
+
+1. **Packed QKV matmul.**  Converter now emits
+   `encoder.blk.{i}.attn.qkv.{weight,bias}` in addition to the three
+   separate `q/k/v.{weight,bias}` tensors.  `BlockWeights` has
+   `attn_qkv_w/b` fields; `load_from_gguf` picks them up optionally.
+   The graph branches on `W.attn_qkv_w != nullptr` — packed path does
+   one `ggml_mul_mat` + bias + `reshape_4d(HD, H, 3, T)` + three
+   `ggml_view_3d` slices to extract Q/K/V.
+
+2. **`ggml_cont` pruning around `q/k/v/p_perm` permutes.**  mul_mat
+   and ggml_add accept non-contiguous src as long as `nb00 == type_size`,
+   so the `cont` could in principle be dropped for k_perm and p_perm
+   (used directly as mul_mat src0) and for q_perm (materialised by the
+   downstream add with pos_bias_u/v).
+
+**Result on M3 Ultra, CPU-only.**  Neither change produced a reliable
+win above the ~15% bench-to-bench stdev, and some configurations
+regressed.
+
+Root causes (measured):
+
+- The packed output lays out Q/K/V in a single 3×d_model row, so the
+  per-slice T stride is 3 * HD * H * 4 = 12 KB vs the natural 4 KB for
+  separate matmuls.  The subsequent `cont(permute)` does a strided copy
+  that's roughly 3× more cache-unfriendly — net slower than the three
+  smaller matmuls ggml-cpu already runs in parallel.
+- Dropping `cont` on k_perm/p_perm pushes the strided reads into the
+  mul_mat kernel itself, which on ggml-cpu's f16×f32 SIMD path is a
+  slower code path than contiguous src0.  The `cont` copy was
+  effectively buying a faster subsequent mul_mat.
+- Fresh per-block substage profile (after all Round 4 changes, packed
+  QKV kept dormant in graph):
+
+```
+   FF1  (macaron)   6.07 ms  (21% of block)
+   Attention        5.72 ms  (20%)          ← no longer biggest
+   Conv module      7.90 ms  (28%)          ← biggest on this machine
+   FF2  (macaron)   6.40 ms  (23%)
+   norm_out         0.04 ms  ( 0%)
+```
+
+Attention is no longer dominant on M3 Ultra — the conv module's
+`ggml_conv_1d_dw` (im2col+matmul) path and `pw1`/`pw2` matmuls are now
+the single biggest slice.  FFN remains the largest aggregate (43%)
+and is the right target for Round 6 (block quantization).
+
+**Shipped:** packed-QKV tensor emission in the converter,
+`BlockWeights::attn_qkv_{w,b}`, and the optional load path.  Graph
+still uses the 3-matmul path.  Infrastructure is dormant but kept
+because Round 7's `ggml_flash_attn_ext` experiment will want the
+packed Q/K/V regardless.
+
+**Not shipped:** any graph-level change.  The baseline (reverted to
+pre-Round-5 attention) is the current code.
+
+Bench snapshot on `sample-16k.wav` (20.1 s, `--bench-warmup 3
+--bench-runs 10`, OpenMP, 10 threads):
+
+```
+                    mean     med      min      max     std
+encoder    ms    1316.70 1245.81  1193.73  1559.76   140.71
+RTF (median/best) = 0.063 / 0.060
+```
+
+Snapshot: `artifacts/bench/ggml-cpu-round5-m3ultra.json`.
+
+### 5.12 — round 6: block-quantized weights  _(done — biggest CPU win so far)_
+
+Quantize the ~150 largest 2D weight matrices per block (FFN, attention
+q/k/v/qkv/out/pos, conv pointwise, subsampling out, CTC head) using
+ggml-cpu's hand-tuned Q8_0 / Q5_0 / Q4_0 kernels.  Small tensors
+(biases, norms, fused BN, mel filterbank, depthwise kernels, tiny 2D
+subsampling convs) stay at f32 / f16 because their innermost dim
+doesn't divide the 32-element block size.
+
+Converter side (`scripts/convert-parakeet-ctc-to-gguf.py`):
+
+  - New `--quant {f32, f16, q8_0, q5_0, q4_0}`.
+  - Single `add_2d` helper routes each 2D weight through
+    `gguf.quants.quantize(arr, qtype)` when the inner dim % 32 == 0,
+    with an f16 fallback otherwise. Squeezes the trailing 1 on
+    `conv.pw{1,2}.weight` so they can be quantized.
+  - File-type header updated to match the selected quant
+    (`LlamaFileType.MOSTLY_Q8_0` etc.).
+
+C++ side (`src/parakeet_ctc.cpp`):
+
+  - No graph changes needed. `ggml_mul_mat` dispatches to the Q8_0 /
+    Q5_0 / Q4_0 kernel automatically based on src0's stored type.
+  - `load_from_gguf` already used `ggml_nbytes(t)` to size the read,
+    which correctly accounts for block-aligned storage.
+  - `conformer_conv_graph`'s `ggml_reshape_2d(W.conv_pw1_w, d_model,
+    2*d_model)` becomes a metadata-only identity after the converter
+    squeeze (pw1 already stored as 2D (1024, 2048)); reshape_2d still
+    accepts the shape and works on quantized src.
+
+Parity (tested on `jfk.wav` + `sample-16k.wav`): **transcript is
+bit-equal to NeMo PyTorch at every quantization level, including
+Q4_0**.  Per-stage rel error grows as expected: f16 ~1.6e-3 → Q8_0
+~5.5e-3 → Q4_0 ~3.3e-2.  Rel drift does NOT translate into token
+drift on clean speech in these tests.
+
+Bench results on M3 Ultra, 10 ggml-cpu threads, `--bench-warmup 3
+--bench-runs 10`:
+
+| variant | file    | enc best (20 s) | enc median (20 s) | enc best (11 s) | enc median (11 s) |
+|---------|---------|----------------:|------------------:|----------------:|------------------:|
+| f16     | 1.3 GiB | 1194            | 1246              | 683             | 796               |
+| Q8_0    | 697 MiB | **999**         | 1209              | **600**         | **655**           |
+| Q5_0    | 453 MiB | 1475            | 1614              | ~650            | —                 |
+| Q4_0    | 372 MiB | 1080            | 1286              | 595             | 637               |
+
+**Key findings:**
+
+  - **Q8_0 is the speed + parity sweet spot.** Best-case encoder time
+    drops from 1194 → 999 ms on the 20 s clip (-16 %), and from 683
+    → 600 ms on the 11 s clip (-12 %).  RTF best 0.050 on 20 s
+    (20x real-time on CPU alone).
+  - **Q4_0 is a valid size tier.** ~10 % slower than Q8_0 on average
+    but model shrinks to 372 MiB (3.5x smaller than f16), with the
+    same bit-equal transcript.
+  - **Q5_0 is a trap on this machine.** File size drops to 453 MiB
+    (smaller than Q8_0) but the ggml-cpu Q5_0 mul_mat kernel is
+    noticeably slower than either Q8_0 or Q4_0 on Apple Silicon.
+    Shipped anyway for the size tier, not recommended for speed.
+  - **Model load time improves too** (bandwidth-bound): f16 312 ms →
+    Q8_0 166 ms → Q4_0 96 ms on 20 s benches.
+
+Remaining gap vs ONNX (20 s clip): **Q8_0 999 ms vs ONNX 944 ms** —
+from 317 ms gap to ~55 ms (**83 % of the remaining gap closed with
+Round 6 alone**).
+
+Snapshots:
+  - `artifacts/bench/ggml-cpu-round6-q8_0-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round6-q5_0-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round6-q4_0-m3ultra.json`
+
+### 5.13 — round 7: flash_attn_ext experiment  _(investigated, not shipped)_
+
+`ggml_flash_attn_ext(q, k, v, mask, scale, max_bias, logit_softcap)`
+fuses `softmax(q @ k^T * scale + mask) @ v` into a single op.
+Prototyped it behind `#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN` in
+`rel_pos_mha_graph`:
+
+  - Compute the Transformer-XL rel-pos BD branch exactly as before
+    (`bd_final` of shape `(T, T, H)`).
+  - Pre-scale BD by `1/sqrt(HD)` (flash_attn_ext applies the `scale`
+    argument only to `q@k^T`, the mask is added as-is).
+  - Cast BD to f16 (CPU backend requires f16 mask — `ggml.c` line 5320).
+  - Call `ggml_flash_attn_ext(q_u, k_perm, v_perm, bd_mask, scale,
+    0.0f, 0.0f)` — skips the explicit `ac = mul_mat(k, q_u)`, the
+    `ac + bd_final` add, the `soft_max`, the second mul_mat on V,
+    and the `v_for_mm = cont(permute(v_perm, 1, 0, 2, 3))` copy.
+  - Output layout `(HD, H, T)` feeds directly into `reshape_2d(HD*H, T)`
+    without the extra permute+cont tail of the non-flash path.
+
+Parity: all 9 `test-encoder` gates pass.  `block_last` rel drifts from
+1.9e-3 → 4.2e-3 (f16 mask cast adds one quantization step), still
+under the 5e-3 threshold.
+
+**Bench result on M3 Ultra, ggml-cpu Q8_0, 3x(warmup 3 + runs 10):**
+
+| clip           | non-flash best | flash best | non-flash median | flash median |
+|----------------|---------------:|-----------:|-----------------:|-------------:|
+| jfk.wav (T=138)|            529 |        559 |              561 |          606 |
+| sample-16k.wav (T=251)| 1037 |       1087 |             1168 |         1157 |
+
+Flash_attn_ext is neutral-to-slower on CPU at these sequence lengths.
+The overhead of the f16 BD mask cast and the extra BD pre-scale offset
+the savings from fusing the four attention ops, and ggml-cpu's
+`q_u @ k_perm^T` matmul is already well-tuned for T ~ 140–250.
+
+**Gate** (per plan: ship if encoder median drops >=30 ms): FAILED.
+
+**Shipped:** code is preserved behind `#ifdef
+PARAKEET_EXPERIMENTAL_FLASH_ATTN` (default off). The Metal backend
+phase will want to revisit this — flash-attn typically wins big on
+GPU where softmax + V-multiply fuse into one kernel pass.
+
+### 5.14 — round 8a: conv module depthwise rewrite  _(done — second-biggest CPU win)_
+
+Swapped `ggml_conv_1d_dw` (im2col + mul_mat path) for
+`ggml_conv_2d_dw_direct` on the Conformer depthwise kernel in
+`conformer_conv_graph`.
+
+Implementation:
+
+  - The existing conv.dw.weight stored shape `(d_model, 1, 9)` —
+    `ggml_reshape_4d(W.conv_dw_w, conv_kernel, 1, 1, d_model)` gives
+    the `(KW=9, KH=1, 1, C=d_model)` layout that
+    `ggml_conv_2d_dw_direct` requires.
+  - Wrap yt from `(T, d_model, 1, 1)` into `(W=T, H=1, C=d_model, N=1)`
+    via `ggml_reshape_4d`, run the op, unwrap back to `(T, d_model, 1)`
+    via `ggml_reshape_3d`.
+  - The CPU backend's depthwise kernel accesses the filter as
+    `const float *`, so we `ggml_cast(W.conv_dw_w, GGML_TYPE_F32)` once
+    (graph-build time, small cost — 9*d_model elements) when the
+    stored type is f16.  Alternative would be storing as f32 at
+    convert time; the cast is simpler and works on all existing
+    GGUFs.
+
+Parity: all 9 `test-encoder` stages pass.  block_last rel is
+essentially unchanged (1.73e-3 vs 1.60e-3 previously).
+
+**Bench on M3 Ultra, Q8_0, 15 timed runs, 5 warmup:**
+
+| clip                   | enc best before | enc best after | delta | enc median before | enc median after |
+|------------------------|----------------:|---------------:|------:|------------------:|-----------------:|
+| jfk.wav (11 s)         |             529 |        **460** |  -13% |               561 |          **481** |
+| sample-16k.wav (20.1 s)|            1000 |        **839** |  -16% |              1208 |          **882** |
+
+This single op swap is ~100–200 ms cheaper than the im2col+mul_mat
+path across 24 blocks. The previous profiler breakdown attributed
+28 % of encoder time to the conv module; after this change it drops
+meaningfully, and the remaining sub-stages are roughly a three-way
+tie between FF1, FF2, and attention.
+
+**Measured vs ONNX Runtime** (20 s clip): Q8_0 + conv_2d_dw_direct
+best 839 ms vs ONNX 944 ms — **ggml-cpu is now 12 % faster than
+ONNX on best-case encoder**. Round 4's 317 ms gap is entirely
+closed.
+
+Snapshots: `artifacts/bench/ggml-cpu-round8a-q8_0-m3ultra.json`.
+
+### 5.15 — round 8b: subsampling mask fast-path  _(done — neutral)_
+
+Added an `all_valid` flag threaded through `build_encoder_graph_cached`
+and `subsampling_graph`. When the caller's mel has no trailing
+silence (`mel_valid == n_mel_frames`, the common case for a single
+utterance), the 8 `apply_time_mask` `ggml_mul` calls in
+`subsampling_graph` are skipped — the graph is built without those
+ops at all.  `EncoderGraph` caches the `all_valid` value so the graph
+is rebuilt when it flips.
+
+Parity: all 9 `test-encoder` gates still pass (the test sends a
+padded mel, so `all_valid=false` and the masked path runs).
+
+**Bench impact**: within noise (~0-10 ms), because the mask ops were
+already small element-wise muls and ggml-cpu runs them cheaply in the
+OpenMP pool.  Shipped anyway for correctness hygiene — running a
+no-op mul_by_ones is silly — and because the infrastructure enables
+the Round 8c LRU cache to cleanly key on `all_valid`.
+
+### 5.16 — round 8c: multi-shape LRU graph cache  _(done — latent win)_
+
+Replaced the single-shape `Impl::encoder_graph` with a small LRU
+`std::vector<std::unique_ptr<EncoderGraph>>` of up to 3 entries. The
+cache key is `(n_mel_frames, n_run_layers, all_valid)`.
+
+Behaviour:
+
+  - On `run_encoder`, scan the cache for a matching entry. If found,
+    reuse it and move it to the back (most-recently-used).
+  - If no match, evict the oldest entry (if cache is full) and build
+    a new graph for the current shape.
+  - Graph rebuild only happens on a genuine shape change; previously
+    any shape change freed the single cached graph and rebuilt it.
+
+This is a **latent** optimisation: the benchmark mode reuses one shape
+and shows no change.  The win shows up in production callers that
+alternate between a few utterance lengths (streaming, short-burst
+input, etc.) — those paths avoid the ~20-50 ms graph rebuild cost on
+every length change.
+
+Parity: unchanged. Transcripts bit-equal on both test clips.
+
+### 5.17 — summary, Round 5-8
+
+| round              | code        | jfk best | 20s best | vs ONNX best (944) |
+|--------------------|:-----------:|---------:|---------:|-------------------:|
+| pre-Round-5        | f16         |      617 |     1197 |              -27 % |
+| Round 5            | f16         |      683 |     1193 |              -26 % |
+| Round 6            | Q8_0        |      600 |      999 |               -6 % |
+| Round 7            | Q8_0 + flash_attn | 559|     1087 |              -15 % |
+| Round 8 (8a+8b+8c) | **Q8_0**    |  **460** | **839**  |          **+11 %** |
+
+**Round 8 is now 11 % faster than onnxruntime on best-case encoder**
+on a 20 s clip, 23 % faster on an 11 s clip, with a 697 MiB GGUF
+(vs ONNX's 2.3 GiB .onnx + .onnx_data).  Transcripts bit-equal to
+NeMo PyTorch reference on both clips.
+
+RTF best on 20 s clip: 0.042 → **24x real-time** on CPU alone.
+Model load: 168 ms (vs ONNX's 15 300 ms — a 91x faster cold start).
+
+Snapshots:
+
+  - `artifacts/bench/ggml-cpu-round5-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round6-{q8_0,q5_0,q4_0}-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round8a-q8_0-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round8-q8_0-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round8-q8_0-jfk-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round8-f16-m3ultra.json`
+
+### 5.18 — still planned
+
+Phase 5 (CPU optimization) is effectively complete: Round 8 Q8_0 is
+11 % faster than `onnxruntime` on the 20 s clip.  Remaining candidate
+work is now outside the CPU-only scope:
+
+  - **Metal backend + `ggml_backend_sched` for GPU offload.**  The
+    backend-buffer rework from Round 2 and the cached encoder graph
+    from Round 3 are what the sched will need to plumb through.
+    flash_attn_ext (dormant behind `PARAKEET_EXPERIMENTAL_FLASH_ATTN`
+    from Round 7) will almost certainly be a win on GPU where the
+    softmax + V-multiply fuse into one kernel pass.
+  - **K-quant tiers (Q4_K_M, Q5_K_M, Q6_K).**  ggml-cpu has k-quant
+    kernels too; these might extend the quality-vs-size curve beyond
+    the block-quant tiers shipped in Round 6.  Would need a sweep
+    against parity.
+  - **Bucketed encoder graph cache.**  Round 8c landed an exact-shape
+    LRU cache (up to 3 entries). A bucketed variant — round up to the
+    next multiple of 64 or 128 mel frames — would avoid rebuilds for
+    variable-length production streams, at the cost of padding the
+    mel input and masking out the tail via the `all_valid=false` path.
+  - TDT / EOU / Sortformer pipelines (new architectures, not a
+    CPU-opt task).

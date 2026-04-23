@@ -86,6 +86,49 @@ directly into the GGUF as standard `tokenizer.ggml.*` metadata and a
 named `preproc/mel_filterbank` tensor, so the C++ binary is
 self-contained.
 
+### Quantization tiers
+
+`--quant` selects the storage format for the ~150 large 2D weight
+matrices (FFN, attention q/k/v/out/pos/qkv, conv pointwise, subsampling
+output, CTC head). Small tensors (biases, norms, fused BN, mel
+filterbank, depthwise/ small 2D convs) always stay at f32/f16.
+
+| `--quant` | File size | enc best on 20 s clip | enc best on 11 s clip | Transcript parity |
+|-----------|-----------|----------------------:|----------------------:|-------------------|
+| `f32`     | 2.4 GiB   | n/a (debug only)      | n/a                   | exact            |
+| `f16`     | 1.3 GiB   | 1221 ms               | ~680 ms               | bit-equal        |
+| `q8_0`    | 697 MiB   | **839 ms**            | **460 ms**            | bit-equal        |
+| `q5_0`    | 453 MiB   | 1475 ms (slower)      | ~650 ms               | bit-equal        |
+| `q4_0`    | 372 MiB   | 1080 ms               | 595 ms                | bit-equal        |
+
+Measurements on an Apple M3 Ultra, 10 ggml-cpu threads, OpenMP,
+`--bench-warmup 5 --bench-runs 15`. Transcripts on both clips are
+bit-equal to NeMo PyTorch reference at every tier tested, including
+`q4_0`.
+
+**Recommended defaults** on current CPU hardware:
+- `q8_0` — the speed + accuracy sweet spot. 11 % faster than
+  onnxruntime on 20 s audio best-case encoder, 23 % faster on 11 s.
+  Model 2x smaller than f16.
+- `q4_0` — smallest runnable variant (3.5x smaller than f16), still
+  bit-equal transcripts on clean speech.
+
+`q5_0` ships as well but the ggml-cpu `q5_0` mul_mat kernel is slower
+than either `q8_0` or `q4_0` on Apple Silicon, so it's only useful if
+you want the `q5_0` size tier specifically.
+
+### Reference comparison vs onnxruntime (20 s clip)
+
+```
+                   onnxruntime    ggml-cpu q8_0
+  --------------------------------------------
+  load ms           15 313.58       167.83   (91x faster cold start)
+  inf best ms          943.04       839.11   (11 % faster)
+  inf median ms        944.32       882.08   (7 % faster)
+  RTF best              0.047        0.042
+  RTF median            0.047        0.045
+```
+
 ## 3. Run - wav -> text
 
 ```bash
@@ -108,26 +151,38 @@ python scripts/dump-ctc-reference.py \
 ./build/test-ctc     models/parakeet-ctc-0.6b.gguf artifacts/ctc-ref/logits.npy
 ```
 
-Expected per-stage rel error targets (NeMo vs C++):
+Expected per-stage rel error (NeMo PyTorch vs C++ at `--quant f16`):
 
 ```
-Stage A  log_mel               rel ~ 1e-4 (inner) / ~ 2e-3 (boundary; f32 FFT)
-Stage B  subsampling_out       target rel < 1e-4   (phase 3)
-Stage C  block_0_out           target rel < 1e-4   (phase 3)
-Stage D  block_23_out          target rel < 1e-4   (phase 3)
-Stage E  ctc_logits            target rel < 2e-4   (phase 4)
-Stage F  decoded transcript    target edit distance = 0 on clean speech
+Stage A  log_mel               ~ 1e-4 inner / ~ 2e-3 boundary (f32 FFT)
+Stage B  subsampling_out       rel ~ 1e-3 (f16 quantization floor)
+Stage C  block_0_out           rel ~ 1e-3
+Stage D  block_23_out          rel ~ 2e-3
+Stage E  ctc_logits            rel ~ 1e-3
+Stage F  decoded transcript    edit distance = 0 on clean speech
 ```
+
+At `--quant q8_0` through `q4_0` the per-stage rel inflates by ~3x
+to ~25x, but the transcript stays bit-equal on clean speech. See
+`PROGRESS.md` 5.12 for the sweep results.
 
 ## Current status
 
-Phases 0 through 4 are complete: `qvac-parakeet --model ... --wav ...`
-produces the expected transcript end-to-end, matching NeMo
-bit-equivalently on the greedy-decoded text on `jfk.wav`.  Per-stage
-numerical parity is at the f16 quantization floor (1–2e-3 rel vs NeMo
-PyTorch) on every intermediate tensor.  Benchmark on Apple Silicon CPU:
-11 s of audio in ~1.05 s (RTF 0.10) on an unoptimized single-core
-build.  Phase 5 (CPU optimization pass) is the remaining work.
+Phases 0 through 5 (rounds 1–8) are complete:
+
+- `qvac-parakeet --model ... --wav ...` produces the expected
+  transcript end-to-end, matching NeMo PyTorch bit-equivalently on
+  `jfk.wav` and `sample-16k.wav` at every quant tier (f16 through
+  Q4_0).
+- Per-stage numerical parity is at the f16 quantization floor
+  (1–2e-3 rel vs NeMo PyTorch) on every intermediate encoder tensor.
+- Best-case Q8_0 encoder runs 24x real-time on an M3 Ultra CPU —
+  11 % faster than `onnxruntime` with a 91x faster cold start and a
+  3.4x smaller model file.
+- See PROGRESS.md for the round-by-round journal.
+
+Next phase: Metal backend + `ggml_backend_sched` for GPU offload,
+then TDT / EOU / Sortformer pipelines.
 
 ## Repository layout
 

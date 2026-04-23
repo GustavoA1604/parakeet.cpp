@@ -66,6 +66,8 @@ struct BlockWeights {
     ggml_tensor * attn_k_b    = nullptr;
     ggml_tensor * attn_v_w    = nullptr;
     ggml_tensor * attn_v_b    = nullptr;
+    ggml_tensor * attn_qkv_w  = nullptr;
+    ggml_tensor * attn_qkv_b  = nullptr;
     ggml_tensor * attn_out_w  = nullptr;
     ggml_tensor * attn_out_b  = nullptr;
     ggml_tensor * attn_pos_w  = nullptr;
