@@ -548,32 +548,36 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
 
 ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
                                    const BlockWeights & W,
-                                   int d_model, int T, int conv_kernel) {
-    ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, xn, 1, 0, 2, 3));
+                                   int d_model, int /*T*/, int conv_kernel) {
+    ggml_tensor * pw1_w_2d = ggml_reshape_2d(ctx, W.conv_pw1_w, d_model, 2 * d_model);
+    ggml_tensor * y = ggml_mul_mat(ctx, pw1_w_2d, xn);
+    y = ggml_add(ctx, y, W.conv_pw1_b);
 
-    xt = conv1d_via_matmul(ctx, W.conv_pw1_w, xt, 1, 0, 1);
-    xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, W.conv_pw1_b, 1, 2 * d_model));
+    ggml_tensor * half1 = ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
+                                       y->nb[1], y->nb[2], 0);
+    ggml_tensor * half2 = ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
+                                       y->nb[1], y->nb[2],
+                                       (size_t) d_model * y->nb[0]);
+    y = ggml_mul(ctx, half1, ggml_sigmoid(ctx, half2));
 
-    ggml_tensor * half1 = ggml_view_2d(ctx, xt, xt->ne[0], d_model,
-                                       xt->nb[1], 0);
-    ggml_tensor * half2 = ggml_view_2d(ctx, xt, xt->ne[0], d_model,
-                                       xt->nb[1], (size_t) d_model * xt->nb[1]);
-    xt = ggml_mul(ctx, ggml_cont(ctx, half1),
-                  ggml_sigmoid(ctx, ggml_cont(ctx, half2)));
+    ggml_tensor * yt = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
 
     const int pad = (conv_kernel - 1) / 2;
-    xt = ggml_conv_1d_dw(ctx, W.conv_dw_w, xt, 1, pad, 1);
-    xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, W.conv_dw_b, 1, d_model));
+    yt = ggml_conv_1d_dw(ctx, W.conv_dw_w, yt, 1, pad, 1);
+    yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_dw_b, 1, d_model));
 
-    xt = ggml_mul(ctx, xt, ggml_reshape_2d(ctx, W.conv_bn_scale, 1, d_model));
-    xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, W.conv_bn_shift, 1, d_model));
+    yt = ggml_mul(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_scale, 1, d_model));
+    yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_shift, 1, d_model));
 
-    xt = ggml_silu(ctx, xt);
+    yt = ggml_silu(ctx, yt);
 
-    xt = conv1d_via_matmul(ctx, W.conv_pw2_w, xt, 1, 0, 1);
-    xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, W.conv_pw2_b, 1, d_model));
+    y = ggml_cont(ctx, ggml_permute(ctx, yt, 1, 0, 2, 3));
 
-    return ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
+    ggml_tensor * pw2_w_2d = ggml_reshape_2d(ctx, W.conv_pw2_w, d_model, d_model);
+    y = ggml_mul_mat(ctx, pw2_w_2d, y);
+    y = ggml_add(ctx, y, W.conv_pw2_b);
+
+    return y;
 }
 
 ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,

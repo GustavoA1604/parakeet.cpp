@@ -429,14 +429,73 @@ compute problem.  Next target:
     `ggml_conv_1d_dw` (im2col + mul_mat) we use today — the header
     even calls it out.
 
-### 5.8 — still planned
+### 5.8 — round 4: conv module rewrite  _(done)_
 
-  - Conv module optimisations (the next round, based on 5.7's findings).
-  - Block-quantized weights (Q4_0 / Q5_0 / Q8_0 via `llama-quantize`
-    or direct converter support).  ggml-cpu has hand-tuned kernels for
-    these and they halve/quarter memory bandwidth — big win if the
-    remaining bottleneck is matmul bandwidth rather than FLOPs.
-    Chatterbox benefits heavily from this.
+Two structural changes to the conv module, driven by the 5.7 profile
+that flagged it as the single biggest slice at 32% of encoder time:
+
+  1. **Drop `ggml_cont` around GLU halves.**  `ggml_mul` and
+     `ggml_sigmoid` accept strided views natively; the two `cont`
+     calls were copying 2×(T×d_model×4) = ~1.1 MB per block, ~27 MB
+     per forward, for no reason.  Per-block conv time: 10.92 → 8.10
+     ms (-26%).
+
+  2. **Replace `conv1d_via_matmul` with direct `ggml_mul_mat` for
+     `pw1`/`pw2` (k=1 convs).**  A k=1 Conv1d is literally a matmul;
+     doing it as such lets us:
+       - skip the im2col (trivial but still a memcpy),
+       - skip the `ggml_cast(kernel, F32)` that was in there to work
+         around the `mul_mat(src0=f32, src1=f16)` ordering
+         restriction,
+       - stay in the natural `(d_model, T)` layout so the
+         `ggml_permute + ggml_cont` enter/exit transposes (another
+         ~1.1 MB per block) are gone.
+     Depthwise conv still needs `(T, d_model)` layout so we
+     transpose just around `dw + BN + SiLU`.  Per-block conv time:
+     8.10 → 6.06 ms (a further -25%, total -45%).
+
+Output rel on block_last moved from 1.60e-3 → 1.88e-3 — within the
+f16 quantization floor, from different accumulation order in the
+mul_mat kernel vs the im2col+matmul path.  All 9 `test-encoder`
+parity gates still pass.
+
+Sub-stage profile after round 4:
+
+```
+   FF1  (macaron)   6.13 ms  (23% of block)  ~186 ms encoder-wide
+   Attention        7.64 ms  (29%)           ~232 ms           ← now biggest
+   Conv module      6.06 ms  (23%)           ~184 ms
+   FF2  (macaron)   6.39 ms  (24%)           ~194 ms
+```
+
+Attention is now the single biggest slice (26.2% of encoder) at ~232
+ms.  FFN + Conv are a close 3-way tie around 20% each.
+
+### 5.9 — baseline comparison
+
+| run     | encoder median ms | encoder best ms | RTF median | RTF best | note |
+|---------|------------------:|----------------:|-----------:|---------:|------|
+| baseline| 1046              | 1032            | 0.096      | 0.095    | ggml-cpu 4 thr |
+| round 1 | 786 (quiet)       | 733             | 0.073      | 0.067    | HC thr + O3/ffast-math |
+| round 2 | ~850              | 770             | 0.077      | 0.070    | +OpenMP + weight buffer |
+| round 3 | 761–862           | 706             | 0.070–0.079| 0.065    | +cached graph |
+| round 4 | **745–809**       | **627**         | 0.069–0.074| **0.058**| +conv rewrite |
+
+Cumulative: **40% reduction in encoder best-case** (1032 → 627 ms).
+RTF best 0.058 = **17.4× real-time** on CPU alone.
+
+### 5.10 — still planned
+
+  - **Attention optimisation.**  Now the biggest single slice at 232
+    ms / 26%.  Candidate wins: fuse q/k/v into one matmul with a
+    packed weight (3× d_model rows in one matrix), reconsider the
+    many `ggml_permute + ggml_cont` in rel-pos MHA, or just let
+    BLAS-backed GEMM handle the bigger matmul sizes there where the
+    comparison shifts in Accelerate's favor.
+  - Block-quantized weights (Q4_0 / Q5_0 / Q8_0).  Would halve /
+    quarter memory bandwidth on the FFN's 1024×4096 matrices, which
+    are the largest in the model — potentially another 80–150 ms.
+    Needs converter change + verification that parity stays tight.
   - Metal backend + `ggml_backend_sched` for GPU offload (future
     phase outside CPU-only scope).  The backend-buffer rework from
     round 2 is what the sched will need to plumb through.
