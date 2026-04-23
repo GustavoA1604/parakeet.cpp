@@ -1,0 +1,391 @@
+#include "qvac-parakeet/qvac-parakeet.h"
+#include "qvac-parakeet/ctc/pipeline.h"
+
+#include "parakeet_ctc.h"
+#include "mel_preprocess.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace {
+
+void print_usage(const char * argv0) {
+    std::fprintf(stderr,
+        "usage: %s --model <parakeet-ctc.gguf> --wav <input.wav> [options]\n"
+        "\n"
+        "options:\n"
+        "  --model PATH         path to the parakeet-ctc GGUF (required)\n"
+        "  --wav PATH           path to a 16 kHz mono wav file (required)\n"
+        "  --threads N          number of CPU threads (0 = hardware_concurrency)\n"
+        "  --n-gpu-layers N     GPU layers (phase 1 CPU-only; ignored)\n"
+        "  --verbose            print per-stage wall times and shapes to stderr\n"
+        "\n"
+        "  --bench              benchmark mode: run the inference path multiple times\n"
+        "                       with warmup, print aggregated stats + RTF.\n"
+        "                       (Transcript is printed once after the stats.)\n"
+        "  --bench-runs N       timed runs for --bench (default 3)\n"
+        "  --bench-warmup N     warmup runs NOT counted in stats (default 2)\n"
+        "  --bench-json PATH    in --bench mode, also write the stats as JSON to PATH\n"
+        "\n"
+        "  --dump-mel PATH      write the C++ log-mel tensor as raw float32 (80, T_mel)\n"
+        "                       to PATH; handy for offline diffing against mel.npy.\n"
+        "  --version            print version and exit\n"
+        "  --help               this help text\n",
+        argv0);
+}
+
+struct ExtraCliOpts {
+    std::string dump_mel_path;
+    bool        bench         = false;
+    int         bench_runs    = 3;
+    int         bench_warmup  = 2;
+    std::string bench_json_path;
+};
+
+double ms_since(std::chrono::steady_clock::time_point a) {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(steady_clock::now() - a).count() / 1000.0;
+}
+
+struct RunTimes {
+    double mel_ms         = 0.0;
+    double enc_ms         = 0.0;
+    double dec_ms         = 0.0;
+    double inference_ms   = 0.0;
+    int    tokens         = 0;
+    int    encoder_frames = 0;
+};
+
+struct AggStats {
+    double mean   = 0.0;
+    double stdev  = 0.0;
+    double min    = 0.0;
+    double max    = 0.0;
+    double median = 0.0;
+};
+
+AggStats aggregate(std::vector<double> v) {
+    AggStats s;
+    if (v.empty()) return s;
+    s.min = v.front();
+    s.max = v.front();
+    double sum = 0.0;
+    for (double x : v) { sum += x; s.min = std::min(s.min, x); s.max = std::max(s.max, x); }
+    s.mean = sum / (double) v.size();
+    double ss = 0.0;
+    for (double x : v) { const double d = x - s.mean; ss += d * d; }
+    s.stdev = v.size() > 1 ? std::sqrt(ss / (double)(v.size() - 1)) : 0.0;
+    std::sort(v.begin(), v.end());
+    if (v.size() % 2 == 1) s.median = v[v.size() / 2];
+    else                   s.median = 0.5 * (v[v.size()/2 - 1] + v[v.size()/2]);
+    return s;
+}
+
+}
+
+extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
+    qvac_parakeet::ctc::TranscribeOptions opts;
+    ExtraCliOpts extra;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--help" || a == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (a == "--version") {
+            std::printf("qvac-parakeet 0.1.0\n");
+            return 0;
+        } else if (a == "--model" && i + 1 < argc) {
+            opts.model_gguf_path = argv[++i];
+        } else if (a == "--wav" && i + 1 < argc) {
+            opts.wav_path = argv[++i];
+        } else if (a == "--threads" && i + 1 < argc) {
+            opts.n_threads = std::atoi(argv[++i]);
+        } else if (a == "--n-gpu-layers" && i + 1 < argc) {
+            opts.n_gpu_layers = std::atoi(argv[++i]);
+        } else if (a == "--verbose" || a == "-v") {
+            opts.verbose = true;
+        } else if (a == "--dump-mel" && i + 1 < argc) {
+            extra.dump_mel_path = argv[++i];
+        } else if (a == "--bench") {
+            extra.bench = true;
+        } else if (a == "--bench-runs" && i + 1 < argc) {
+            extra.bench_runs = std::max(1, std::atoi(argv[++i]));
+        } else if (a == "--bench-warmup" && i + 1 < argc) {
+            extra.bench_warmup = std::max(0, std::atoi(argv[++i]));
+        } else if (a == "--bench-json" && i + 1 < argc) {
+            extra.bench_json_path = argv[++i];
+        } else {
+            std::fprintf(stderr, "unknown option: %s\n", a.c_str());
+            print_usage(argv[0]);
+            return 2;
+        }
+    }
+
+    if (opts.model_gguf_path.empty() || opts.wav_path.empty()) {
+        print_usage(argv[0]);
+        return 2;
+    }
+
+    using namespace qvac_parakeet::ctc;
+    using clock = std::chrono::steady_clock;
+
+    const auto t_load = clock::now();
+    ParakeetCtcModel model;
+    if (int rc = load_from_gguf(opts.model_gguf_path, model, opts.n_threads, opts.n_gpu_layers, opts.verbose); rc != 0) {
+        std::fprintf(stderr, "error: failed to load %s (rc=%d)\n", opts.model_gguf_path.c_str(), rc);
+        return 3;
+    }
+    const double load_ms = ms_since(t_load);
+
+    const auto t_wav = clock::now();
+    std::vector<float> samples;
+    int sr = 0;
+    if (int rc = load_wav_mono_f32(opts.wav_path, samples, sr); rc != 0) {
+        std::fprintf(stderr, "error: failed to load %s (rc=%d)\n", opts.wav_path.c_str(), rc);
+        return 4;
+    }
+    if (sr != model.mel_cfg.sample_rate) {
+        std::fprintf(stderr, "error: wav is %d Hz but model expects %d Hz (resampling not yet wired)\n",
+                     sr, model.mel_cfg.sample_rate);
+        return 5;
+    }
+    const double wav_ms = ms_since(t_wav);
+    const double audio_ms = 1000.0 * (double) samples.size() / (double) sr;
+
+    auto run_once = [&](std::string & text_out, std::vector<int32_t> & ids_out,
+                        int & n_frames_out, RunTimes & times) -> int {
+        const auto t1 = clock::now();
+        std::vector<float> mel;
+        int n_frames = 0;
+        if (int rc = compute_log_mel(samples.data(), (int) samples.size(),
+                                     model.mel_cfg, mel, n_frames); rc != 0) return rc;
+        times.mel_ms = ms_since(t1);
+
+        if (!extra.dump_mel_path.empty()) {
+            std::vector<float> transposed((size_t) model.mel_cfg.n_mels * n_frames);
+            for (int t = 0; t < n_frames; ++t)
+                for (int m = 0; m < model.mel_cfg.n_mels; ++m)
+                    transposed[m * n_frames + t] = mel[t * model.mel_cfg.n_mels + m];
+            FILE * fp = std::fopen(extra.dump_mel_path.c_str(), "wb");
+            if (fp) {
+                std::fwrite(transposed.data(), sizeof(float), transposed.size(), fp);
+                std::fclose(fp);
+            }
+            extra.dump_mel_path.clear();
+        }
+
+        const auto t2 = clock::now();
+        EncoderOutputs enc_out;
+        if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out); rc != 0) return rc;
+        times.enc_ms = ms_since(t2);
+        times.encoder_frames = enc_out.n_enc_frames;
+
+        const auto t3 = clock::now();
+        ids_out = ctc_greedy_decode(
+            enc_out.logits.data(), enc_out.n_enc_frames, model.vocab_size, model.blank_id);
+        text_out = detokenize(model.vocab, ids_out);
+        times.dec_ms = ms_since(t3);
+        times.inference_ms = times.mel_ms + times.enc_ms + times.dec_ms;
+        times.tokens = (int) ids_out.size();
+        n_frames_out = n_frames;
+        return 0;
+    };
+
+    std::string text;
+    std::vector<int32_t> ids;
+    int n_frames = 0;
+
+    if (!extra.bench) {
+        RunTimes times;
+        if (int rc = run_once(text, ids, n_frames, times); rc != 0) return 6 + rc;
+        std::printf("%s\n", text.c_str());
+        if (opts.verbose) {
+            const double inf_rtf   = times.inference_ms / audio_ms;
+            const double total_ms  = ms_since(t_load);
+            const double total_rtf = total_ms / audio_ms;
+            std::fprintf(stderr,
+                "[BENCH] load=%.1fms wav=%.1fs (%zu samples@%dHz) mel=%dx%d\n"
+                "[BENCH] mel=%.1fms enc=%.1fms dec=%.1fms inference=%.1fms  RTF=%.3f\n"
+                "[BENCH] total(load+wav+inf)=%.1fms  total_RTF=%.3f  tokens=%zu\n",
+                load_ms, audio_ms / 1000.0, samples.size(), sr, n_frames, model.mel_cfg.n_mels,
+                times.mel_ms, times.enc_ms, times.dec_ms, times.inference_ms, inf_rtf,
+                total_ms, total_rtf, ids.size());
+        }
+        return 0;
+    }
+
+    std::fprintf(stderr, "[bench] model=%s  wav=%s (%.2f s audio, %d samples @ %d Hz)\n",
+                 opts.model_gguf_path.c_str(), opts.wav_path.c_str(),
+                 audio_ms / 1000.0, (int) samples.size(), sr);
+    std::fprintf(stderr, "[bench] threads=%d  warmup=%d  runs=%d\n",
+                 opts.n_threads, extra.bench_warmup, extra.bench_runs);
+    std::fprintf(stderr, "[bench] load=%.1fms wav_read=%.1fms\n", load_ms, wav_ms);
+
+    for (int w = 0; w < extra.bench_warmup; ++w) {
+        RunTimes t;
+        if (int rc = run_once(text, ids, n_frames, t); rc != 0) return 10 + rc;
+        std::fprintf(stderr, "[bench] warmup %d/%d  mel=%.1fms enc=%.1fms dec=%.1fms  RTF=%.3f\n",
+                     w + 1, extra.bench_warmup, t.mel_ms, t.enc_ms, t.dec_ms, t.inference_ms / audio_ms);
+    }
+
+    std::vector<double> mel_v, enc_v, dec_v, inf_v;
+    mel_v.reserve(extra.bench_runs);
+    enc_v.reserve(extra.bench_runs);
+    dec_v.reserve(extra.bench_runs);
+    inf_v.reserve(extra.bench_runs);
+
+    int enc_frames_last = 0;
+    for (int r = 0; r < extra.bench_runs; ++r) {
+        RunTimes t;
+        if (int rc = run_once(text, ids, n_frames, t); rc != 0) return 20 + rc;
+        mel_v.push_back(t.mel_ms);
+        enc_v.push_back(t.enc_ms);
+        dec_v.push_back(t.dec_ms);
+        inf_v.push_back(t.inference_ms);
+        enc_frames_last = t.encoder_frames;
+        std::fprintf(stderr, "[bench] run %d/%d    mel=%.1fms enc=%.1fms dec=%.1fms inference=%.1fms  RTF=%.3f\n",
+                     r + 1, extra.bench_runs, t.mel_ms, t.enc_ms, t.dec_ms,
+                     t.inference_ms, t.inference_ms / audio_ms);
+    }
+
+    std::printf("%s\n", text.c_str());
+
+    const AggStats s_mel = aggregate(mel_v);
+    const AggStats s_enc = aggregate(enc_v);
+    const AggStats s_dec = aggregate(dec_v);
+    const AggStats s_inf = aggregate(inf_v);
+    const double   rtf_median = s_inf.median / audio_ms;
+    const double   rtf_best   = s_inf.min    / audio_ms;
+    const double   rtf_mean   = s_inf.mean   / audio_ms;
+    const bool     noisy      = s_inf.stdev > 0.2 * s_inf.mean;
+
+    std::fprintf(stderr,
+        "[bench] ----------- summary (%d timed runs, warmup excluded) -----------\n"
+        "[bench]   audio              = %.3f s (%zu samples @ %d Hz)\n"
+        "[bench]   model load         = %.1f ms\n"
+        "[bench]   wav read           = %.1f ms\n"
+        "[bench]                         mean      med       min       max       std\n"
+        "[bench]   mel        ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
+        "[bench]   encoder    ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
+        "[bench]   decode     ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
+        "[bench]   inference  ms    %8.2f  %7.2f  %7.2f  %7.2f  %7.2f\n"
+        "[bench]   RTF (median/best) = %.3f / %.3f    (realtime multiple = %.1fx / %.1fx)\n"
+        "[bench]   tokens             = %d%s\n"
+        "[bench] ---------------------------------------------------------------%s\n",
+        extra.bench_runs, audio_ms / 1000.0, samples.size(), sr,
+        load_ms, wav_ms,
+        s_mel.mean, s_mel.median, s_mel.min, s_mel.max, s_mel.stdev,
+        s_enc.mean, s_enc.median, s_enc.min, s_enc.max, s_enc.stdev,
+        s_dec.mean, s_dec.median, s_dec.min, s_dec.max, s_dec.stdev,
+        s_inf.mean, s_inf.median, s_inf.min, s_inf.max, s_inf.stdev,
+        rtf_median, rtf_best,
+        (rtf_median > 0 ? 1.0 / rtf_median : 0.0),
+        (rtf_best   > 0 ? 1.0 / rtf_best   : 0.0),
+        (int) ids.size(),
+        noisy ? "  (WARNING: stdev > 20% of mean — consider more warmup / runs)" : "",
+        noisy ? "\n[bench] prefer the median / best RTF — mean is skewed by outliers." : "");
+
+    if (!extra.bench_json_path.empty()) {
+        FILE * fp = std::fopen(extra.bench_json_path.c_str(), "w");
+        if (!fp) {
+            std::fprintf(stderr, "error: cannot open %s for writing\n", extra.bench_json_path.c_str());
+            return 30;
+        }
+        auto fmt_stats = [&](const char * name, const AggStats & s, const std::vector<double> & v) {
+            std::fprintf(fp, "    \"%s_ms\": {\"mean\": %.3f, \"median\": %.3f, \"stdev\": %.3f, \"min\": %.3f, \"max\": %.3f, \"samples\": [",
+                         name, s.mean, s.median, s.stdev, s.min, s.max);
+            for (size_t i = 0; i < v.size(); ++i) std::fprintf(fp, "%s%.3f", i == 0 ? "" : ", ", v[i]);
+            std::fprintf(fp, "]}");
+        };
+        std::fprintf(fp, "{\n");
+        std::fprintf(fp, "  \"model\": \"%s\",\n",  opts.model_gguf_path.c_str());
+        std::fprintf(fp, "  \"wav\": \"%s\",\n",    opts.wav_path.c_str());
+        std::fprintf(fp, "  \"backend\": \"ggml-cpu\",\n");
+        std::fprintf(fp, "  \"threads\": %d,\n",    opts.n_threads);
+        std::fprintf(fp, "  \"warmup_runs\": %d,\n", extra.bench_warmup);
+        std::fprintf(fp, "  \"timed_runs\":  %d,\n", extra.bench_runs);
+        std::fprintf(fp, "  \"audio_seconds\": %.6f,\n", audio_ms / 1000.0);
+        std::fprintf(fp, "  \"audio_samples\": %zu,\n", samples.size());
+        std::fprintf(fp, "  \"sample_rate\": %d,\n", sr);
+        std::fprintf(fp, "  \"mel_frames\": %d,\n",  n_frames);
+        std::fprintf(fp, "  \"encoder_frames\": %d,\n", enc_frames_last);
+        std::fprintf(fp, "  \"tokens\": %d,\n",      (int) ids.size());
+        std::fprintf(fp, "  \"transcript\": \"");
+        for (char c : text) { if (c == '"') std::fputs("\\\"", fp); else if (c == '\\') std::fputs("\\\\", fp); else std::fputc(c, fp); }
+        std::fprintf(fp, "\",\n");
+        std::fprintf(fp, "  \"load_ms\": %.3f,\n",       load_ms);
+        std::fprintf(fp, "  \"wav_read_ms\": %.3f,\n",   wav_ms);
+        fmt_stats("mel",       s_mel, mel_v);           std::fprintf(fp, ",\n");
+        fmt_stats("encoder",   s_enc, enc_v);           std::fprintf(fp, ",\n");
+        fmt_stats("decode",    s_dec, dec_v);           std::fprintf(fp, ",\n");
+        fmt_stats("inference", s_inf, inf_v);           std::fprintf(fp, ",\n");
+        std::fprintf(fp, "    \"rtf_mean\":   %.6f,\n", rtf_mean);
+        std::fprintf(fp, "    \"rtf_median\": %.6f,\n", rtf_median);
+        std::fprintf(fp, "    \"rtf_best\":   %.6f\n",  rtf_best);
+        std::fprintf(fp, "}\n");
+        std::fclose(fp);
+        std::fprintf(stderr, "[bench] wrote %s\n", extra.bench_json_path.c_str());
+    }
+
+    return 0;
+}
+
+namespace qvac_parakeet::ctc {
+
+int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+
+    ParakeetCtcModel model;
+    if (int rc = load_from_gguf(opts.model_gguf_path, model, opts.n_threads,
+                                opts.n_gpu_layers, opts.verbose); rc != 0) {
+        return rc;
+    }
+
+    std::vector<float> samples;
+    int sr = 0;
+    if (int rc = load_wav_mono_f32(opts.wav_path, samples, sr); rc != 0) return rc;
+    if (sr != model.mel_cfg.sample_rate) return 10;
+
+    const auto t1 = clock::now();
+    std::vector<float> mel;
+    int n_frames = 0;
+    if (int rc = compute_log_mel(samples.data(), (int) samples.size(),
+                                 model.mel_cfg, mel, n_frames); rc != 0) return rc;
+    const double pre_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                             clock::now() - t1).count() / 1000.0;
+
+    const auto t2 = clock::now();
+    EncoderOutputs enc_out;
+    if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out); rc != 0) return rc;
+    const double enc_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                             clock::now() - t2).count() / 1000.0;
+
+    const auto t3 = clock::now();
+    std::vector<int32_t> ids = ctc_greedy_decode(
+        enc_out.logits.data(), enc_out.n_enc_frames, model.vocab_size, model.blank_id);
+    result.text = detokenize(model.vocab, ids);
+    result.token_ids = std::move(ids);
+    const double dec_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                             clock::now() - t3).count() / 1000.0;
+
+    result.preprocess_ms = pre_ms;
+    result.encoder_ms    = enc_ms;
+    result.decode_ms     = dec_ms;
+    result.total_ms      = std::chrono::duration_cast<std::chrono::microseconds>(
+                               clock::now() - t0).count() / 1000.0;
+    result.audio_samples = (int) samples.size();
+    result.sample_rate   = sr;
+    result.mel_frames    = n_frames;
+    result.encoder_frames = enc_out.n_enc_frames;
+    return 0;
+}
+
+}
