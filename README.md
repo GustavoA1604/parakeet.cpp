@@ -117,17 +117,42 @@ bit-equal to NeMo PyTorch reference at every tier tested, including
 than either `q8_0` or `q4_0` on Apple Silicon, so it's only useful if
 you want the `q5_0` size tier specifically.
 
-### Reference comparison vs onnxruntime (20 s clip)
+### Reference comparison vs onnxruntime (20 s clip, sample-16k.wav, 5 warmup + 15 timed runs)
+
+**f16 vs f16** — same floating-point precision, different runtimes:
 
 ```
-                   onnxruntime    ggml-cpu q8_0
-  --------------------------------------------
-  load ms           15 313.58       167.83   (91x faster cold start)
-  inf best ms          943.04       839.11   (11 % faster)
-  inf median ms        944.32       882.08   (7 % faster)
-  RTF best              0.047        0.042
-  RTF median            0.047        0.045
+                   onnxruntime-f16    ggml-cpu-f16
+  -----------------------------------------------
+  model size           2.3 GiB         1.3 GiB
+  load ms              16 736            642      (26x faster)
+  inf best ms             948           1117      (15 % slower)
+  inf median ms         1 007           1132      (12 % slower)
+  inf stdev ms             52             18      (3x tighter)
+  RTF best               0.047          0.055
+  RTF median             0.050          0.056
+  Transcripts            match          match
 ```
+
+**int8 vs int8** — same quantization level, different runtimes:
+
+```
+                   onnxruntime-int8    ggml-cpu-q8_0
+  -------------------------------------------------
+  model size          583.9 MiB         697 MiB
+  load ms               2 054             179      (11x faster)
+  inf best ms             677             898      (25 % slower)
+  inf median ms           721             928      (22 % slower)
+  inf stdev ms             55              25      (2x tighter)
+  RTF best               0.034           0.045
+  RTF median             0.036           0.046
+  Transcripts            match           match
+```
+
+onnxruntime uses hand-tuned AMX coprocessor kernels on Apple Silicon for both
+f16 and int8. ggml is 12–25 % slower on throughput but has 2–3× tighter
+run-to-run variance and far faster cold-start load times (11–26×). The Metal
+/ GPU backend is the next step to close the throughput gap.
 
 ## 3. Run - wav -> text
 

@@ -757,21 +757,64 @@ Parity: unchanged. Transcripts bit-equal on both test clips.
 
 ### 5.17 — summary, Round 5-8
 
-| round              | code        | jfk best | 20s best | vs ONNX best (944) |
-|--------------------|:-----------:|---------:|---------:|-------------------:|
-| pre-Round-5        | f16         |      617 |     1197 |              -27 % |
-| Round 5            | f16         |      683 |     1193 |              -26 % |
-| Round 6            | Q8_0        |      600 |      999 |               -6 % |
-| Round 7            | Q8_0 + flash_attn | 559|     1087 |              -15 % |
-| Round 8 (8a+8b+8c) | **Q8_0**    |  **460** | **839**  |          **+11 %** |
+| round              | code        | jfk best | 20s best | vs ONNX f16 best (944) |
+|--------------------|:-----------:|---------:|---------:|------------------------:|
+| pre-Round-5        | f16         |      617 |     1197 |               -27 %    |
+| Round 5            | f16         |      683 |     1193 |               -26 %    |
+| Round 6            | Q8_0        |      600 |      999 |                -6 %    |
+| Round 7            | Q8_0 + flash_attn | 559|     1087 |              -15 %    |
+| Round 8 (8a+8b+8c) | **Q8_0**    |  **460** | **839**  |           **+11 %**    |
 
-**Round 8 is now 11 % faster than onnxruntime on best-case encoder**
-on a 20 s clip, 23 % faster on an 11 s clip, with a 697 MiB GGUF
-(vs ONNX's 2.3 GiB .onnx + .onnx_data).  Transcripts bit-equal to
-NeMo PyTorch reference on both clips.
+**Round 8 vs ONNX f16**: 11 % faster on best-case encoder on a 20 s clip.
 
-RTF best on 20 s clip: 0.042 → **24x real-time** on CPU alone.
-Model load: 168 ms (vs ONNX's 15 300 ms — a 91x faster cold start).
+**Fair f16 vs f16** (same precision, different runtimes — 5 warmup + 15 timed runs):
+
+```
+                   onnxruntime-f16    ggml-cpu-f16
+  -----------------------------------------------
+  model size           2.3 GiB         1.3 GiB
+  load ms              16 736            642      (26x faster cold start)
+  inf best ms             948           1117      (15 % slower)
+  inf median ms         1 007           1132      (12 % slower)
+  inf stdev ms             52             18      (3x tighter)
+  RTF best               0.047          0.055
+  RTF median             0.050          0.056
+  Transcripts            match          match
+```
+
+**Fair int8 vs int8** (generated via ORT dynamic quantization from the same weights,
+5 warmup + 15 timed runs):
+
+```
+                   onnxruntime-int8    ggml-cpu-Q8_0
+  -------------------------------------------------
+  model size           583.9 MiB         697 MiB
+  load ms               2 054             179      (11x faster cold start)
+  inf best ms             677             898      (25 % slower)
+  inf median ms           721             928      (22 % slower)
+  inf stdev ms             55              25      (2x tighter)
+  RTF best               0.034           0.045
+  RTF median             0.036           0.046
+  Transcripts            match           match
+```
+
+Interpretation:
+
+  - ggml is **12–25 % slower** than onnxruntime at the same precision tier.
+    onnxruntime's kernels on Apple Silicon route through AMX coprocessor
+    instructions (hand-tuned for both f16 and int8) that ggml-cpu's
+    OpenMP SIMD threads can't match on multiply-accumulate throughput.
+  - ggml stdev is **2–3× tighter** at both tiers (18 vs 52 ms at f16;
+    25 vs 55 ms at int8), meaning per-utterance latency is more
+    predictable under background OS load.
+  - ggml model load is **11–26× faster** — critical for cold-start /
+    short-session workloads.
+  - The Metal backend (planned Phase 6) will target GPU compute, where
+    AMX doesn't apply and ggml's flash-attention kernel (already
+    prototyped in Round 7) can be used.
+
+RTF best on 20 s clip (Q8_0): 0.045 → **22x real-time** on CPU alone.
+Model load: 179 ms vs ONNX int8's 2054 ms.
 
 Snapshots:
 
