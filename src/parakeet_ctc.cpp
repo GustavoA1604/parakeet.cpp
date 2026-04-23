@@ -4,10 +4,12 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-blas.h"
 #include "gguf.h"
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -15,20 +17,63 @@
 
 namespace qvac_parakeet::ctc {
 
-struct ParakeetCtcModel::Impl {
-    gguf_context     * gguf           = nullptr;
-    ggml_context     * ctx            = nullptr;
-    ggml_backend_t     backend        = nullptr;
-    ggml_gallocr_t     encoder_alloc  = nullptr;
-    int                encoder_alloc_T_mel = 0;
+struct EncoderGraph {
+    ggml_context * graph_ctx = nullptr;
+    ggml_cgraph  * cgraph    = nullptr;
+    ggml_gallocr_t alloc     = nullptr;
+    int            T_mel     = 0;
+    int            n_run_layers = 0;
 
-    ~Impl() {
-        if (encoder_alloc) ggml_gallocr_free(encoder_alloc);
-        if (ctx)           ggml_free(ctx);
-        if (gguf)          gguf_free(gguf);
-        if (backend)       ggml_backend_free(backend);
+    std::vector<float> pe_host;
+
+    ggml_tensor * mel_in  = nullptr;
+    ggml_tensor * mask_t0 = nullptr;
+    ggml_tensor * mask_t1 = nullptr;
+    ggml_tensor * mask_t2 = nullptr;
+    ggml_tensor * mask_t3 = nullptr;
+    ggml_tensor * pe_in   = nullptr;
+
+    ggml_tensor * sub_out_node         = nullptr;
+    ggml_tensor * post_ff1_0_node      = nullptr;
+    ggml_tensor * post_attn_0_node     = nullptr;
+    ggml_tensor * post_conv_0_node     = nullptr;
+    ggml_tensor * post_ff2_0_node      = nullptr;
+    ggml_tensor * block_0_out_node     = nullptr;
+    ggml_tensor * block_last_out_node  = nullptr;
+    ggml_tensor * encoder_out_node     = nullptr;
+    ggml_tensor * logits_node          = nullptr;
+
+    void free_() {
+        if (alloc)     { ggml_gallocr_free(alloc); alloc = nullptr; }
+        if (graph_ctx) { ggml_free(graph_ctx);     graph_ctx = nullptr; }
+        cgraph = nullptr;
+        mel_in = mask_t0 = mask_t1 = mask_t2 = mask_t3 = pe_in = nullptr;
+        sub_out_node = post_ff1_0_node = post_attn_0_node = nullptr;
+        post_conv_0_node = post_ff2_0_node = block_0_out_node = nullptr;
+        block_last_out_node = encoder_out_node = logits_node = nullptr;
+        T_mel = 0;
+        pe_host.clear();
     }
 };
+
+struct ParakeetCtcModel::Impl {
+    gguf_context         * gguf           = nullptr;
+    ggml_context         * ctx            = nullptr;
+    ggml_backend_t         backend_cpu    = nullptr;
+    ggml_backend_t         backend_blas   = nullptr;
+    ggml_backend_buffer_t  weights_buffer = nullptr;
+    EncoderGraph           encoder_graph;
+
+    ~Impl() {
+        encoder_graph.free_();
+        if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
+        if (ctx)            ggml_free(ctx);
+        if (gguf)           gguf_free(gguf);
+        if (backend_blas)   ggml_backend_free(backend_blas);
+        if (backend_cpu)    ggml_backend_free(backend_cpu);
+    }
+};
+
 
 namespace {
 
@@ -83,7 +128,24 @@ int load_from_gguf(const std::string & gguf_path,
 
     auto impl = std::make_shared<ParakeetCtcModel::Impl>();
 
-    gguf_init_params params = { false, &impl->ctx };
+    impl->backend_cpu = ggml_backend_cpu_init();
+    if (!impl->backend_cpu) {
+        std::fprintf(stderr, "gguf: ggml_backend_cpu_init failed\n");
+        return 10;
+    }
+    int resolved_threads = n_threads;
+    if (resolved_threads <= 0) {
+        const unsigned hc = std::thread::hardware_concurrency();
+        resolved_threads = hc > 0 ? (int) hc : 4;
+    }
+    ggml_backend_cpu_set_n_threads(impl->backend_cpu, resolved_threads);
+
+    impl->backend_blas = ggml_backend_blas_init();
+    if (impl->backend_blas && resolved_threads > 0) {
+        ggml_backend_blas_set_n_threads(impl->backend_blas, resolved_threads);
+    }
+
+    gguf_init_params params = { /*no_alloc=*/ true, &impl->ctx };
     impl->gguf = gguf_init_from_file(gguf_path.c_str(), params);
     if (!impl->gguf) {
         std::fprintf(stderr, "gguf: failed to open %s\n", gguf_path.c_str());
@@ -91,6 +153,38 @@ int load_from_gguf(const std::string & gguf_path,
     }
 
     gguf_context * g = impl->gguf;
+
+    impl->weights_buffer = ggml_backend_alloc_ctx_tensors(impl->ctx, impl->backend_cpu);
+    if (!impl->weights_buffer) {
+        std::fprintf(stderr, "gguf: ggml_backend_alloc_ctx_tensors failed\n");
+        return 12;
+    }
+    ggml_backend_buffer_set_usage(impl->weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    {
+        std::ifstream f(gguf_path, std::ios::binary);
+        if (!f) {
+            std::fprintf(stderr, "gguf: cannot reopen %s for tensor data\n", gguf_path.c_str());
+            return 13;
+        }
+        const size_t data_offset = gguf_get_data_offset(g);
+        const int64_t n_tensors = gguf_get_n_tensors(g);
+        std::vector<char> buf;
+        for (int64_t i = 0; i < n_tensors; ++i) {
+            const char  * name = gguf_get_tensor_name(g, i);
+            ggml_tensor * t    = ggml_get_tensor(impl->ctx, name);
+            if (!t) continue;
+            const size_t off   = gguf_get_tensor_offset(g, i);
+            const size_t nbytes = ggml_nbytes(t);
+            buf.resize(nbytes);
+            f.seekg((std::streamoff)(data_offset + off), std::ios::beg);
+            if (!f.read(buf.data(), nbytes)) {
+                std::fprintf(stderr, "gguf: short read on tensor '%s' (%zu bytes)\n", name, nbytes);
+                return 14;
+            }
+            ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
+        }
+    }
 
     {
         const int id = find_key(g, "general.architecture");
@@ -228,18 +322,10 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.ctc.w = require_tensor(impl->ctx, "ctc.decoder.weight");
     out_model.ctc.b = require_tensor(impl->ctx, "ctc.decoder.bias");
 
-    impl->backend = ggml_backend_cpu_init();
-    if (!impl->backend) {
-        std::fprintf(stderr, "gguf: ggml_backend_cpu_init failed\n");
-        return 10;
+    if (impl->backend_blas) {
+        ggml_backend_free(impl->backend_blas);
+        impl->backend_blas = nullptr;
     }
-
-    int resolved_threads = n_threads;
-    if (resolved_threads <= 0) {
-        const unsigned hc = std::thread::hardware_concurrency();
-        resolved_threads = hc > 0 ? (int) hc : 4;
-    }
-    ggml_backend_cpu_set_n_threads(impl->backend, resolved_threads);
 
     out_model.impl = impl;
 
@@ -531,9 +617,9 @@ int run_subsampling(ParakeetCtcModel   & model,
                     int                  n_mels,
                     std::vector<float> & out_feats,
                     int                & out_n_frames) {
-    if (!model.impl || !model.impl->backend) return -1;
+    if (!model.impl || !model.impl->backend_cpu) return -1;
 
-    ggml_backend_t backend = model.impl->backend;
+    ggml_backend_t backend = model.impl->backend_cpu;
     const int C_sub = model.encoder_cfg.subsampling_channels;
     const int d_model = model.encoder_cfg.d_model;
 
@@ -621,15 +707,10 @@ int run_subsampling(ParakeetCtcModel   & model,
     return 0;
 }
 
-int run_encoder(ParakeetCtcModel   & model,
-                const float        * mel,
-                int                  n_mel_frames,
-                int                  n_mels,
-                EncoderOutputs     & out) {
-    if (!model.impl || !model.impl->backend) return -1;
-
-    ggml_backend_t backend = model.impl->backend;
-    ParakeetCtcModel::Impl & impl = *model.impl;
+static int build_encoder_graph_cached(const ParakeetCtcModel & model,
+                                      EncoderGraph & g,
+                                      int n_mel_frames, int n_mels,
+                                      ggml_backend_t backend) {
     const EncoderConfig & enc = model.encoder_cfg;
     const int C_sub = enc.subsampling_channels;
     const int d_model = enc.d_model;
@@ -638,6 +719,153 @@ int run_encoder(ParakeetCtcModel   & model,
     const int N_LAYERS = enc.n_layers;
     const int conv_kernel = enc.conv_kernel;
     const float eps = enc.layer_norm_eps;
+
+    const int L0 = n_mel_frames;
+    const int L1 = _conv_out_len(L0, 3, 2, 1);
+    const int L2 = _conv_out_len(L1, 3, 2, 1);
+    const int L3 = _conv_out_len(L2, 3, 2, 1);
+    const int T = L3;
+
+    g.pe_host = compute_rel_pos_encoding(T, d_model);
+
+    const size_t graph_slots = GGML_DEFAULT_GRAPH_SIZE * 16;
+    const size_t overhead = ggml_tensor_overhead() * graph_slots
+                          + ggml_graph_overhead_custom(graph_slots, false);
+    ggml_init_params gp = { overhead, nullptr, /*no_alloc=*/ true };
+    g.graph_ctx = ggml_init(gp);
+    if (!g.graph_ctx) return -2;
+    ggml_context * gctx = g.graph_ctx;
+
+    g.mel_in  = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_mels, L0, 1, 1);
+    g.mask_t0 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L0, 1, 1);
+    g.mask_t1 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L1, 1, 1);
+    g.mask_t2 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L2, 1, 1);
+    g.mask_t3 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L3, 1, 1);
+    g.pe_in   = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_model, 2 * T - 1);
+    ggml_set_name(g.mel_in,  "mel_in");
+    ggml_set_name(g.mask_t0, "mask_t0");
+    ggml_set_name(g.mask_t1, "mask_t1");
+    ggml_set_name(g.mask_t2, "mask_t2");
+    ggml_set_name(g.mask_t3, "mask_t3");
+    ggml_set_name(g.pe_in,   "pe_in");
+
+    ggml_tensor * x = subsampling_graph(gctx, g.mel_in, model.subsampling, C_sub, d_model,
+                                        g.mask_t0, g.mask_t1, g.mask_t2, g.mask_t3);
+    g.sub_out_node = x;
+    ggml_set_name(g.sub_out_node, "subsampling_out");
+    ggml_set_output(g.sub_out_node);
+
+    x = ggml_scale(gctx, x, std::sqrt((float) d_model));
+
+    const int n_run_layers = std::getenv("PARAKEET_MAX_LAYERS")
+                           ? std::atoi(std::getenv("PARAKEET_MAX_LAYERS"))
+                           : N_LAYERS;
+    g.n_run_layers = n_run_layers;
+
+    for (int i = 0; i < n_run_layers; ++i) {
+        if (i == 0) {
+            const BlockWeights & W = model.blocks[0];
+            ggml_tensor * residual = x;
+            ggml_tensor * y = conformer_ff_graph(gctx, x,
+                                                 W.norm_ff1_w, W.norm_ff1_b,
+                                                 W.ff1_l1_w,   W.ff1_l1_b,
+                                                 W.ff1_l2_w,   W.ff1_l2_b, eps);
+            y = ggml_scale(gctx, y, 0.5f);
+            x = ggml_add(gctx, residual, y);
+            g.post_ff1_0_node = x;
+            ggml_set_name(g.post_ff1_0_node, "block_0_post_ff1");
+            ggml_set_output(g.post_ff1_0_node);
+
+            residual = x;
+            ggml_tensor * xn = layer_norm_affine(gctx, x, W.norm_attn_w, W.norm_attn_b, eps);
+            y = rel_pos_mha_graph(gctx, xn, g.pe_in, W, H, HD, T);
+            x = ggml_add(gctx, residual, y);
+            g.post_attn_0_node = x;
+            ggml_set_name(g.post_attn_0_node, "block_0_post_attn");
+            ggml_set_output(g.post_attn_0_node);
+
+            residual = x;
+            xn = layer_norm_affine(gctx, x, W.norm_conv_w, W.norm_conv_b, eps);
+            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel);
+            x = ggml_add(gctx, residual, y);
+            g.post_conv_0_node = x;
+            ggml_set_name(g.post_conv_0_node, "block_0_post_conv");
+            ggml_set_output(g.post_conv_0_node);
+
+            residual = x;
+            y = conformer_ff_graph(gctx, x,
+                                   W.norm_ff2_w, W.norm_ff2_b,
+                                   W.ff2_l1_w,   W.ff2_l1_b,
+                                   W.ff2_l2_w,   W.ff2_l2_b, eps);
+            y = ggml_scale(gctx, y, 0.5f);
+            x = ggml_add(gctx, residual, y);
+            g.post_ff2_0_node = x;
+            ggml_set_name(g.post_ff2_0_node, "block_0_post_ff2");
+            ggml_set_output(g.post_ff2_0_node);
+
+            x = layer_norm_affine(gctx, x, W.norm_out_w, W.norm_out_b, eps);
+
+            g.block_0_out_node = x;
+            ggml_set_name(g.block_0_out_node, "block_0_out");
+            ggml_set_output(g.block_0_out_node);
+        } else {
+            x = conformer_block_graph(gctx, x, g.pe_in, model.blocks[i],
+                                      d_model, H, HD, T, conv_kernel, eps);
+        }
+        if (i == n_run_layers - 1) {
+            g.block_last_out_node = x;
+            ggml_set_name(g.block_last_out_node, "block_last_out");
+            ggml_set_output(g.block_last_out_node);
+        }
+    }
+
+    g.encoder_out_node = x;
+    ggml_set_name(g.encoder_out_node, "encoder_out");
+    ggml_set_output(g.encoder_out_node);
+
+    g.logits_node = ggml_add(gctx, ggml_mul_mat(gctx, model.ctc.w, x), model.ctc.b);
+    ggml_set_name(g.logits_node, "logits");
+    ggml_set_output(g.logits_node);
+
+    g.cgraph = ggml_new_graph_custom(gctx, graph_slots, false);
+    ggml_build_forward_expand(g.cgraph, g.sub_out_node);
+    if (g.post_ff1_0_node)     ggml_build_forward_expand(g.cgraph, g.post_ff1_0_node);
+    if (g.post_attn_0_node)    ggml_build_forward_expand(g.cgraph, g.post_attn_0_node);
+    if (g.post_conv_0_node)    ggml_build_forward_expand(g.cgraph, g.post_conv_0_node);
+    if (g.post_ff2_0_node)     ggml_build_forward_expand(g.cgraph, g.post_ff2_0_node);
+    if (g.block_0_out_node)    ggml_build_forward_expand(g.cgraph, g.block_0_out_node);
+    if (g.block_last_out_node) ggml_build_forward_expand(g.cgraph, g.block_last_out_node);
+    ggml_build_forward_expand(g.cgraph, g.encoder_out_node);
+    ggml_build_forward_expand(g.cgraph, g.logits_node);
+
+    g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!g.alloc || !ggml_gallocr_reserve(g.alloc, g.cgraph)) {
+        g.free_();
+        return -3;
+    }
+
+    g.T_mel = n_mel_frames;
+    return 0;
+}
+
+int run_encoder(ParakeetCtcModel   & model,
+                const float        * mel,
+                int                  n_mel_frames,
+                int                  n_mels,
+                EncoderOutputs     & out) {
+    if (!model.impl || !model.impl->backend_cpu) return -1;
+
+    ggml_backend_t backend = model.impl->backend_cpu;
+    const EncoderConfig & enc = model.encoder_cfg;
+    const int d_model = enc.d_model;
+
+    EncoderGraph & g = model.impl->encoder_graph;
+    if (!g.cgraph || g.T_mel != n_mel_frames) {
+        g.free_();
+        if (int rc = build_encoder_graph_cached(model, g, n_mel_frames, n_mels, backend); rc != 0) {
+            return rc;
+        }
+    }
 
     int mel_valid = 0;
     for (int t = 0; t < n_mel_frames; ++t) {
@@ -660,177 +888,52 @@ int run_encoder(ParakeetCtcModel   & model,
     const int V3 = _conv_out_len(V2, 3, 2, 1);
 
     const int T = L3;
+    const int vocab_size = model.vocab_size;
 
     auto make_mask = [](int L, int V) {
         std::vector<float> m(L, 0.0f);
         for (int t = 0; t < L && t < V; ++t) m[t] = 1.0f;
         return m;
     };
-    std::vector<float> m0 = make_mask(L0, V0);
-    std::vector<float> m1 = make_mask(L1, V1);
-    std::vector<float> m2 = make_mask(L2, V2);
-    std::vector<float> m3 = make_mask(L3, V3);
+    const std::vector<float> m0 = make_mask(L0, V0);
+    const std::vector<float> m1 = make_mask(L1, V1);
+    const std::vector<float> m2 = make_mask(L2, V2);
+    const std::vector<float> m3 = make_mask(L3, V3);
 
-    std::vector<float> pe_host = compute_rel_pos_encoding(T, d_model);
-
-    const size_t graph_slots = GGML_DEFAULT_GRAPH_SIZE * 16;
-    const size_t overhead = ggml_tensor_overhead() * graph_slots
-                          + ggml_graph_overhead_custom(graph_slots, false);
-    ggml_init_params gp = { overhead, nullptr, /*no_alloc=*/ true };
-    ggml_context * gctx = ggml_init(gp);
-    if (!gctx) return -2;
-
-    ggml_tensor * mel_in  = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, n_mels, L0, 1, 1);
-    ggml_tensor * mask_t0 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L0, 1, 1);
-    ggml_tensor * mask_t1 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L1, 1, 1);
-    ggml_tensor * mask_t2 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L2, 1, 1);
-    ggml_tensor * mask_t3 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L3, 1, 1);
-    ggml_tensor * pe_in   = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_model, 2 * T - 1);
-    ggml_set_name(mel_in, "mel_in");
-    ggml_set_name(mask_t0, "mask_t0");
-    ggml_set_name(mask_t1, "mask_t1");
-    ggml_set_name(mask_t2, "mask_t2");
-    ggml_set_name(mask_t3, "mask_t3");
-    ggml_set_name(pe_in,   "pe_in");
-
-    ggml_tensor * x = subsampling_graph(gctx, mel_in, model.subsampling, C_sub, d_model,
-                                        mask_t0, mask_t1, mask_t2, mask_t3);
-    ggml_tensor * sub_out_node = x;
-    ggml_set_name(sub_out_node, "subsampling_out");
-    ggml_set_output(sub_out_node);
-
-    x = ggml_scale(gctx, x, std::sqrt((float) d_model));
-
-    ggml_tensor * block_0_out_node = nullptr;
-    ggml_tensor * block_last_out_node = nullptr;
-
-    const int n_run_layers = std::getenv("PARAKEET_MAX_LAYERS")
-                           ? std::atoi(std::getenv("PARAKEET_MAX_LAYERS"))
-                           : N_LAYERS;
-
-    ggml_tensor * post_ff1_0_node  = nullptr;
-    ggml_tensor * post_attn_0_node = nullptr;
-    ggml_tensor * post_conv_0_node = nullptr;
-    ggml_tensor * post_ff2_0_node  = nullptr;
-
-    for (int i = 0; i < n_run_layers; ++i) {
-        if (i == 0) {
-            const BlockWeights & W = model.blocks[0];
-            ggml_tensor * residual = x;
-            ggml_tensor * y = conformer_ff_graph(gctx, x,
-                                                 W.norm_ff1_w, W.norm_ff1_b,
-                                                 W.ff1_l1_w,   W.ff1_l1_b,
-                                                 W.ff1_l2_w,   W.ff1_l2_b, eps);
-            y = ggml_scale(gctx, y, 0.5f);
-            x = ggml_add(gctx, residual, y);
-            post_ff1_0_node = x;
-            ggml_set_name(post_ff1_0_node, "block_0_post_ff1");
-            ggml_set_output(post_ff1_0_node);
-
-            residual = x;
-            ggml_tensor * xn = layer_norm_affine(gctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-            y = rel_pos_mha_graph(gctx, xn, pe_in, W, H, HD, T);
-            x = ggml_add(gctx, residual, y);
-            post_attn_0_node = x;
-            ggml_set_name(post_attn_0_node, "block_0_post_attn");
-            ggml_set_output(post_attn_0_node);
-
-            residual = x;
-            xn = layer_norm_affine(gctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel);
-            x = ggml_add(gctx, residual, y);
-            post_conv_0_node = x;
-            ggml_set_name(post_conv_0_node, "block_0_post_conv");
-            ggml_set_output(post_conv_0_node);
-
-            residual = x;
-            y = conformer_ff_graph(gctx, x,
-                                   W.norm_ff2_w, W.norm_ff2_b,
-                                   W.ff2_l1_w,   W.ff2_l1_b,
-                                   W.ff2_l2_w,   W.ff2_l2_b, eps);
-            y = ggml_scale(gctx, y, 0.5f);
-            x = ggml_add(gctx, residual, y);
-            post_ff2_0_node = x;
-            ggml_set_name(post_ff2_0_node, "block_0_post_ff2");
-            ggml_set_output(post_ff2_0_node);
-
-            x = layer_norm_affine(gctx, x, W.norm_out_w, W.norm_out_b, eps);
-
-            block_0_out_node = x;
-            ggml_set_name(block_0_out_node, "block_0_out");
-            ggml_set_output(block_0_out_node);
-        } else {
-            x = conformer_block_graph(gctx, x, pe_in, model.blocks[i],
-                                      d_model, H, HD, T, conv_kernel, eps);
-        }
-        if (i == n_run_layers - 1) {
-            block_last_out_node = x;
-            ggml_set_name(block_last_out_node, "block_last_out");
-            ggml_set_output(block_last_out_node);
-        }
-    }
-
-    ggml_tensor * encoder_out_node = x;
-    ggml_set_name(encoder_out_node, "encoder_out");
-    ggml_set_output(encoder_out_node);
-
-    ggml_tensor * logits_node = ggml_add(gctx, ggml_mul_mat(gctx, model.ctc.w, x), model.ctc.b);
-    ggml_set_name(logits_node, "logits");
-    ggml_set_output(logits_node);
-
-    ggml_cgraph * gf = ggml_new_graph_custom(gctx, graph_slots, false);
-    ggml_build_forward_expand(gf, sub_out_node);
-    if (post_ff1_0_node)     ggml_build_forward_expand(gf, post_ff1_0_node);
-    if (post_attn_0_node)    ggml_build_forward_expand(gf, post_attn_0_node);
-    if (post_conv_0_node)    ggml_build_forward_expand(gf, post_conv_0_node);
-    if (post_ff2_0_node)     ggml_build_forward_expand(gf, post_ff2_0_node);
-    if (block_0_out_node)    ggml_build_forward_expand(gf, block_0_out_node);
-    if (block_last_out_node) ggml_build_forward_expand(gf, block_last_out_node);
-    ggml_build_forward_expand(gf, encoder_out_node);
-    ggml_build_forward_expand(gf, logits_node);
-
-    if (!impl.encoder_alloc || impl.encoder_alloc_T_mel != n_mel_frames) {
-        if (impl.encoder_alloc) ggml_gallocr_free(impl.encoder_alloc);
-        impl.encoder_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        impl.encoder_alloc_T_mel = n_mel_frames;
-    }
-    if (!impl.encoder_alloc || !ggml_gallocr_alloc_graph(impl.encoder_alloc, gf)) {
-        ggml_free(gctx);
+    if (!ggml_gallocr_alloc_graph(g.alloc, g.cgraph)) {
         return -3;
     }
 
-    ggml_backend_tensor_set(mel_in,  mel,           0, (size_t) n_mels * L0 * sizeof(float));
-    ggml_backend_tensor_set(mask_t0, m0.data(),     0, m0.size() * sizeof(float));
-    ggml_backend_tensor_set(mask_t1, m1.data(),     0, m1.size() * sizeof(float));
-    ggml_backend_tensor_set(mask_t2, m2.data(),     0, m2.size() * sizeof(float));
-    ggml_backend_tensor_set(mask_t3, m3.data(),     0, m3.size() * sizeof(float));
-    ggml_backend_tensor_set(pe_in,   pe_host.data(), 0, pe_host.size() * sizeof(float));
+    ggml_backend_tensor_set(g.mel_in,  mel,              0, (size_t) n_mels * L0 * sizeof(float));
+    ggml_backend_tensor_set(g.mask_t0, m0.data(),        0, m0.size()        * sizeof(float));
+    ggml_backend_tensor_set(g.mask_t1, m1.data(),        0, m1.size()        * sizeof(float));
+    ggml_backend_tensor_set(g.mask_t2, m2.data(),        0, m2.size()        * sizeof(float));
+    ggml_backend_tensor_set(g.mask_t3, m3.data(),        0, m3.size()        * sizeof(float));
+    ggml_backend_tensor_set(g.pe_in,   g.pe_host.data(), 0, g.pe_host.size() * sizeof(float));
 
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-        ggml_free(gctx);
+    if (ggml_backend_graph_compute(backend, g.cgraph) != GGML_STATUS_SUCCESS) {
         return -4;
     }
 
     out.n_enc_frames = T;
     out.d_model      = d_model;
-    out.vocab_size   = model.vocab_size;
+    out.vocab_size   = vocab_size;
 
     auto copy_tensor = [&](ggml_tensor * t, std::vector<float> & dst) {
         if (!t) { dst.clear(); return; }
         dst.resize((size_t) ggml_nelements(t));
         ggml_backend_tensor_get(t, dst.data(), 0, dst.size() * sizeof(float));
     };
-    copy_tensor(sub_out_node,         out.subsampling_out);
-    copy_tensor(post_ff1_0_node,      out.block_0_post_ff1);
-    copy_tensor(post_attn_0_node,     out.block_0_post_attn);
-    copy_tensor(post_conv_0_node,     out.block_0_post_conv);
-    copy_tensor(post_ff2_0_node,      out.block_0_post_ff2);
-    copy_tensor(block_0_out_node,     out.block_0_out);
-    copy_tensor(block_last_out_node,  out.block_last_out);
-    copy_tensor(encoder_out_node,     out.encoder_out);
-    copy_tensor(logits_node,          out.logits);
+    copy_tensor(g.sub_out_node,         out.subsampling_out);
+    copy_tensor(g.post_ff1_0_node,      out.block_0_post_ff1);
+    copy_tensor(g.post_attn_0_node,     out.block_0_post_attn);
+    copy_tensor(g.post_conv_0_node,     out.block_0_post_conv);
+    copy_tensor(g.post_ff2_0_node,      out.block_0_post_ff2);
+    copy_tensor(g.block_0_out_node,     out.block_0_out);
+    copy_tensor(g.block_last_out_node,  out.block_last_out);
+    copy_tensor(g.encoder_out_node,     out.encoder_out);
+    copy_tensor(g.logits_node,          out.logits);
 
-    ggml_free(gctx);
     return 0;
 }
 

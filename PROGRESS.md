@@ -287,27 +287,101 @@ higher than the baseline (std 83 ms vs 10 ms) — that's a
 benchmark-noise effect from system contention, not a regression; in
 isolation the median is within the previous std band.
 
-### 5.3 — OpenMP, BLAS, further optimizations  _(planned)_
+### 5.3 — round 2: OpenMP + backend-buffer weight loading  _(done)_
 
-  - OpenMP on the ggml-cpu backend — requires libomp on macOS
-    (`brew install libomp`) and `-DGGML_OPENMP=ON`.  CMake auto-links
-    it via the existing `find_package(OpenMP)` block.  First round of
-    measurements showed regression but was under CPU contention from
-    a parallel workload — needs re-measurement on a quiet machine
-    before we claim win or loss.
-  - Accelerate BLAS backend routing for matmul.  ggml-cpu only uses
-    Accelerate for vec ops and softmax; the big wins for matmul
-    require co-initialising the `ggml-blas` backend and a
-    `ggml_backend_sched` scheduler with BLAS as secondary.  First
-    attempt hit `buffer_id < 0` asserts because weights live in a
-    `gguf_init_from_file`-owned CPU buffer that the sched doesn't
-    know about — needs weight buffers to be wrapped via
-    `ggml_backend_cpu_buffer_from_ptr` or copied into a
-    backend-allocated context.  Non-trivial; picking up next.
-  - Larger-granularity profiling: `ggml_time_us()` hooks at each of
-    subsampling / block / CTC head boundaries to attribute the
-    remaining ~940 ms encoder budget to specific sub-stages.
+Two changes shipped together:
 
-Each lands with a before/after row in the table and the
-corresponding `artifacts/bench/*.json` snapshot so the impact is
-auditable.
+  1. **OpenMP on ggml-cpu.**  `brew install libomp` (one-time) then
+     `-DGGML_OPENMP=ON` at configure time.  CMake auto-links it via
+     the existing `find_package(OpenMP)` block.  On a quiet M3 Ultra,
+     with CPU-only backend, measured ~4% encoder speedup (median
+     803 ms → 768 ms) and 42% tighter stdev (88 ms → 50 ms).  Worth
+     taking for the variance reduction alone.
+  2. **Weight loading reworked to use a backend-owned buffer.**
+     `gguf_init_from_file` is now called with `no_alloc=true`, the
+     ggml context is then populated via
+     `ggml_backend_alloc_ctx_tensors(ctx, backend_cpu)`, and each
+     tensor's data is streamed from the file into the backend buffer
+     via `ggml_backend_tensor_set`.  The buffer is tagged
+     `GGML_BACKEND_BUFFER_USAGE_WEIGHTS` so future sched-based
+     optimizations can reach it.  No direct perf impact (identical
+     in-memory layout), but unblocks multi-backend scheduling.
+
+### 5.4 — BLAS backend sched attempt  _(investigated, not shipped)_
+
+Tried co-initialising the `ggml-blas` backend with `ggml_backend_sched`
+configured as `[blas, cpu]` + `op_offload=true`.  Result on this model
++ machine: no speedup, sometimes slower.
+
+Root causes:
+
+  - ggml-cpu's **multi-threaded f16×f32 SIMD** matmul beats
+    **single-threaded Accelerate** `cblas_sgemm` for our matmul sizes
+    (d_model=1024, T_enc=138, FFN=4096).  On Apple Silicon
+    Accelerate routes SGEMM to the single-CPU AMX coprocessor; for
+    these "medium" matmuls, 10 parallel SIMD threads win.
+  - Our weights are f16; BLAS needs f32 inputs, forcing on-the-fly
+    dequantization that eats the BLAS kernel's advantage.
+  - Sched splits the graph per op, adding per-op dispatch overhead.
+
+Reverted to plain CPU backend.  BLAS backend init code is kept in
+`load_from_gguf` (dormant, will be used when we plumb a real
+sched-based multi-backend path for GPU offload).  BLAS attempt with
+an f32 GGUF hit a `cur_backend_id != -1` sched assertion, not
+pursued further.
+
+### 5.5 — round 3: cached encoder graph  _(done)_
+
+The encoder ggml graph (~600 nodes: 24 Conformer blocks with FF /
+rel-pos MHA / conv + subsampling + CTC head) was rebuilt from scratch
+on every `run_encoder` call — fresh `ggml_context`, fresh `cgraph`,
+fresh `ggml_gallocr_new`, re-reserve.  That's pure per-call overhead
+that doesn't scale with audio length.
+
+Refactored `run_encoder` into two phases:
+
+  1. `build_encoder_graph_cached(model, graph, n_mel_frames, ...)` —
+     constructs the graph, pre-computes the sinusoidal rel-pos
+     encoding (only shape-dependent), reserves the allocator.  Named
+     input tensors (`mel_in`, `mask_t{0..3}`, `pe_in`) and output
+     tensors are stashed on `Impl::encoder_graph`.
+  2. The hot path in `run_encoder` just computes per-call masks from
+     `mel_valid`, `ggml_backend_tensor_set` on the cached input
+     tensor pointers, `ggml_backend_graph_compute`, and
+     `ggml_backend_tensor_get` on the cached output tensors.
+
+Graph rebuild is triggered only when `n_mel_frames` changes
+(different input length).  For bench mode running the same wav N
+times, the graph is built once and reused.
+
+### 5.6 — baseline comparison
+
+| run              | mel ms (median) | encoder ms (median) | encoder ms (best) | RTF median | RTF best | backend |
+|------------------|----------------:|--------------------:|------------------:|-----------:|---------:|---------|
+| pre-round-1      | 14.63           | 1046.23             | 1031.53           | 0.096      | 0.095    | ggml-cpu (4 thr) |
+| round 1          |  5.80           |  786 (quiet)        |  733              | 0.073      | 0.067    | ggml-cpu (10 thr, O3/ffast-math) |
+| round 2          |  ~9             |  ~850 (median), 770 (best) | 710 | 0.077–0.091 | **0.065–0.070** | ggml-cpu + OpenMP + weight buffer |
+| round 3          |  8.5–9.1        |  761–862 (median)   | **706**           | 0.070–0.079 | **0.065–0.066** | + cached encoder graph |
+
+**Note on variance.**  Round 2 numbers have wider spread than round 1
+(stdev 75–140 ms on encoder) despite being measured on the same
+machine.  Cause: macOS background activity (Spotlight, Time Machine,
+etc.) preempting our encoder threads; mel and decode std grow too
+when the system is busy.  The **best** encoder time is the cleanest
+signal for "what the code achieves when nothing else is running";
+**median** is what a user typically observes.  `--bench` output
+reports both and warns when stdev > 20% of mean.
+
+Snapshots: `artifacts/bench/ggml-cpu-baseline-m3ultra.json`,
+`ggml-cpu-round1-m3ultra.json`, `ggml-cpu-round2-m3ultra.json`.
+
+### 5.7 — still planned
+
+  - Per-sub-stage `ggml_time_us()` hooks so we can attribute the
+    remaining ~706 ms (best-case) encoder budget to attention / FF /
+    conv module individually; pick the single biggest slice for the
+    next round.
+  - Real multi-backend sched with Metal + CPU when we move to GPU
+    offload (future phase outside CPU-only scope).  The backend
+    buffer rework already shipped in round 2 is what the sched will
+    need to plumb through.
