@@ -70,6 +70,17 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
         POSITION_INDEPENDENT_CODE ON
         EXPORT_NAME qvac-parakeet
     )
+
+    if (CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
+        target_compile_options(qvac-parakeet PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-O3>
+            $<$<COMPILE_LANGUAGE:C>:-O3>
+            $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>
+            $<$<COMPILE_LANGUAGE:C>:-ffast-math>
+            $<$<COMPILE_LANGUAGE:CXX>:-funroll-loops>
+            $<$<COMPILE_LANGUAGE:C>:-funroll-loops>
+        )
+    endif()
 endif()
 
 if (QVAC_PARAKEET_BUILD_EXECUTABLES)

@@ -10,19 +10,23 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace qvac_parakeet::ctc {
 
 struct ParakeetCtcModel::Impl {
-    gguf_context     * gguf    = nullptr;
-    ggml_context     * ctx     = nullptr;
-    ggml_backend_t     backend = nullptr;
+    gguf_context     * gguf           = nullptr;
+    ggml_context     * ctx            = nullptr;
+    ggml_backend_t     backend        = nullptr;
+    ggml_gallocr_t     encoder_alloc  = nullptr;
+    int                encoder_alloc_T_mel = 0;
 
     ~Impl() {
-        if (ctx)     ggml_free(ctx);
-        if (gguf)    gguf_free(gguf);
-        if (backend) ggml_backend_free(backend);
+        if (encoder_alloc) ggml_gallocr_free(encoder_alloc);
+        if (ctx)           ggml_free(ctx);
+        if (gguf)          gguf_free(gguf);
+        if (backend)       ggml_backend_free(backend);
     }
 };
 
@@ -229,13 +233,20 @@ int load_from_gguf(const std::string & gguf_path,
         std::fprintf(stderr, "gguf: ggml_backend_cpu_init failed\n");
         return 10;
     }
-    if (n_threads > 0) {
-        ggml_backend_cpu_set_n_threads(impl->backend, n_threads);
+
+    int resolved_threads = n_threads;
+    if (resolved_threads <= 0) {
+        const unsigned hc = std::thread::hardware_concurrency();
+        resolved_threads = hc > 0 ? (int) hc : 4;
     }
+    ggml_backend_cpu_set_n_threads(impl->backend, resolved_threads);
 
     out_model.impl = impl;
 
-    if (verbose) print_model_summary(out_model);
+    if (verbose) {
+        print_model_summary(out_model);
+        std::fprintf(stderr, "  backend: cpu  (threads=%d)\n", resolved_threads);
+    }
     return 0;
 }
 
@@ -618,6 +629,7 @@ int run_encoder(ParakeetCtcModel   & model,
     if (!model.impl || !model.impl->backend) return -1;
 
     ggml_backend_t backend = model.impl->backend;
+    ParakeetCtcModel::Impl & impl = *model.impl;
     const EncoderConfig & enc = model.encoder_cfg;
     const int C_sub = enc.subsampling_channels;
     const int d_model = enc.d_model;
@@ -777,9 +789,12 @@ int run_encoder(ParakeetCtcModel   & model,
     ggml_build_forward_expand(gf, encoder_out_node);
     ggml_build_forward_expand(gf, logits_node);
 
-    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    if (!alloc || !ggml_gallocr_alloc_graph(alloc, gf)) {
-        if (alloc) ggml_gallocr_free(alloc);
+    if (!impl.encoder_alloc || impl.encoder_alloc_T_mel != n_mel_frames) {
+        if (impl.encoder_alloc) ggml_gallocr_free(impl.encoder_alloc);
+        impl.encoder_alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        impl.encoder_alloc_T_mel = n_mel_frames;
+    }
+    if (!impl.encoder_alloc || !ggml_gallocr_alloc_graph(impl.encoder_alloc, gf)) {
         ggml_free(gctx);
         return -3;
     }
@@ -792,7 +807,6 @@ int run_encoder(ParakeetCtcModel   & model,
     ggml_backend_tensor_set(pe_in,   pe_host.data(), 0, pe_host.size() * sizeof(float));
 
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-        ggml_gallocr_free(alloc);
         ggml_free(gctx);
         return -4;
     }
@@ -816,7 +830,6 @@ int run_encoder(ParakeetCtcModel   & model,
     copy_tensor(encoder_out_node,     out.encoder_out);
     copy_tensor(logits_node,          out.logits);
 
-    ggml_gallocr_free(alloc);
     ggml_free(gctx);
     return 0;
 }

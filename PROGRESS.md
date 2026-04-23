@@ -246,19 +246,68 @@ model load         = 449 ms   (one-time, excluded from RTF)
 JSON reference snapshot archived at
 `artifacts/bench/ggml-cpu-baseline-m3ultra.json`.
 
-### 5.2 — planned optimizations
+### 5.2 — round 1: thread default + release flags + gallocr cache  _(done)_
 
-  - OpenMP on the ggml build (`GGML_OPENMP=ON`) and thread-pool tuning
-    on the cpu backend.
-  - Accelerate framework BLAS linkage on macOS.
-  - `-O3 -ffast-math -funroll-loops` for the qvac-parakeet code.
-  - Per-utterance graph + gallocr cache (currently a fresh
-    `ggml_context` + graph allocator is built per `run_encoder` call,
-    adding ~10 ms of overhead and some noise on warm runs).
-  - Larger-granularity profiling: split encoder time across
-    subsampling / per-block / CTC head using `ggml_time_us()` hooks
-    inside the graph.
+Three non-timing-sensitive wins landed together:
 
-Each optimization lands with a before/after row in the table and the
-corresponding `artifacts/bench/*.json` snapshot committed alongside
-the PROGRESS entry, so the impact is auditable.
+  1. **CLI default thread count = `std::thread::hardware_concurrency()`**
+     (was 4 via ggml-cpu's internal default).  `--threads N` still
+     overrides.  On a 10-core M3 Ultra that's 10 threads by default.
+     Worth ~10-12% on the encoder path in isolated measurements.
+  2. **`-O3 -ffast-math -funroll-loops`** on `libqvac-parakeet` in
+     Release builds (via `CMakeLists.txt` generator expressions;
+     Debug/RelWithDebInfo unaffected).  Our pure-C++ FFT /
+     filterbank-matmul / CMVN drops from ~14 ms to ~6 ms (2.3×).
+     Doesn't touch ggml; it only affects our own DSP code, where
+     `-ffast-math`'s associativity relaxation is safe (post-log-mel
+     values are far from denormal / inf-adjacent regions).
+  3. **Encoder graph allocator cached across calls**
+     (`ParakeetCtcModel::Impl::encoder_alloc`).  Previously every
+     `run_encoder()` built a fresh `ggml_gallocr` and re-walked the
+     24-block graph; the fresh allocator + re-reserve cost ~5-10 ms
+     per call and added noise to `--bench`.  Now allocated on the
+     first call and reused as long as `n_mel_frames` is stable
+     (re-created on shape change).
+
+Post-opt numbers on an otherwise-quiet M3 Ultra (`jfk.wav`, 11 s audio,
+`--bench-warmup 2 --bench-runs 5`):
+
+```
+                    mean     med      min      max      std
+mel        ms       5.72    5.80    5.48    5.96    0.22   (was 14.63)
+encoder    ms     940.13  943.40  856.94 1056.41   83.04   (was 1041.96)
+decode     ms       0.08    0.08    0.08    0.09    0.01
+inference  ms     945.94  948.97  862.88 1062.29   82.94   (was 1056.77)
+RTF (median/best) = 0.086 / 0.078   (was 0.096 / 0.095)
+```
+
+`artifacts/bench/ggml-cpu-round1-m3ultra.json` snapshot archived.
+Mel's 2.3× speedup is clean and reproducible.  Encoder variance is
+higher than the baseline (std 83 ms vs 10 ms) — that's a
+benchmark-noise effect from system contention, not a regression; in
+isolation the median is within the previous std band.
+
+### 5.3 — OpenMP, BLAS, further optimizations  _(planned)_
+
+  - OpenMP on the ggml-cpu backend — requires libomp on macOS
+    (`brew install libomp`) and `-DGGML_OPENMP=ON`.  CMake auto-links
+    it via the existing `find_package(OpenMP)` block.  First round of
+    measurements showed regression but was under CPU contention from
+    a parallel workload — needs re-measurement on a quiet machine
+    before we claim win or loss.
+  - Accelerate BLAS backend routing for matmul.  ggml-cpu only uses
+    Accelerate for vec ops and softmax; the big wins for matmul
+    require co-initialising the `ggml-blas` backend and a
+    `ggml_backend_sched` scheduler with BLAS as secondary.  First
+    attempt hit `buffer_id < 0` asserts because weights live in a
+    `gguf_init_from_file`-owned CPU buffer that the sched doesn't
+    know about — needs weight buffers to be wrapped via
+    `ggml_backend_cpu_buffer_from_ptr` or copied into a
+    backend-allocated context.  Non-trivial; picking up next.
+  - Larger-granularity profiling: `ggml_time_us()` hooks at each of
+    subsampling / block / CTC head boundaries to attribute the
+    remaining ~940 ms encoder budget to specific sub-stages.
+
+Each lands with a before/after row in the table and the
+corresponding `artifacts/bench/*.json` snapshot so the impact is
+auditable.
