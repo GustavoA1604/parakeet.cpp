@@ -375,13 +375,68 @@ reports both and warns when stdev > 20% of mean.
 Snapshots: `artifacts/bench/ggml-cpu-baseline-m3ultra.json`,
 `ggml-cpu-round1-m3ultra.json`, `ggml-cpu-round2-m3ultra.json`.
 
-### 5.7 — still planned
+### 5.7 — sub-stage profiler + attribution  _(done)_
 
-  - Per-sub-stage `ggml_time_us()` hooks so we can attribute the
-    remaining ~706 ms (best-case) encoder budget to attention / FF /
-    conv module individually; pick the single biggest slice for the
-    next round.
-  - Real multi-backend sched with Metal + CPU when we move to GPU
-    offload (future phase outside CPU-only scope).  The backend
-    buffer rework already shipped in round 2 is what the sched will
-    need to plumb through.
+Added `--profile` mode to the CLI.  Drives two complementary sweeps
+off the same model load:
+
+  1. **Layer-depth sweep** — runs the encoder with
+     `n_run_layers = {0, 1, 12, 24}` (wired through a new
+     `max_layers` param on `run_encoder`; the graph cache keys on it
+     so each config gets a fresh graph), times each.  Linear
+     decomposition gives:
+     - `subsampling + CTC head` = time@0
+     - `per-block avg`          = (time@24 - time@1) / 23
+     - `block-0 extra`          = time@1 - time@0 - per-block-avg
+  2. **Within-block sub-stage sweep** — `profile_block_substages`
+     in `src/parakeet_ctc.cpp` builds five tiny graphs (FF1 only,
+     attention only, conv only, FF2 only, norm_out only) on a
+     fixed-shape random input at `T_enc` and times each.  Also
+     times the full block for consistency check.
+
+Output on `jfk.wav` (11 s, M3 Ultra, 5 timed + 2 warmup):
+
+```
+[profile] mel preprocess                  4.83 ms  ( 0.6% of total)
+[profile] subsampling + CTC head (nl=0)  71.36 ms  ( 8.3% of total)
+[profile] per-block avg (nl=1..24)       32.64 ms  (x 24 = 783 ms, 91.3%)
+[profile] full encoder (nl=24)          853.35 ms   RTF = 0.0780
+
+[profile] per-block sub-stages (T_enc=137):
+   Conv module    10.92 ms  (31% of block)   ~275 ms encoder-wide (32%)
+   Attention       7.41 ms  (21%)            ~186 ms (22%)
+   FF2             6.70 ms  (19%)            ~169 ms (20%)
+   FF1             6.07 ms  (17%)            ~153 ms (18%)
+   norm_out        0.05 ms  ( 0%)            ~  1 ms ( 0%)
+```
+
+**Key finding.**  Conv module is the single biggest slice (32%
+encoder-wide), not FFN.  By FLOP count the conv module is ~5x
+cheaper than FFN (~435 MFLOPs vs ~2.3 GFLOPs per block), so this is
+a memory-bandwidth / implementation efficiency problem, not a
+compute problem.  Next target:
+
+  - `conv1d_via_matmul` casts f16 kernels to f32 via `ggml_cast`
+    every forward pass — could keep f16 native in mul_mat by flipping
+    argument order.
+  - The `ggml_permute(x, 1, 0, 2, 3) + ggml_cont` wrappers around
+    the module materialise a (d_model × T) buffer twice per block
+    (enter + exit).  Re-shaping the internal ops to work on
+    `(d_model, T)` layout natively would save ~24 * 2 *
+    (d_model * T * sizeof(f32)) = 24 * 2 * 1024 * 137 * 4 bytes
+    ≈ 27 MB of redundant copies per utterance.
+  - `ggml_conv_2d_dw_direct` may be faster than the
+    `ggml_conv_1d_dw` (im2col + mul_mat) we use today — the header
+    even calls it out.
+
+### 5.8 — still planned
+
+  - Conv module optimisations (the next round, based on 5.7's findings).
+  - Block-quantized weights (Q4_0 / Q5_0 / Q8_0 via `llama-quantize`
+    or direct converter support).  ggml-cpu has hand-tuned kernels for
+    these and they halve/quarter memory bandwidth — big win if the
+    remaining bottleneck is matmul bandwidth rather than FLOPs.
+    Chatterbox benefits heavily from this.
+  - Metal backend + `ggml_backend_sched` for GPU offload (future
+    phase outside CPU-only scope).  The backend-buffer rework from
+    round 2 is what the sched will need to plumb through.

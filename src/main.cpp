@@ -32,6 +32,11 @@ void print_usage(const char * argv0) {
         "  --bench-runs N       timed runs for --bench (default 3)\n"
         "  --bench-warmup N     warmup runs NOT counted in stats (default 2)\n"
         "  --bench-json PATH    in --bench mode, also write the stats as JSON to PATH\n"
+        "  --profile            per-sub-stage encoder profiling: runs the encoder\n"
+        "                       with n_layers = {0, 1, 12, 24} and attributes time to\n"
+        "                       subsampling / CTC-head / per-block averages.\n"
+        "  --profile-runs N     timed runs per configuration in --profile (default 5)\n"
+        "  --profile-warmup N   warmup runs per configuration (default 2)\n"
         "\n"
         "  --dump-mel PATH      write the C++ log-mel tensor as raw float32 (80, T_mel)\n"
         "                       to PATH; handy for offline diffing against mel.npy.\n"
@@ -46,6 +51,9 @@ struct ExtraCliOpts {
     int         bench_runs    = 3;
     int         bench_warmup  = 2;
     std::string bench_json_path;
+    bool        profile       = false;
+    int         profile_runs  = 5;
+    int         profile_warmup = 2;
 };
 
 double ms_since(std::chrono::steady_clock::time_point a) {
@@ -121,6 +129,12 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             extra.bench_warmup = std::max(0, std::atoi(argv[++i]));
         } else if (a == "--bench-json" && i + 1 < argc) {
             extra.bench_json_path = argv[++i];
+        } else if (a == "--profile") {
+            extra.profile = true;
+        } else if (a == "--profile-runs" && i + 1 < argc) {
+            extra.profile_runs = std::max(1, std::atoi(argv[++i]));
+        } else if (a == "--profile-warmup" && i + 1 < argc) {
+            extra.profile_warmup = std::max(0, std::atoi(argv[++i]));
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             print_usage(argv[0]);
@@ -201,6 +215,133 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     std::string text;
     std::vector<int32_t> ids;
     int n_frames = 0;
+
+    if (extra.profile) {
+        std::fprintf(stderr, "[profile] model=%s  wav=%s (%.2f s audio, %d samples @ %d Hz)\n",
+                     opts.model_gguf_path.c_str(), opts.wav_path.c_str(),
+                     audio_ms / 1000.0, (int) samples.size(), sr);
+        std::fprintf(stderr, "[profile] threads=%d  warmup=%d  runs=%d per config\n",
+                     opts.n_threads, extra.profile_warmup, extra.profile_runs);
+
+        RunTimes t_mel;
+        std::string text_tmp;
+        std::vector<int32_t> ids_tmp;
+        int n_frames_tmp = 0;
+        auto clk = std::chrono::steady_clock::now();
+        std::vector<float> mel_buf;
+        if (int rc = compute_log_mel(samples.data(), (int) samples.size(),
+                                     model.mel_cfg, mel_buf, n_frames_tmp); rc != 0) {
+            std::fprintf(stderr, "profile: mel failed rc=%d\n", rc);
+            return 20;
+        }
+        const double mel_ms = ms_since(clk);
+        std::fprintf(stderr, "[profile] mel preprocess: %.2f ms   (audio=%.2fs, mel_frames=%d)\n",
+                     mel_ms, audio_ms / 1000.0, n_frames_tmp);
+
+        const std::vector<int> layer_points = {0, 1, 12, (int) model.encoder_cfg.n_layers};
+        std::vector<std::pair<int, AggStats>> results;
+
+        for (int nl : layer_points) {
+            std::vector<double> timings;
+            timings.reserve(extra.profile_runs);
+
+            EncoderOutputs tmp_out;
+            for (int w = 0; w < extra.profile_warmup; ++w) {
+                if (int rc = run_encoder(model, mel_buf.data(), n_frames_tmp,
+                                         model.mel_cfg.n_mels, tmp_out, nl); rc != 0) {
+                    std::fprintf(stderr, "profile: run_encoder failed rc=%d at nl=%d\n", rc, nl);
+                    return 21;
+                }
+            }
+            for (int r = 0; r < extra.profile_runs; ++r) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (int rc = run_encoder(model, mel_buf.data(), n_frames_tmp,
+                                         model.mel_cfg.n_mels, tmp_out, nl); rc != 0) {
+                    std::fprintf(stderr, "profile: run_encoder failed rc=%d at nl=%d\n", rc, nl);
+                    return 22;
+                }
+                timings.push_back(ms_since(t0));
+            }
+            AggStats s = aggregate(timings);
+            results.emplace_back(nl, s);
+            std::fprintf(stderr, "[profile] n_layers=%2d:  mean=%7.2f ms   median=%7.2f ms   min=%7.2f ms   max=%7.2f ms   std=%6.2f\n",
+                         nl, s.mean, s.median, s.min, s.max, s.stdev);
+        }
+
+        double t0 = 0, t1 = 0, t12 = 0, t24 = 0;
+        for (auto & kv : results) {
+            if (kv.first == 0)   t0 = kv.second.median;
+            if (kv.first == 1)   t1 = kv.second.median;
+            if (kv.first == 12)  t12 = kv.second.median;
+            if (kv.first == (int) model.encoder_cfg.n_layers) t24 = kv.second.median;
+        }
+
+        const double per_block_from_1_to_24 = (t24 - t1) / (double)(model.encoder_cfg.n_layers - 1);
+        const double per_block_from_1_to_12 = (t12 - t1) / (double) 11;
+        const double block_0_extra = t1 - t0 - per_block_from_1_to_24;
+        const double sub_plus_ctc = t0;
+
+        std::fprintf(stderr, "\n[profile] ---------- encoder attribution (median ms) ----------\n");
+        std::fprintf(stderr, "[profile]   mel preprocess                    %7.2f   (%.1f%% of total)\n",
+                     mel_ms, mel_ms / (mel_ms + t24) * 100.0);
+        std::fprintf(stderr, "[profile]   subsampling + CTC head (nl=0)     %7.2f   (%.1f%% of total)\n",
+                     sub_plus_ctc, sub_plus_ctc / (mel_ms + t24) * 100.0);
+        std::fprintf(stderr, "[profile]   block-0 overhead above avg block  %+7.2f   (extra captures / first-block warmup)\n",
+                     block_0_extra);
+        std::fprintf(stderr, "[profile]   per-block avg (nl=1..24 range)    %7.2f   (x %d blocks = %7.2f ms, %.1f%% of total)\n",
+                     per_block_from_1_to_24, model.encoder_cfg.n_layers,
+                     per_block_from_1_to_24 * model.encoder_cfg.n_layers,
+                     per_block_from_1_to_24 * model.encoder_cfg.n_layers / (mel_ms + t24) * 100.0);
+        std::fprintf(stderr, "[profile]   per-block avg (nl=1..12 range)    %7.2f   (sanity check)\n",
+                     per_block_from_1_to_12);
+        std::fprintf(stderr, "[profile]   full encoder (nl=%d)               %7.2f\n",
+                     (int) model.encoder_cfg.n_layers, t24);
+        std::fprintf(stderr, "[profile]   total (mel + encoder)              %7.2f   RTF = %.4f\n",
+                     mel_ms + t24, (mel_ms + t24) / audio_ms);
+        std::fprintf(stderr, "[profile] -------------------------------------------------------\n");
+
+        const int T_enc = n_frames_tmp / 8;
+        std::fprintf(stderr, "\n[profile] sub-stage breakdown of a single conformer block (T_enc=%d)\n", T_enc);
+        qvac_parakeet::ctc::BlockSubstageTimes sub;
+        if (qvac_parakeet::ctc::profile_block_substages(model, T_enc,
+                extra.profile_warmup, extra.profile_runs, sub) == 0) {
+            const double sum = sub.ff1_ms + sub.attn_ms + sub.conv_ms + sub.ff2_ms + sub.norm_out_ms;
+            auto row = [&](const char * label, double ms) {
+                const double pct_block = sub.block_full_ms > 0 ? ms / sub.block_full_ms * 100.0 : 0.0;
+                const double pct_sum   = sum > 0              ? ms / sum * 100.0               : 0.0;
+                std::fprintf(stderr, "[profile]   %-14s %7.2f ms   (%5.1f%% of sum-of-parts,  %5.1f%% of full-block)\n",
+                             label, ms, pct_sum, pct_block);
+            };
+            row("FF1  (macaron)", sub.ff1_ms);
+            row("Attention",      sub.attn_ms);
+            row("Conv module",    sub.conv_ms);
+            row("FF2  (macaron)", sub.ff2_ms);
+            row("norm_out",       sub.norm_out_ms);
+            std::fprintf(stderr, "[profile]   %-14s %7.2f ms   (sum of parts, slight overhead vs full)\n",
+                         "sum of parts", sum);
+            std::fprintf(stderr, "[profile]   %-14s %7.2f ms   (actual full-block forward)\n",
+                         "full block", sub.block_full_ms);
+
+            const double per_block_measured = per_block_from_1_to_24;
+            const double n_layers_full = (double) model.encoder_cfg.n_layers;
+            std::fprintf(stderr, "\n[profile] extrapolated cost over all %d blocks (mean per-block = %.2f ms):\n",
+                         (int) n_layers_full, per_block_measured);
+            auto extrap = [&](const char * label, double ms) {
+                const double frac = sum > 0 ? ms / sum : 0.0;
+                const double total_ms = frac * per_block_measured * n_layers_full;
+                std::fprintf(stderr, "[profile]   %-14s ~%7.2f ms across encoder  (= %.1f%% of encoder time)\n",
+                             label, total_ms, total_ms / t24 * 100.0);
+            };
+            extrap("FF1",       sub.ff1_ms);
+            extrap("Attention", sub.attn_ms);
+            extrap("Conv",      sub.conv_ms);
+            extrap("FF2",       sub.ff2_ms);
+            extrap("norm_out",  sub.norm_out_ms);
+        } else {
+            std::fprintf(stderr, "[profile] sub-stage profiling failed\n");
+        }
+        return 0;
+    }
 
     if (!extra.bench) {
         RunTimes times;

@@ -152,11 +152,27 @@ int run_encoder(ParakeetCtcModel   & model,
                 const float        * mel,
                 int                  n_mel_frames,
                 int                  n_mels,
-                EncoderOutputs     & out);
+                EncoderOutputs     & out,
+                int                  max_layers = -1);
 
 std::vector<int32_t> ctc_greedy_decode(const float * logits,
                                        int           n_frames,
                                        int           vocab_size,
                                        int32_t       blank_id);
+
+struct BlockSubstageTimes {
+    double ff1_ms  = 0.0;
+    double attn_ms = 0.0;
+    double conv_ms = 0.0;
+    double ff2_ms  = 0.0;
+    double norm_out_ms = 0.0;
+    double block_full_ms = 0.0;
+};
+
+int profile_block_substages(ParakeetCtcModel & model,
+                            int T_enc,
+                            int warmup_runs,
+                            int timed_runs,
+                            BlockSubstageTimes & out);
 
 }
