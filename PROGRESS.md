@@ -1320,3 +1320,67 @@ Requires graph changes (persistent cache tensors for attention + conv
 module, streaming attention mask with `att_context_size` plumbing
 already used by NeMo's own cache-aware export path), plus a per-stage
 parity harness vs the §8.1 Python reference. Out of scope for this PR.
+
+## Phase 9 — multi-model support _(in progress)_
+
+Phase 9 extends the Parakeet-CTC pipeline beyond the initial 0.6B
+checkpoint. Target is drop-in support for other NeMo Parakeet-CTC
+checkpoints that share the FastConformer architecture, without
+branching the converter or the C++ encoder graph.
+
+### Phase 9.1 — parakeet-ctc-1.1b (done)
+
+HF repo: `nvidia/parakeet-ctc-1.1b`. NeMo encoder config:
+
+    d_model: 1024          (same as 0.6B)
+    n_layers: 42           (was 24)
+    n_heads: 8             (same)
+    ff_expansion_factor: 4 (same; ff_dim=4096)
+    conv_kernel_size: 9    (same)
+    subsampling_factor: 8  (same)
+    subsampling_conv_channels: 256 (same)
+    self_attention_model: rel_pos (same)
+    conv_norm_type: batch_norm (same, fused at convert)
+    att_context_size: [-1, -1]  (same, offline)
+    vocab_size: 1025 (1024 BPE + CTC blank)
+
+Only `n_layers` differs from 0.6B. The converter already reads
+`n_layers` from the NeMo YAML and iterates block-by-block, and the C++
+loader reads `parakeet.encoder.n_layers` from GGUF metadata. Zero
+code changes needed to produce a working 1.1B GGUF and transcribe with
+it. The one stale hardcode was in the `--profile` CLI path
+(`layer_points = {0, 1, 12, 24}`); now scales with `n_layers` via
+`{0, 1, n_layers/2, n_layers}`.
+
+End-to-end results on Apple M3 Ultra, Metal, Q8_0:
+
+| Clip | Model | Wall time | RTF | Encoder ms |
+|-|-|-|-|-|
+| jfk.wav (11 s) | ctc-0.6b | 170 ms | 0.015 | ~155 ms |
+| jfk.wav (11 s) | ctc-1.1b | 281 ms | 0.026 | 276 ms |
+| LastQuestion_long_EN.raw (5.5 min) | ctc-0.6b | 15.1 s | 0.046 | 14.9 s |
+| LastQuestion_long_EN.raw (5.5 min) | ctc-1.1b | 24.4 s | 0.074 | 24.2 s |
+
+1.1B is 1.6-1.8× slower than 0.6B, roughly matching the layer-count
+ratio (42/24 ≈ 1.75). Metal still hits ~13× real-time on the long clip
+with 1.1B, comfortably faster than real-time. Transcripts differ on
+2.3 % of words on the long clip (22 / 969) — typical quality difference
+between the two models; both ship transcripts that track the same
+content.
+
+Streaming (Mode 2 and Mode 3) works out of the box with 1.1B:
+`test-streaming` passes all chunk-size byte-equality checks (Mode 2)
+and all three (chunk × left × right) configs at WER ≤ 5% (Mode 3).
+
+### Phase 9.x — next candidates
+
+Natural follow-ups that reuse the same converter + encoder graph:
+
+- `nvidia/parakeet-tdt_ctc-110m`: 110 M hybrid TDT+CTC. 512 × 17
+  FastConformer. CTC head alone can be decoded by the existing
+  `ctc_greedy_decode_window`; TDT primary decoder is a separate
+  port (prediction net + joint net + transducer greedy).
+- `nvidia/parakeet-tdt-0.6b-v3`: bigger TDT model family — same
+  transducer-decoder port, larger encoder.
+- `nvidia/parakeet-ctc-110m`: smaller CTC-only variant if it exists;
+  would land as a converter-flag change only.

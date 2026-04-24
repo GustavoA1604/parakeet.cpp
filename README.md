@@ -1,9 +1,20 @@
 # qvac-parakeet.cpp
 
-**Parakeet-CTC-0.6B** (NVIDIA, CC-BY-4.0 FastConformer ASR model) ported to
+**Parakeet-CTC** (NVIDIA, CC-BY-4.0 FastConformer ASR family) ported to
 [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference on CPU
-(GPU backends and TDT / EOU / Sortformer pipelines land as follow-ups),
-with no runtime dependency on Python, PyTorch, or onnxruntime.
+and GPU (Metal / CUDA / Vulkan), with no runtime dependency on Python,
+PyTorch, or onnxruntime. TDT / EOU / Sortformer pipelines land as
+follow-ups.
+
+Supported checkpoints:
+
+| HF repo | `d_model × n_layers` | Params | GGUF Q8_0 size | Encoder RTF (M3 Ultra, Metal) |
+|-|-|-|-|-|
+| `nvidia/parakeet-ctc-0.6b` | 1024 × 24 | 600 M | 697 MiB | 0.014-0.046 depending on clip length |
+| `nvidia/parakeet-ctc-1.1b` | 1024 × 42 | 1.1 B | 1217 MiB | 0.026-0.074 |
+
+Same converter, same encoder graph, same GGUF schema — model identity
+lives entirely in `parakeet.encoder.n_layers` metadata.
 
 Mirrors [`chatterbox.cpp`](https://github.com/GustavoA1604/chatterbox.cpp)'s
 layout and staged-validation methodology, so contributors familiar with
@@ -97,14 +108,20 @@ pip install "nemo_toolkit[asr]" gguf numpy soundfile librosa sentencepiece
 python scripts/convert-parakeet-ctc-to-gguf.py \
   --ckpt models/parakeet-ctc-0.6b.nemo \
   --out  models/parakeet-ctc-0.6b.gguf
+
+# or the bigger 1.1B variant (same converter, same flags)
+python scripts/convert-parakeet-ctc-to-gguf.py \
+  --ckpt models/parakeet-ctc-1.1b.nemo \
+  --out  models/parakeet-ctc-1.1b.q8_0.gguf \
+  --quant q8_0
 ```
 
-The script downloads `nvidia/parakeet-ctc-0.6b` from Hugging Face on
-first run if the local path doesn't exist. The SentencePiece tokenizer
-(`tokenizer.model`) and the precomputed mel filterbank are embedded
-directly into the GGUF as standard `tokenizer.ggml.*` metadata and a
-named `preproc/mel_filterbank` tensor, so the C++ binary is
-self-contained.
+The script downloads `nvidia/parakeet-ctc-0.6b` (or `-1.1b`) from
+Hugging Face on first run if the local path doesn't exist. The
+SentencePiece tokenizer (`tokenizer.model`) and the precomputed mel
+filterbank are embedded directly into the GGUF as standard
+`tokenizer.ggml.*` metadata and a named `preproc/mel_filterbank`
+tensor, so the C++ binary is self-contained.
 
 ### Quantization tiers
 

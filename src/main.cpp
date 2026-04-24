@@ -62,8 +62,8 @@ void print_usage(const char * argv0) {
         "  --bench-warmup N     warmup runs NOT counted in stats (default 2)\n"
         "  --bench-json PATH    in --bench mode, also write the stats as JSON to PATH\n"
         "  --profile            per-sub-stage encoder profiling: runs the encoder\n"
-        "                       with n_layers = {0, 1, 12, 24} and attributes time to\n"
-        "                       subsampling / CTC-head / per-block averages.\n"
+        "                       with n_layers = {0, 1, N/2, N} (N from the GGUF) and\n"
+        "                       attributes time to subsampling / CTC-head / per-block.\n"
         "  --profile-runs N     timed runs per configuration in --profile (default 5)\n"
         "  --profile-warmup N   warmup runs per configuration (default 2)\n"
         "\n"
@@ -392,7 +392,9 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         std::fprintf(stderr, "[profile] mel preprocess: %.2f ms   (audio=%.2fs, mel_frames=%d)\n",
                      mel_ms, audio_ms / 1000.0, n_frames_tmp);
 
-        const std::vector<int> layer_points = {0, 1, 12, (int) model.encoder_cfg.n_layers};
+        const int nl_full = (int) model.encoder_cfg.n_layers;
+        const int nl_mid  = std::max(2, nl_full / 2);
+        const std::vector<int> layer_points = {0, 1, nl_mid, nl_full};
         std::vector<std::pair<int, AggStats>> results;
 
         for (int nl : layer_points) {
@@ -422,36 +424,37 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                          nl, s.mean, s.median, s.min, s.max, s.stdev);
         }
 
-        double t0 = 0, t1 = 0, t12 = 0, t24 = 0;
+        double t0 = 0, t1 = 0, t_mid = 0, t_full = 0;
         for (auto & kv : results) {
-            if (kv.first == 0)   t0 = kv.second.median;
-            if (kv.first == 1)   t1 = kv.second.median;
-            if (kv.first == 12)  t12 = kv.second.median;
-            if (kv.first == (int) model.encoder_cfg.n_layers) t24 = kv.second.median;
+            if (kv.first == 0)       t0     = kv.second.median;
+            if (kv.first == 1)       t1     = kv.second.median;
+            if (kv.first == nl_mid)  t_mid  = kv.second.median;
+            if (kv.first == nl_full) t_full = kv.second.median;
         }
 
-        const double per_block_from_1_to_24 = (t24 - t1) / (double)(model.encoder_cfg.n_layers - 1);
-        const double per_block_from_1_to_12 = (t12 - t1) / (double) 11;
-        const double block_0_extra = t1 - t0 - per_block_from_1_to_24;
+        const double per_block_from_1_to_full = (t_full - t1) / (double)(nl_full - 1);
+        const double per_block_from_1_to_mid  = (t_mid  - t1) / (double)(nl_mid - 1);
+        const double block_0_extra = t1 - t0 - per_block_from_1_to_full;
         const double sub_plus_ctc = t0;
 
         std::fprintf(stderr, "\n[profile] ---------- encoder attribution (median ms) ----------\n");
         std::fprintf(stderr, "[profile]   mel preprocess                    %7.2f   (%.1f%% of total)\n",
-                     mel_ms, mel_ms / (mel_ms + t24) * 100.0);
+                     mel_ms, mel_ms / (mel_ms + t_full) * 100.0);
         std::fprintf(stderr, "[profile]   subsampling + CTC head (nl=0)     %7.2f   (%.1f%% of total)\n",
-                     sub_plus_ctc, sub_plus_ctc / (mel_ms + t24) * 100.0);
+                     sub_plus_ctc, sub_plus_ctc / (mel_ms + t_full) * 100.0);
         std::fprintf(stderr, "[profile]   block-0 overhead above avg block  %+7.2f   (extra captures / first-block warmup)\n",
                      block_0_extra);
-        std::fprintf(stderr, "[profile]   per-block avg (nl=1..24 range)    %7.2f   (x %d blocks = %7.2f ms, %.1f%% of total)\n",
-                     per_block_from_1_to_24, model.encoder_cfg.n_layers,
-                     per_block_from_1_to_24 * model.encoder_cfg.n_layers,
-                     per_block_from_1_to_24 * model.encoder_cfg.n_layers / (mel_ms + t24) * 100.0);
-        std::fprintf(stderr, "[profile]   per-block avg (nl=1..12 range)    %7.2f   (sanity check)\n",
-                     per_block_from_1_to_12);
+        std::fprintf(stderr, "[profile]   per-block avg (nl=1..%d range)    %7.2f   (x %d blocks = %7.2f ms, %.1f%% of total)\n",
+                     nl_full,
+                     per_block_from_1_to_full, nl_full,
+                     per_block_from_1_to_full * nl_full,
+                     per_block_from_1_to_full * nl_full / (mel_ms + t_full) * 100.0);
+        std::fprintf(stderr, "[profile]   per-block avg (nl=1..%d range)    %7.2f   (sanity check)\n",
+                     nl_mid, per_block_from_1_to_mid);
         std::fprintf(stderr, "[profile]   full encoder (nl=%d)               %7.2f\n",
-                     (int) model.encoder_cfg.n_layers, t24);
+                     nl_full, t_full);
         std::fprintf(stderr, "[profile]   total (mel + encoder)              %7.2f   RTF = %.4f\n",
-                     mel_ms + t24, (mel_ms + t24) / audio_ms);
+                     mel_ms + t_full, (mel_ms + t_full) / audio_ms);
         std::fprintf(stderr, "[profile] -------------------------------------------------------\n");
 
         const int T_enc = n_frames_tmp / 8;
@@ -476,7 +479,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             std::fprintf(stderr, "[profile]   %-14s %7.2f ms   (actual full-block forward)\n",
                          "full block", sub.block_full_ms);
 
-            const double per_block_measured = per_block_from_1_to_24;
+            const double per_block_measured = per_block_from_1_to_full;
             const double n_layers_full = (double) model.encoder_cfg.n_layers;
             std::fprintf(stderr, "\n[profile] extrapolated cost over all %d blocks (mean per-block = %.2f ms):\n",
                          (int) n_layers_full, per_block_measured);
@@ -484,7 +487,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                 const double frac = sum > 0 ? ms / sum : 0.0;
                 const double total_ms = frac * per_block_measured * n_layers_full;
                 std::fprintf(stderr, "[profile]   %-14s ~%7.2f ms across encoder  (= %.1f%% of encoder time)\n",
-                             label, total_ms, total_ms / t24 * 100.0);
+                             label, total_ms, total_ms / t_full * 100.0);
             };
             extrap("FF1",       sub.ff1_ms);
             extrap("Attention", sub.attn_ms);
