@@ -15,6 +15,7 @@ endif()
 option(QVAC_PARAKEET_BUILD_LIBRARY     "qvac-parakeet: build the static qvac-parakeet library"                 ON)
 option(QVAC_PARAKEET_BUILD_EXECUTABLES "qvac-parakeet: build the qvac-parakeet CLI"                            ${QVAC_PARAKEET_STANDALONE_DEFAULT})
 option(QVAC_PARAKEET_BUILD_TESTS       "qvac-parakeet: build per-stage numerical validation harnesses"         ${QVAC_PARAKEET_STANDALONE_DEFAULT})
+option(QVAC_PARAKEET_BUILD_EXAMPLES    "qvac-parakeet: build standalone examples (live-mic, ...)"              ${QVAC_PARAKEET_STANDALONE_DEFAULT})
 option(QVAC_PARAKEET_INSTALL           "qvac-parakeet: generate install rules"                                 ON)
 option(QVAC_PARAKEET_USE_SYSTEM_GGML   "qvac-parakeet: use system-installed GGML library"                      OFF)
 
@@ -123,6 +124,34 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     add_executable(test-streaming src/test_streaming.cpp)
     target_link_libraries(test-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-streaming PRIVATE include src ggml/include)
+endif()
+
+if (QVAC_PARAKEET_BUILD_EXAMPLES)
+    if (NOT QVAC_PARAKEET_BUILD_LIBRARY)
+        message(FATAL_ERROR "QVAC_PARAKEET_BUILD_EXAMPLES requires QVAC_PARAKEET_BUILD_LIBRARY=ON")
+    endif()
+
+    add_executable(live-mic examples/live-mic.cpp)
+    target_link_libraries(live-mic PRIVATE qvac-parakeet)
+    target_include_directories(live-mic PRIVATE include examples)
+    target_compile_options(live-mic PRIVATE -Wno-deprecated-declarations)
+
+    if (APPLE)
+        find_library(COREAUDIO_LIBRARY CoreAudio REQUIRED)
+        find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+        find_library(AUDIOUNIT_LIBRARY AudioUnit REQUIRED)
+        find_library(AUDIOTOOLBOX_LIBRARY AudioToolbox REQUIRED)
+        target_link_libraries(live-mic PRIVATE
+            ${COREAUDIO_LIBRARY}
+            ${COREFOUNDATION_LIBRARY}
+            ${AUDIOUNIT_LIBRARY}
+            ${AUDIOTOOLBOX_LIBRARY})
+    elseif (UNIX)
+        find_package(Threads REQUIRED)
+        target_link_libraries(live-mic PRIVATE Threads::Threads dl m)
+    elseif (WIN32)
+        target_link_libraries(live-mic PRIVATE winmm ole32)
+    endif()
 endif()
 
 if (QVAC_PARAKEET_INSTALL AND QVAC_PARAKEET_BUILD_LIBRARY)

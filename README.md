@@ -319,6 +319,40 @@ drives `StreamSession` directly from its existing `append({type:'audio',
 data})` flow — each incoming `Buffer` maps to `feed_pcm_i16`, and
 `{type:'end of job'}` maps to `finalize()`.
 
+### Live microphone example
+
+`examples/live-mic.cpp` wraps `StreamSession` around
+[`miniaudio`](https://miniaud.io/) (single-header, MIT, vendored under
+`examples/miniaudio.h`) for real-time transcription from the default
+capture device on macOS / Linux / Windows. Terminal output only, no GUI.
+
+```bash
+# Built as part of the default CLI target set; gated on
+# -DQVAC_PARAKEET_BUILD_EXAMPLES=ON (on by default when the project
+# is the top-level CMake).
+
+# List capture devices:
+./build-metal/live-mic --list-devices
+
+# Transcribe live (Ctrl-C to stop, Metal backend recommended):
+./build-metal/live-mic \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf \
+    --n-gpu-layers 1 \
+    --chunk-ms 1000 --left-context-ms 5000 --right-lookahead-ms 1000
+```
+
+First time you run it macOS will prompt for microphone access. The
+capture thread pushes f32 samples into a mutex-guarded queue; the main
+thread drains the queue and calls `StreamSession::feed_pcm_f32`, so
+the encoder runs off the audio callback thread (no capture-buffer
+stalls). Ctrl-C sets a stop flag, the capture device is stopped, the
+tail buffer is flushed, `finalize()` emits the last segment, and the
+binary exits cleanly.
+
+Defaults chosen for an interactive feel: first segment lands ~2 s
+after you start speaking (`chunk_ms + right_lookahead_ms`), segments
+afterward at the `chunk_ms` cadence.
+
 ## 4. Optional: validate against NeMo PyTorch
 
 ```bash
