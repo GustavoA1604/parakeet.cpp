@@ -109,6 +109,8 @@ struct ParakeetCtcModel {
     int32_t blank_id   = 1024;
     int32_t vocab_size = 1025;
 
+    bool supports_streaming = false;
+
     SubsamplingWeights       subsampling;
     std::vector<BlockWeights> blocks;
     CtcHeadWeights            ctc;
@@ -161,6 +163,15 @@ std::vector<int32_t> ctc_greedy_decode(const float * logits,
                                        int           n_frames,
                                        int           vocab_size,
                                        int32_t       blank_id);
+
+void ctc_greedy_decode_window(const float * logits,
+                              int           start_frame,
+                              int           end_frame,
+                              int           vocab_size,
+                              int32_t       blank_id,
+                              int32_t     & inout_prev_token,
+                              std::vector<int32_t> & out_tokens,
+                              std::vector<int>     * out_first_frame = nullptr);
 
 struct BlockSubstageTimes {
     double ff1_ms  = 0.0;

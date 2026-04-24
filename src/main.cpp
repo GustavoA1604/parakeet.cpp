@@ -1,5 +1,6 @@
 #include "qvac-parakeet/qvac-parakeet.h"
 #include "qvac-parakeet/ctc/pipeline.h"
+#include "qvac-parakeet/ctc/engine.h"
 
 #include "parakeet_ctc.h"
 #include "mel_preprocess.h"
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -17,16 +19,28 @@ namespace {
 
 void print_usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s --model <parakeet-ctc.gguf> --wav <input.wav> [options]\n"
+        "usage: %s --model <parakeet-ctc.gguf> (--wav <input.wav> | --pcm-in <input.raw>) [options]\n"
         "\n"
         "options:\n"
         "  --model PATH         path to the parakeet-ctc GGUF (required)\n"
-        "  --wav PATH           path to a 16 kHz mono wav file (required)\n"
+        "  --wav PATH           path to a 16 kHz mono wav file\n"
+        "  --pcm-in PATH        path to a raw PCM file (16 kHz mono, format selected by --pcm-format)\n"
+        "  --pcm-format FMT     raw PCM sample format: s16le (default) or f32le\n"
         "  --threads N          number of CPU threads (0 = hardware_concurrency)\n"
         "  --n-gpu-layers N     offload to GPU backend when > 0 (build with\n"
         "                       -DGGML_METAL=ON / -DGGML_CUDA=ON / -DGGML_VULKAN=ON;\n"
         "                       N just needs to be >0 — the whole encoder moves)\n"
         "  --verbose            print per-stage wall times and shapes to stderr\n"
+        "\n"
+        "  --stream             enable Mode 2 streaming: runs the offline encoder once, then\n"
+        "                       emits one segment per --stream-chunk-ms window via callback.\n"
+        "                       Transcript is byte-equal to non-streaming mode; segments are\n"
+        "                       printed to stdout as they are produced.\n"
+        "  --stream-chunk-ms N  segment window stride in ms (default 1000; snaps to multiples\n"
+        "                       of the 80 ms encoder frame stride)\n"
+        "  --emit FMT           --stream output format: 'text' (default) prints segment text\n"
+        "                       one per line; 'jsonl' prints {text,start,end,chunk,is_final}\n"
+        "                       JSON Lines, one per segment\n"
         "\n"
         "  --bench              benchmark mode: run the inference path multiple times\n"
         "                       with warmup, print aggregated stats + RTF.\n"
@@ -47,6 +61,85 @@ void print_usage(const char * argv0) {
         argv0);
 }
 
+int load_raw_pcm(const std::string & path,
+                 const std::string & format,
+                 std::vector<float> & out_samples) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        std::fprintf(stderr, "error: could not open raw PCM file %s\n", path.c_str());
+        return 1;
+    }
+    const std::streamsize size = f.tellg();
+    f.seekg(0, std::ios::beg);
+    if (size <= 0) {
+        std::fprintf(stderr, "error: raw PCM file %s is empty\n", path.c_str());
+        return 2;
+    }
+    if (format == "s16le") {
+        if (size % 2 != 0) {
+            std::fprintf(stderr, "error: s16le PCM size %lld not multiple of 2\n",
+                         (long long) size);
+            return 3;
+        }
+        const size_t n = static_cast<size_t>(size) / 2;
+        std::vector<int16_t> buf(n);
+        if (!f.read(reinterpret_cast<char *>(buf.data()), size)) {
+            std::fprintf(stderr, "error: short read from %s\n", path.c_str());
+            return 4;
+        }
+        out_samples.resize(n);
+        constexpr float inv = 1.0f / 32768.0f;
+        for (size_t i = 0; i < n; ++i) out_samples[i] = (float) buf[i] * inv;
+        return 0;
+    }
+    if (format == "f32le") {
+        if (size % 4 != 0) {
+            std::fprintf(stderr, "error: f32le PCM size %lld not multiple of 4\n",
+                         (long long) size);
+            return 3;
+        }
+        const size_t n = static_cast<size_t>(size) / 4;
+        out_samples.resize(n);
+        if (!f.read(reinterpret_cast<char *>(out_samples.data()), size)) {
+            std::fprintf(stderr, "error: short read from %s\n", path.c_str());
+            return 4;
+        }
+        return 0;
+    }
+    std::fprintf(stderr, "error: unknown --pcm-format '%s' (expected s16le or f32le)\n",
+                 format.c_str());
+    return 5;
+}
+
+void emit_segment(const qvac_parakeet::ctc::StreamingSegment & seg,
+                  const std::string & format) {
+    if (format == "jsonl") {
+        std::printf("{\"chunk\":%d,\"start\":%.3f,\"end\":%.3f,\"is_final\":%s,\"text\":\"",
+                    seg.chunk_index, seg.start_s, seg.end_s,
+                    seg.is_final ? "true" : "false");
+        for (char c : seg.text) {
+            switch (c) {
+                case '"':  std::fputs("\\\"", stdout); break;
+                case '\\': std::fputs("\\\\", stdout); break;
+                case '\n': std::fputs("\\n",  stdout); break;
+                case '\r': std::fputs("\\r",  stdout); break;
+                case '\t': std::fputs("\\t",  stdout); break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) {
+                        std::printf("\\u%04x", c);
+                    } else {
+                        std::fputc(c, stdout);
+                    }
+            }
+        }
+        std::printf("\"}\n");
+    } else {
+        std::printf("[%.2f-%.2f] %s\n",
+                    seg.start_s, seg.end_s, seg.text.c_str());
+    }
+    std::fflush(stdout);
+}
+
 struct ExtraCliOpts {
     std::string dump_mel_path;
     bool        bench         = false;
@@ -56,6 +149,13 @@ struct ExtraCliOpts {
     bool        profile       = false;
     int         profile_runs  = 5;
     int         profile_warmup = 2;
+
+    std::string pcm_in_path;
+    std::string pcm_format   = "s16le";
+
+    bool        stream        = false;
+    int         stream_chunk_ms = 1000;
+    std::string emit_format  = "text";
 };
 
 double ms_since(std::chrono::steady_clock::time_point a) {
@@ -137,6 +237,16 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             extra.profile_runs = std::max(1, std::atoi(argv[++i]));
         } else if (a == "--profile-warmup" && i + 1 < argc) {
             extra.profile_warmup = std::max(0, std::atoi(argv[++i]));
+        } else if (a == "--pcm-in" && i + 1 < argc) {
+            extra.pcm_in_path = argv[++i];
+        } else if (a == "--pcm-format" && i + 1 < argc) {
+            extra.pcm_format = argv[++i];
+        } else if (a == "--stream") {
+            extra.stream = true;
+        } else if (a == "--stream-chunk-ms" && i + 1 < argc) {
+            extra.stream_chunk_ms = std::max(80, std::atoi(argv[++i]));
+        } else if (a == "--emit" && i + 1 < argc) {
+            extra.emit_format = argv[++i];
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             print_usage(argv[0]);
@@ -144,8 +254,18 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         }
     }
 
-    if (opts.model_gguf_path.empty() || opts.wav_path.empty()) {
+    if (opts.model_gguf_path.empty() ||
+        (opts.wav_path.empty() && extra.pcm_in_path.empty())) {
         print_usage(argv[0]);
+        return 2;
+    }
+    if (!opts.wav_path.empty() && !extra.pcm_in_path.empty()) {
+        std::fprintf(stderr, "error: --wav and --pcm-in are mutually exclusive\n");
+        return 2;
+    }
+    if (extra.emit_format != "text" && extra.emit_format != "jsonl") {
+        std::fprintf(stderr, "error: --emit must be 'text' or 'jsonl' (got '%s')\n",
+                     extra.emit_format.c_str());
         return 2;
     }
 
@@ -162,10 +282,17 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
     const auto t_wav = clock::now();
     std::vector<float> samples;
-    int sr = 0;
-    if (int rc = load_wav_mono_f32(opts.wav_path, samples, sr); rc != 0) {
-        std::fprintf(stderr, "error: failed to load %s (rc=%d)\n", opts.wav_path.c_str(), rc);
-        return 4;
+    int sr = model.mel_cfg.sample_rate;
+    if (!opts.wav_path.empty()) {
+        if (int rc = load_wav_mono_f32(opts.wav_path, samples, sr); rc != 0) {
+            std::fprintf(stderr, "error: failed to load %s (rc=%d)\n", opts.wav_path.c_str(), rc);
+            return 4;
+        }
+    } else {
+        if (int rc = load_raw_pcm(extra.pcm_in_path, extra.pcm_format, samples); rc != 0) {
+            return 4;
+        }
+        sr = model.mel_cfg.sample_rate;
     }
     if (sr != model.mel_cfg.sample_rate) {
         std::fprintf(stderr, "error: wav is %d Hz but model expects %d Hz (resampling not yet wired)\n",
@@ -341,6 +468,42 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             extrap("norm_out",  sub.norm_out_ms);
         } else {
             std::fprintf(stderr, "[profile] sub-stage profiling failed\n");
+        }
+        return 0;
+    }
+
+    if (extra.stream) {
+        EngineOptions eopts;
+        eopts.model_gguf_path = opts.model_gguf_path;
+        eopts.n_gpu_layers    = opts.n_gpu_layers;
+        eopts.n_threads       = opts.n_threads;
+        eopts.verbose         = opts.verbose;
+
+        Engine engine(eopts);
+
+        StreamingOptions sopts;
+        sopts.sample_rate = sr;
+        sopts.chunk_ms    = extra.stream_chunk_ms;
+
+        const std::string emit_fmt = extra.emit_format;
+        const auto t_stream = clock::now();
+
+        auto result = engine.transcribe_samples_stream(
+            samples.data(), (int) samples.size(), sr, sopts,
+            [&](const StreamingSegment & seg) {
+                emit_segment(seg, emit_fmt);
+            });
+
+        const double stream_ms = ms_since(t_stream);
+        if (opts.verbose) {
+            std::fprintf(stderr,
+                "[stream] load=%.1fms audio=%.2fs samples=%zu@%dHz mel_frames=%d enc_frames=%d\n"
+                "[stream] mel=%.1fms enc=%.1fms dec=%.1fms total=%.1fms RTF=%.3f tokens=%zu\n",
+                load_ms, audio_ms / 1000.0, samples.size(), sr,
+                result.mel_frames, result.encoder_frames,
+                result.preprocess_ms, result.encoder_ms,
+                result.decode_ms, stream_ms, stream_ms / audio_ms,
+                result.token_ids.size());
         }
         return 0;
     }

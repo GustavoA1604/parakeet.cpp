@@ -954,5 +954,187 @@ work is now outside the CPU-only scope:
     next multiple of 64 or 128 mel frames — would avoid rebuilds for
     variable-length production streams, at the cost of padding the
     mel input and masking out the tail via the `all_valid=false` path.
+    Becomes a prerequisite for Phase 8 (cache-aware streaming) where
+    every chunk is a fresh encoder call.
   - TDT / EOU / Sortformer pipelines (new architectures, not a
     CPU-opt task).
+
+## Phase 7 — streaming entry points (Mode 2)  _(done)_
+
+Scope: ship a platform-agnostic streaming API surface on `Engine` that
+mirrors the three qvac/packages/sdk transcription shapes (one-shot,
+streamed-output, duplex). Mode 2 (streamed-output) is implemented on
+top of today's offline encoder; Mode 3 (duplex) has its header +
+binding-facing API frozen but errors at runtime until Phase 8 delivers
+a cache-aware streaming GGUF.
+
+Design rationale is in the plan's scope discussion: chunked-batch on
+the offline encoder was explicitly rejected because it costs 1-3 % WER
+at 2 s chunks with no throughput win on 20 s clips, and Mode 2's
+"offline encoder + CTC-timestamp streaming" gets the same UX at zero
+accuracy cost.
+
+### 7.1 — Engine class implementation
+
+`include/qvac-parakeet/ctc/engine.h` was the declared-but-unimplemented
+surface. Phase 7 lands the definition in `src/parakeet_engine.cpp`:
+
+- `Engine(const EngineOptions &)` loads the GGUF once via
+  `load_from_gguf`, stores `ParakeetCtcModel` + cancel flag in `Impl`.
+- `Engine::transcribe(wav_path)` / `transcribe_samples(samples, n, sr)`
+  drive the existing `compute_log_mel` + `run_encoder` +
+  `ctc_greedy_decode` + `detokenize` pipeline and return an
+  `EngineResult` with per-stage timing.
+- `Engine::cancel()` sets an atomic flag; the streaming loop polls it
+  between chunks (cooperative cancellation only — the encoder graph
+  run itself is not interruptible).
+
+### 7.2 — Stateful CTC window decoder
+
+Added `ctc_greedy_decode_window(logits, start, end, vocab, blank,
+inout_prev_token, out_tokens, out_first_frame=nullptr)` in
+`src/parakeet_ctc.{h,cpp}`. The existing one-shot
+`ctc_greedy_decode()` now delegates to it with `prev_token = -1`.
+
+The stateful variant preserves collapse-repeats across window
+boundaries via a caller-managed `inout_prev_token`, so a token whose
+first argmax lands in window K and repeats in window K+1 isn't emitted
+twice. This is the core invariant that makes Mode 2 byte-equal to the
+offline path.
+
+### 7.3 — Mode 2: `transcribe_stream` / `transcribe_samples_stream`
+
+`Engine::transcribe_samples_stream(samples, n, sr, opts, on_segment)`:
+
+1. Runs the existing offline mel + encoder path once.
+2. Computes `frames_per_window = max(1, opts.chunk_ms / 80 ms)` (the
+   80 ms comes from 10 ms mel hop × 8x subsampling).
+3. Walks `[0, T_enc)` in contiguous windows, calling
+   `ctc_greedy_decode_window` with a persistent `prev_token`.
+4. After each window's decode, detokenizes the *cumulative* token list
+   and emits the delta slice as the segment text. Detokenizing
+   cumulatively rather than per-window is required because
+   `sentencepiece_bpe::detokenize` strips a leading ASCII space — if
+   we detokenized per window, the leading space of every segment
+   except the first would be silently stripped and `"hello world"`
+   would come out as `"helloworld"`. Caught by the first run of the
+   new test harness on `jfk.wav` and fixed before landing.
+5. Emits `StreamingSegment{text, token_ids, start_s, end_s,
+   chunk_index, is_final=true, encoder_ms (first segment only),
+   decode_ms}` via the caller's callback, and accumulates into
+   the returned `EngineResult`.
+
+`transcribe_stream(wav_path, opts, cb)` is a thin wrapper that loads
+the WAV and forwards to `transcribe_samples_stream`. Both return
+the full concatenated `EngineResult` so callers that want *both* the
+streaming callback *and* a final aggregate don't have to rebuild it
+themselves.
+
+### 7.4 — Mode 3 API freeze (errored)
+
+`StreamSession` declares `feed_pcm_f32(const float*, int)`,
+`feed_pcm_i16(const int16_t*, int)`, `finalize()`, `cancel()`,
+`options()`, destructor, and move ctor/assign. Implementation is in
+`src/parakeet_engine.cpp`.
+
+`Engine::stream_start(opts, cb)` probes
+`pimpl_->model.supports_streaming` (fed from the new
+`parakeet.encoder.streaming.enabled` GGUF key, added to
+`load_from_gguf`). Today's GGUFs don't set the flag, so the call
+throws `std::runtime_error` with a message pointing at Phase 8 and
+suggesting `transcribe_stream()` for full-audio cases. The
+`qvac-lib-infer-parakeet` binding can be wired against the final
+`StreamSession` shape immediately; when Phase 8 lands the error
+branch is swapped for the real state machine without touching the
+public header.
+
+### 7.5 — CLI wiring
+
+`src/main.cpp`:
+
+- `--pcm-in PATH` + `--pcm-format {s16le,f32le}` — load raw PCM
+  directly (used to validate end-to-end against `LastQuestion_long_EN.raw`
+  without adding an ffmpeg dependency to the test loop). Mutually
+  exclusive with `--wav PATH`.
+- `--stream` — route through `Engine::transcribe_samples_stream`
+  instead of the existing `run_once` path. Incompatible with `--bench`
+  / `--profile` (those continue to exercise the offline path).
+- `--stream-chunk-ms N` — segment stride (default 1000).
+- `--emit {text,jsonl}` — `text` prints `[start-end] segment` one line
+  per callback; `jsonl` prints a single JSON object per line, with
+  proper escaping of `"`, `\`, newlines, control chars. Flushes stdout
+  after each segment so downstream players/consumers see output
+  immediately.
+
+### 7.6 — Validation harness `test-streaming`
+
+`src/test_streaming.cpp` runs on a loaded Engine and asserts:
+
+- Mode 1 reference: `transcribe()` produces the baseline text.
+- Mode 2 byte-equality: for `chunk_ms ∈ {250, 500, 1000, 2000, 4000}`
+  plus `audio_duration_ms` (single-segment edge case),
+  `transcribe_stream()` segments concatenate byte-equal to Mode 1.
+- Mode 2 timestamp continuity: every segment's `start_s` matches the
+  previous `end_s` (within 1 ms rounding); `end_s > start_s`;
+  `is_final=true` for every segment in Phase 1.
+- Mode 3 error path: `stream_start()` on a non-streaming GGUF throws
+  an exception whose message mentions "streaming" or "Phase 8".
+
+Caught the cumulative-vs-per-window detokenize bug on first run; once
+fixed, all checks pass on `jfk.wav` and on the long speech clip via
+CLI byte-equality.
+
+### 7.7 — Real-world validation
+
+`LastQuestion_long_EN.raw` (5.46 min, 16 kHz s16le mono,
+`qvac/packages/qvac-lib-infer-whispercpp/examples/samples/`):
+
+- offline `--model ... --pcm-in ...` transcript: 5169 bytes, 1710
+  tokens, 4099 encoder frames.
+- `--stream --stream-chunk-ms 2000` segments concatenated: 5169 bytes,
+  byte-equal to offline (`diff` produces no output).
+- Metal Q8_0 timing: `mel=152ms enc=14941ms dec=5ms total=15099ms
+  RTF=0.046` (22x real-time). Mode 2's overhead over the offline path
+  is sub-ms (the stream variant's total wall is the encoder pass +
+  1710-token cumulative detokenize + callback dispatch).
+- `--emit jsonl` emits one correctly-escaped JSON object per segment;
+  first chunk lands at `start=0.000 end=0.480` with the first word
+  `"but"`.
+
+### 7.8 — Phase 8 design notes (not yet implemented)
+
+Phase 8 will deliver Mode 3 functional: live duplex streaming where
+the caller pushes PCM over time via `StreamSession::feed_pcm_*` and
+receives partial-then-final segments as chunks close.
+
+Prerequisites and scope tracked for Phase 8:
+
+1. **Checkpoint selection (go/no-go gate).** Evaluate candidate NeMo
+   cache-aware streaming checkpoints against Parakeet-CTC-0.6B on the
+   repo's reference clips. Primary candidate:
+   `stt_en_fastconformer_hybrid_large_streaming_multi`. Accept only
+   if WER on reference set is within ±0.5 % of current offline.
+2. **New converter** `scripts/convert-parakeet-streaming-to-gguf.py`,
+   scoped similarly to `convert-parakeet-ctc-to-gguf.py`. Sets the
+   `parakeet.encoder.streaming.enabled = true` metadata flag that
+   `stream_start()` already probes.
+3. **Streaming encoder graph**: per-layer attention KV cache tensors
+   (left-context), depthwise-conv left-state tensors, chunked +
+   left-context attention mask, streaming mel state (reflect-pad only
+   on true first/last chunk, per-chunk CMVN *or* running-mean CMVN
+   depending on what the chosen checkpoint was trained with).
+4. **Bucketed graph cache** — round chunk mel length up to a fixed
+   bucket so the 3-entry LRU graph cache reuses the compiled graph
+   across chunks. Already tracked in §5.18.
+5. `StreamingOptions` gains `left_context_ms`, `right_lookahead_ms`,
+   `emit_partials` (activated in Phase 8).
+6. Per-stage numerical parity harness vs the NeMo streaming reference,
+   following the Round 5-8 methodology.
+7. Mode 3 bring-up + `StreamSession` state machine (sample ring,
+   bucket-rounded encoder call, KV cache slide, cancellation).
+8. Wire the CLI `--pcm-in` path (plus future `--pcm-in -` for stdin)
+   through `stream_start()` for manual live-streaming testing.
+9. Expected performance (extrapolated from §6.x Metal numbers): 20 s
+   clip, `chunk_ms=500`: ~350-450 ms total, first segment ~0.55 s;
+   60 s clip, `chunk_ms=2000`: ~700 ms total (vs offline ~850 ms —
+   linear-in-T attention wins on long-form).

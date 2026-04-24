@@ -82,10 +82,11 @@ This produces the main binary plus per-stage validation harnesses:
 
 | Binary                  | What it does |
 |-------------------------|--------------|
-| `build/qvac-parakeet`   | End-to-end: wav -> text (FastConformer + CTC greedy decode + SentencePiece detokenize). |
+| `build/qvac-parakeet`   | End-to-end: wav / raw PCM -> text (FastConformer + CTC greedy decode + SentencePiece detokenize), with optional `--stream` Mode 2 output. |
 | `build/test-mel`        | 16 kHz 80-ch log-mel parity vs NeMo `AudioToMelSpectrogramPreprocessor`. |
 | `build/test-encoder`    | FastConformer encoder per-stage parity vs `dump-ctc-reference.py`. |
 | `build/test-ctc`        | CTC head + greedy decode parity vs NeMo `transcribe()`. |
+| `build/test-streaming`  | Mode 2 byte-equality + timestamp coverage + Mode 3 error-path assertions across chunk sizes {250, 500, 1000, 2000, 4000} ms. |
 
 ## 2. One-time: convert weights
 
@@ -198,6 +199,70 @@ affects file size — all three land at ~272 ms encoder on a 20 s clip.
     --wav   test/samples/jfk.wav
 ```
 
+### Raw PCM input
+
+For headless pipelines (ffmpeg / sox upstream, or the QVAC bindings), the
+CLI also accepts raw 16 kHz mono PCM via `--pcm-in`:
+
+```bash
+./build/qvac-parakeet \
+    --model models/parakeet-ctc-0.6b.gguf \
+    --pcm-in recording.raw \
+    --pcm-format s16le        # or f32le; defaults to s16le
+```
+
+### Streaming — Mode 2 (full audio in, segments streamed out)
+
+The engine exposes three transcription entry points that mirror the qvac
+SDK's `transcribe` / `transcribeStream` API:
+
+| Entry point | Caller provides | Caller receives | Status |
+|-|-|-|-|
+| `Engine::transcribe()` | full audio | full text | ships |
+| `Engine::transcribe_stream()` | full audio + callback | segments via callback | **ships (Mode 2)** |
+| `Engine::stream_start()` -> `StreamSession` | push PCM via `feed_pcm_*()` | segments via callback | API frozen, errors until a cache-aware streaming GGUF lands (Phase 8) |
+
+Mode 2 runs the offline encoder once, then walks CTC frames in
+`chunk_ms`-sized windows and emits one `StreamingSegment` per window via
+the callback. Transcript is **byte-equal** to the non-streaming path —
+`test-streaming` asserts this across chunk sizes {250, 500, 1000, 2000,
+4000} ms on every run.
+
+From the CLI:
+
+```bash
+./build/qvac-parakeet \
+    --model models/parakeet-ctc-0.6b.gguf \
+    --pcm-in recording.raw --pcm-format s16le \
+    --stream --stream-chunk-ms 1000 \
+    --emit text         # or jsonl
+```
+
+Flags:
+
+- `--stream` — enable Mode 2.
+- `--stream-chunk-ms N` — segment window stride (default 1000; snaps
+  down to multiples of the 80 ms encoder frame stride).
+- `--emit text` — one `[start-end] text` line per segment (default).
+- `--emit jsonl` — one `{"chunk","start","end","is_final","text"}` JSON
+  object per line, for easy downstream consumption.
+
+Observed on an Apple M3 Ultra (Metal Q8_0) feeding a 5.5 minute speech
+clip (`LastQuestion_long_EN.raw`, 16 kHz s16le):
+
+```
+audio=327.91s samples=5246635@16000Hz mel_frames=32792 enc_frames=4099
+mel=152ms enc=14941ms dec=5ms total=15099ms RTF=0.046 tokens=1710
+```
+
+Segments are emitted to stdout at the `--stream-chunk-ms` cadence once
+the offline encoder finishes. Mode 2 is *cosmetic streaming*: first
+segment lands after the full encoder pass; true low-latency streaming
+is the Phase 8 Mode 3 milestone (live duplex with a cache-aware
+streaming checkpoint). The API surface for Mode 3 is already frozen —
+`stream_start()` compiles and links today, and throws a clear runtime
+error until the streaming GGUF is available.
+
 ## 4. Optional: validate against NeMo PyTorch
 
 ```bash
@@ -229,7 +294,7 @@ to ~25x, but the transcript stays bit-equal on clean speech. See
 
 ## Current status
 
-Phases 0 through 6 are complete:
+Phases 0 through 7 are complete:
 
 - `qvac-parakeet --model ... --wav ...` produces the expected
   transcript end-to-end, matching NeMo PyTorch bit-equivalently on
@@ -242,11 +307,19 @@ Phases 0 through 6 are complete:
 - **Metal Q8_0**: encoder runs **73x real-time** on the M3 Ultra
   GPU. **2.5x faster than onnxruntime int8** with 21x tighter
   variance (0.83 ms stdev).
+- **Phase 7 — Mode 2 streaming output**: `Engine::transcribe_stream()`
+  walks CTC frames in `chunk_ms` windows and emits per-segment
+  callbacks, byte-equal to the offline transcript. `--stream` CLI
+  flag + `--pcm-in` raw input + `--emit text|jsonl`.
+  Mode 3 (duplex live streaming) API is frozen and errors out until
+  the Phase 8 cache-aware streaming GGUF is available.
 - See PROGRESS.md for the round-by-round journal (§5.11–5.17 for
-  Rounds 5–8, §6.x for the Metal bring-up).
+  Rounds 5–8, §6.x for the Metal bring-up, §7.x for streaming).
 
-Next: `CONV_2D_DW` op on Metal (upstream ggml contribution), Metal
-flash-attn, then TDT / EOU / Sortformer pipelines.
+Next: Phase 8 cache-aware streaming encoder (Mode 3 duplex) — checkpoint
+selection, new GGUF converter, per-layer attention KV cache + depthwise
+conv state. Then `CONV_2D_DW` on Metal (upstream ggml contribution),
+Metal flash-attn, TDT / EOU / Sortformer pipelines.
 
 ## Repository layout
 
@@ -256,14 +329,15 @@ qvac-parakeet.cpp/
                                    by scripts/setup-ggml.sh, or skipped entirely
                                    when building with -DQVAC_PARAKEET_USE_SYSTEM_GGML=ON)
   src/
-    main.cpp                     CLI (wav -> text) + qvac_parakeet_cli_main impl
+    main.cpp                     CLI (wav / raw PCM -> text, + streaming) + qvac_parakeet_cli_main impl
     cli_main.cpp                 thin main() -> qvac_parakeet_cli_main shim
     parakeet_ctc.{h,cpp}         FastConformer encoder + CTC head ggml graph + GGUF loader
+    parakeet_engine.cpp          Engine + StreamSession implementation (transcribe, transcribe_stream, stream_start)
     mel_preprocess.{h,cpp}       wav I/O + STFT + mel + CMVN
     sentencepiece_bpe.{h,cpp}    SentencePiece BPE detokenizer
     dr_wav.h                     vendored single-header WAV reader
     npy.h                        minimal .npy load / save + compare
-    test_*.cpp                   per-stage numerical-parity harnesses
+    test_*.cpp                   per-stage numerical-parity harnesses + streaming validation
   include/qvac-parakeet/
     qvac-parakeet.h              CLI entry (qvac_parakeet_cli_main)
     ctc/pipeline.h               one-shot wav -> text API

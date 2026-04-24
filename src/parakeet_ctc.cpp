@@ -260,6 +260,8 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.encoder_cfg.xscaling        = get_bool(g, "parakeet.encoder.xscaling", true);
     out_model.encoder_cfg.untie_biases    = get_bool(g, "parakeet.encoder.untie_biases", true);
 
+    out_model.supports_streaming = get_bool(g, "parakeet.encoder.streaming.enabled", false);
+
     out_model.mel_cfg.sample_rate = get_u32(g, "parakeet.preproc.sample_rate", 16000);
     out_model.mel_cfg.n_fft       = get_u32(g, "parakeet.preproc.n_fft",       512);
     out_model.mel_cfg.win_length  = get_u32(g, "parakeet.preproc.win_length",  400);
@@ -1216,21 +1218,38 @@ std::vector<int32_t> ctc_greedy_decode(const float * logits,
                                        int           vocab_size,
                                        int32_t       blank_id) {
     std::vector<int32_t> decoded;
-    decoded.reserve(n_frames);
-
     int32_t prev = -1;
-    for (int t = 0; t < n_frames; ++t) {
+    ctc_greedy_decode_window(logits, 0, n_frames, vocab_size, blank_id,
+                             prev, decoded, nullptr);
+    return decoded;
+}
+
+void ctc_greedy_decode_window(const float * logits,
+                              int           start_frame,
+                              int           end_frame,
+                              int           vocab_size,
+                              int32_t       blank_id,
+                              int32_t     & inout_prev_token,
+                              std::vector<int32_t> & out_tokens,
+                              std::vector<int>     * out_first_frame) {
+    if (start_frame < 0) start_frame = 0;
+    if (end_frame < start_frame) end_frame = start_frame;
+
+    int32_t prev = inout_prev_token;
+    for (int t = start_frame; t < end_frame; ++t) {
         const float * row = logits + static_cast<size_t>(t) * vocab_size;
         int32_t best       = 0;
         float   best_score = row[0];
         for (int i = 1; i < vocab_size; ++i) {
             if (row[i] > best_score) { best_score = row[i]; best = i; }
         }
-        if (best != blank_id && best != prev) decoded.push_back(best);
+        if (best != blank_id && best != prev) {
+            out_tokens.push_back(best);
+            if (out_first_frame) out_first_frame->push_back(t);
+        }
         prev = best;
     }
-
-    return decoded;
+    inout_prev_token = prev;
 }
 
 }

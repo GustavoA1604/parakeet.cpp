@@ -34,6 +34,7 @@ find_package(OpenMP)
 
 set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
+    src/parakeet_engine.cpp
     src/mel_preprocess.cpp
     src/sentencepiece_bpe.cpp
 )
@@ -118,6 +119,10 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-ctc PRIVATE ggml)
     target_include_directories(test-ctc PRIVATE ggml/include src)
+
+    add_executable(test-streaming src/test_streaming.cpp)
+    target_link_libraries(test-streaming PRIVATE qvac-parakeet)
+    target_include_directories(test-streaming PRIVATE include src ggml/include)
 endif()
 
 if (QVAC_PARAKEET_INSTALL AND QVAC_PARAKEET_BUILD_LIBRARY)
