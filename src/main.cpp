@@ -3,6 +3,7 @@
 #include "qvac-parakeet/ctc/engine.h"
 
 #include "parakeet_ctc.h"
+#include "parakeet_tdt.h"
 #include "mel_preprocess.h"
 
 #include <algorithm>
@@ -324,14 +325,14 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                      sr, model.mel_cfg.sample_rate);
         return 5;
     }
-    if (model.model_type != ParakeetModelType::CTC) {
-        std::fprintf(stderr, "error: loaded GGUF is a TDT (RNN-T+duration) model; the TDT decoder\n"
-                             "       is not yet implemented in this repo. Track progress in PROGRESS.md\n"
-                             "       Phase 10. For now, pass a parakeet-ctc-*.gguf.\n");
-        return 5;
-    }
     const double wav_ms = ms_since(t_wav);
     const double audio_ms = 1000.0 * (double) samples.size() / (double) sr;
+
+    if (model.model_type != ParakeetModelType::CTC && extra.stream) {
+        std::fprintf(stderr, "error: --stream is not yet wired for TDT models; use one-shot mode\n"
+                             "       (omit --stream) for parakeet-tdt-*.gguf. Tracked in PROGRESS.md Phase 10.\n");
+        return 5;
+    }
 
     auto run_once = [&](std::string & text_out, std::vector<int32_t> & ids_out,
                         int & n_frames_out, RunTimes & times) -> int {
@@ -362,9 +363,26 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         times.encoder_frames = enc_out.n_enc_frames;
 
         const auto t3 = clock::now();
-        ids_out = ctc_greedy_decode(
-            enc_out.logits.data(), enc_out.n_enc_frames, model.vocab_size, model.blank_id);
-        text_out = detokenize(model.vocab, ids_out);
+        if (model.model_type == ParakeetModelType::TDT) {
+            static TdtRuntimeWeights rt;
+            static bool rt_ready = false;
+            if (!rt_ready) {
+                if (tdt_prepare_runtime(model, rt) != 0) return 20;
+                rt_ready = true;
+            }
+            TdtDecodeOptions dopts;
+            TdtDecodeResult  dres;
+            if (int rc = tdt_greedy_decode(model, rt,
+                                           enc_out.encoder_out.data(),
+                                           enc_out.n_enc_frames, enc_out.d_model,
+                                           dopts, dres); rc != 0) return rc;
+            ids_out  = std::move(dres.token_ids);
+            text_out = std::move(dres.text);
+        } else {
+            ids_out = ctc_greedy_decode(
+                enc_out.logits.data(), enc_out.n_enc_frames, model.vocab_size, model.blank_id);
+            text_out = detokenize(model.vocab, ids_out);
+        }
         times.dec_ms = ms_since(t3);
         times.inference_ms = times.mel_ms + times.enc_ms + times.dec_ms;
         times.tokens = (int) ids_out.size();

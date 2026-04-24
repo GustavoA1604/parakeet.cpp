@@ -36,6 +36,7 @@ find_package(OpenMP)
 set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
     src/parakeet_engine.cpp
+    src/parakeet_tdt.cpp
     src/mel_preprocess.cpp
     src/sentencepiece_bpe.cpp
 )
@@ -129,6 +130,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_tdt.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml)

@@ -1,6 +1,7 @@
 #include "qvac-parakeet/ctc/engine.h"
 
 #include "parakeet_ctc.h"
+#include "parakeet_tdt.h"
 #include "mel_preprocess.h"
 #include "sentencepiece_bpe.h"
 
@@ -33,6 +34,9 @@ struct Engine::Impl {
     ParakeetCtcModel    model;
     std::atomic<bool>   cancel_flag{false};
 
+    TdtRuntimeWeights   tdt_rt;
+    bool                tdt_ready = false;
+
     Impl() = default;
 };
 
@@ -49,17 +53,24 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
                                  opts.model_gguf_path +
                                  "' (rc=" + std::to_string(rc) + ")");
     }
+
+    if (pimpl_->model.model_type == ParakeetModelType::TDT) {
+        if (tdt_prepare_runtime(pimpl_->model, pimpl_->tdt_rt) != 0) {
+            throw std::runtime_error("Engine: tdt_prepare_runtime failed");
+        }
+        pimpl_->tdt_ready = true;
+    }
 }
 
 namespace {
 
-void ensure_ctc_model(const ParakeetCtcModel & model, const char * context) {
+void ensure_ctc_only(const ParakeetCtcModel & model, const char * context) {
     if (model.model_type != ParakeetModelType::CTC) {
         throw std::runtime_error(
             std::string(context) +
-            ": loaded GGUF is a TDT (RNN-T + duration) model; the TDT decoder "
-            "is not yet implemented in this repo. Track progress in PROGRESS.md "
-            "Phase 10. Use a parakeet-ctc-*.gguf for now.");
+            ": loaded GGUF is a TDT model; streaming (Mode 2/3) is not yet "
+            "wired for TDT. Phase 10 tracks this follow-up. For TDT use "
+            "Engine::transcribe()/transcribe_samples() (one-shot only).");
     }
 }
 
@@ -96,7 +107,6 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
                                  std::to_string(sample_rate) + " Hz but model expects " +
                                  std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
     }
-    ensure_ctc_model(pimpl_->model, "qvac_parakeet::ctc::Engine::transcribe_samples");
 
     pimpl_->cancel_flag.store(false);
 
@@ -123,10 +133,25 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     const double encoder_ms = ms_since(t_enc);
 
     const auto t_dec = clock::now();
-    std::vector<int32_t> ids = ctc_greedy_decode(
-        enc_out.logits.data(), enc_out.n_enc_frames,
-        pimpl_->model.vocab_size, pimpl_->model.blank_id);
-    std::string text = detokenize(pimpl_->model.vocab, ids);
+    std::vector<int32_t> ids;
+    std::string text;
+    if (pimpl_->model.model_type == ParakeetModelType::TDT) {
+        TdtDecodeOptions dopts;
+        TdtDecodeResult  dres;
+        if (int rc = tdt_greedy_decode(pimpl_->model, pimpl_->tdt_rt,
+                                       enc_out.encoder_out.data(),
+                                       enc_out.n_enc_frames, enc_out.d_model,
+                                       dopts, dres); rc != 0) {
+            throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples: tdt_greedy_decode failed (rc=" +
+                                     std::to_string(rc) + ")");
+        }
+        ids  = std::move(dres.token_ids);
+        text = std::move(dres.text);
+    } else {
+        ids  = ctc_greedy_decode(enc_out.logits.data(), enc_out.n_enc_frames,
+                                 pimpl_->model.vocab_size, pimpl_->model.blank_id);
+        text = detokenize(pimpl_->model.vocab, ids);
+    }
     const double decode_ms = ms_since(t_dec);
 
     EngineResult result;
@@ -177,7 +202,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
         throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: "
                                  "StreamingOptions.chunk_ms must be > 0");
     }
-    ensure_ctc_model(pimpl_->model, "qvac_parakeet::ctc::Engine::transcribe_samples_stream");
+    ensure_ctc_only(pimpl_->model, "qvac_parakeet::ctc::Engine::transcribe_samples_stream");
 
     pimpl_->cancel_flag.store(false);
 
@@ -494,7 +519,7 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     if (opts.left_context_ms < 0 || opts.right_lookahead_ms < 0) {
         throw std::runtime_error("Engine::stream_start: left_context_ms and right_lookahead_ms must be >= 0");
     }
-    ensure_ctc_model(pimpl_->model, "Engine::stream_start");
+    ensure_ctc_only(pimpl_->model, "Engine::stream_start");
 
     auto impl = std::make_unique<StreamSession::Impl>();
     impl->engine_impl  = pimpl_.get();
