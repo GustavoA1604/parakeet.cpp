@@ -324,6 +324,12 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                      sr, model.mel_cfg.sample_rate);
         return 5;
     }
+    if (model.model_type != ParakeetModelType::CTC) {
+        std::fprintf(stderr, "error: loaded GGUF is a TDT (RNN-T+duration) model; the TDT decoder\n"
+                             "       is not yet implemented in this repo. Track progress in PROGRESS.md\n"
+                             "       Phase 10. For now, pass a parakeet-ctc-*.gguf.\n");
+        return 5;
+    }
     const double wav_ms = ms_since(t_wav);
     const double audio_ms = 1000.0 * (double) samples.size() / (double) sr;
 

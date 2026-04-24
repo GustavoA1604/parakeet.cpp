@@ -149,6 +149,16 @@ ggml_tensor * require_tensor(ggml_context * ctx, const std::string & name) {
     return t;
 }
 
+ggml_tensor * maybe_tensor(ggml_context * ctx, const std::string & name) {
+    return ggml_get_tensor(ctx, name.c_str());
+}
+
+std::string get_str(const gguf_context * g, const std::string & k, const std::string & fallback) {
+    const int id = find_key(g, k);
+    if (id < 0) return fallback;
+    return gguf_get_val_str(g, id);
+}
+
 std::vector<float> read_filterbank_to_vector(ggml_tensor * t) {
     const size_t n_elts = ggml_nelements(t);
     std::vector<float> out(n_elts);
@@ -259,8 +269,31 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.encoder_cfg.pos_emb_max_len = get_u32(g, "parakeet.encoder.pos_emb_max_len", 5000);
     out_model.encoder_cfg.xscaling        = get_bool(g, "parakeet.encoder.xscaling", true);
     out_model.encoder_cfg.untie_biases    = get_bool(g, "parakeet.encoder.untie_biases", true);
+    out_model.encoder_cfg.use_bias        = get_bool(g, "parakeet.encoder.use_bias", true);
 
     out_model.supports_streaming = get_bool(g, "parakeet.encoder.streaming.enabled", false);
+
+    const std::string mtype_str = get_str(g, "parakeet.model.type", "ctc");
+    out_model.model_type =
+        (mtype_str == "tdt") ? ParakeetModelType::TDT : ParakeetModelType::CTC;
+
+    if (out_model.model_type == ParakeetModelType::TDT) {
+        out_model.encoder_cfg.tdt_pred_hidden     = get_u32(g, "parakeet.tdt.pred_hidden",     640);
+        out_model.encoder_cfg.tdt_pred_rnn_layers = get_u32(g, "parakeet.tdt.pred_rnn_layers", 2);
+        out_model.encoder_cfg.tdt_joint_hidden    = get_u32(g, "parakeet.tdt.joint_hidden",    640);
+        out_model.encoder_cfg.tdt_num_durations   = get_u32(g, "parakeet.tdt.num_durations",   5);
+        out_model.vocab_size = get_u32(g, "parakeet.tdt.vocab_size", 8192);
+        out_model.blank_id   = get_u32(g, "parakeet.tdt.blank_id",   out_model.vocab_size);
+
+        const int did = find_key(g, "parakeet.tdt.durations");
+        if (did >= 0) {
+            const size_t n = gguf_get_arr_n(g, did);
+            const int32_t * data = static_cast<const int32_t *>(gguf_get_arr_data(g, did));
+            out_model.tdt_durations.assign(data, data + n);
+        } else {
+            out_model.tdt_durations = {0, 1, 2, 3, 4};
+        }
+    }
 
     out_model.mel_cfg.sample_rate = get_u32(g, "parakeet.preproc.sample_rate", 16000);
     out_model.mel_cfg.n_fft       = get_u32(g, "parakeet.preproc.n_fft",       512);
@@ -271,8 +304,10 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.mel_cfg.log_zero_guard_value =
         get_f32(g, "parakeet.preproc.log_zero_guard_value", 5.96046448e-08f);
 
-    out_model.vocab_size = get_u32(g, "parakeet.ctc.vocab_size", 1025);
-    out_model.blank_id   = get_u32(g, "parakeet.ctc.blank_id",   1024);
+    if (out_model.model_type == ParakeetModelType::CTC) {
+        out_model.vocab_size = get_u32(g, "parakeet.ctc.vocab_size", 1025);
+        out_model.blank_id   = get_u32(g, "parakeet.ctc.blank_id",   1024);
+    }
     out_model.vocab.blank_id = out_model.blank_id;
 
     {
@@ -308,17 +343,17 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.mel_cfg.window     = read_filterbank_to_vector(out_model.window);
 
     out_model.subsampling.conv0_w    = require_tensor(impl->ctx, "encoder.subsampling.conv0.weight");
-    out_model.subsampling.conv0_b    = require_tensor(impl->ctx, "encoder.subsampling.conv0.bias");
+    out_model.subsampling.conv0_b    = maybe_tensor(impl->ctx, "encoder.subsampling.conv0.bias");
     out_model.subsampling.conv1_dw_w = require_tensor(impl->ctx, "encoder.subsampling.conv1_dw.weight");
-    out_model.subsampling.conv1_dw_b = require_tensor(impl->ctx, "encoder.subsampling.conv1_dw.bias");
+    out_model.subsampling.conv1_dw_b = maybe_tensor(impl->ctx, "encoder.subsampling.conv1_dw.bias");
     out_model.subsampling.conv1_pw_w = require_tensor(impl->ctx, "encoder.subsampling.conv1_pw.weight");
-    out_model.subsampling.conv1_pw_b = require_tensor(impl->ctx, "encoder.subsampling.conv1_pw.bias");
+    out_model.subsampling.conv1_pw_b = maybe_tensor(impl->ctx, "encoder.subsampling.conv1_pw.bias");
     out_model.subsampling.conv2_dw_w = require_tensor(impl->ctx, "encoder.subsampling.conv2_dw.weight");
-    out_model.subsampling.conv2_dw_b = require_tensor(impl->ctx, "encoder.subsampling.conv2_dw.bias");
+    out_model.subsampling.conv2_dw_b = maybe_tensor(impl->ctx, "encoder.subsampling.conv2_dw.bias");
     out_model.subsampling.conv2_pw_w = require_tensor(impl->ctx, "encoder.subsampling.conv2_pw.weight");
-    out_model.subsampling.conv2_pw_b = require_tensor(impl->ctx, "encoder.subsampling.conv2_pw.bias");
+    out_model.subsampling.conv2_pw_b = maybe_tensor(impl->ctx, "encoder.subsampling.conv2_pw.bias");
     out_model.subsampling.out_w      = require_tensor(impl->ctx, "encoder.subsampling.out.weight");
-    out_model.subsampling.out_b      = require_tensor(impl->ctx, "encoder.subsampling.out.bias");
+    out_model.subsampling.out_b      = maybe_tensor(impl->ctx, "encoder.subsampling.out.bias");
 
     out_model.blocks.resize(out_model.encoder_cfg.n_layers);
     for (int i = 0; i < out_model.encoder_cfg.n_layers; ++i) {
@@ -328,22 +363,22 @@ int load_from_gguf(const std::string & gguf_path,
         b.norm_ff1_w  = require_tensor(impl->ctx, p + "norm_ff1.weight");
         b.norm_ff1_b  = require_tensor(impl->ctx, p + "norm_ff1.bias");
         b.ff1_l1_w    = require_tensor(impl->ctx, p + "ff1.linear1.weight");
-        b.ff1_l1_b    = require_tensor(impl->ctx, p + "ff1.linear1.bias");
+        b.ff1_l1_b    = maybe_tensor(impl->ctx, p + "ff1.linear1.bias");
         b.ff1_l2_w    = require_tensor(impl->ctx, p + "ff1.linear2.weight");
-        b.ff1_l2_b    = require_tensor(impl->ctx, p + "ff1.linear2.bias");
+        b.ff1_l2_b    = maybe_tensor(impl->ctx, p + "ff1.linear2.bias");
 
         b.norm_attn_w = require_tensor(impl->ctx, p + "norm_attn.weight");
         b.norm_attn_b = require_tensor(impl->ctx, p + "norm_attn.bias");
         b.attn_q_w    = require_tensor(impl->ctx, p + "attn.q.weight");
-        b.attn_q_b    = require_tensor(impl->ctx, p + "attn.q.bias");
+        b.attn_q_b    = maybe_tensor(impl->ctx, p + "attn.q.bias");
         b.attn_k_w    = require_tensor(impl->ctx, p + "attn.k.weight");
-        b.attn_k_b    = require_tensor(impl->ctx, p + "attn.k.bias");
+        b.attn_k_b    = maybe_tensor(impl->ctx, p + "attn.k.bias");
         b.attn_v_w    = require_tensor(impl->ctx, p + "attn.v.weight");
-        b.attn_v_b    = require_tensor(impl->ctx, p + "attn.v.bias");
-        b.attn_qkv_w  = ggml_get_tensor(impl->ctx, (p + "attn.qkv.weight").c_str());
-        b.attn_qkv_b  = ggml_get_tensor(impl->ctx, (p + "attn.qkv.bias").c_str());
+        b.attn_v_b    = maybe_tensor(impl->ctx, p + "attn.v.bias");
+        b.attn_qkv_w  = maybe_tensor(impl->ctx, p + "attn.qkv.weight");
+        b.attn_qkv_b  = maybe_tensor(impl->ctx, p + "attn.qkv.bias");
         b.attn_out_w  = require_tensor(impl->ctx, p + "attn.out.weight");
-        b.attn_out_b  = require_tensor(impl->ctx, p + "attn.out.bias");
+        b.attn_out_b  = maybe_tensor(impl->ctx, p + "attn.out.bias");
         b.attn_pos_w  = require_tensor(impl->ctx, p + "attn.pos.weight");
         b.pos_bias_u  = require_tensor(impl->ctx, p + "attn.pos_bias_u");
         b.pos_bias_v  = require_tensor(impl->ctx, p + "attn.pos_bias_v");
@@ -351,27 +386,46 @@ int load_from_gguf(const std::string & gguf_path,
         b.norm_conv_w = require_tensor(impl->ctx, p + "norm_conv.weight");
         b.norm_conv_b = require_tensor(impl->ctx, p + "norm_conv.bias");
         b.conv_pw1_w  = require_tensor(impl->ctx, p + "conv.pw1.weight");
-        b.conv_pw1_b  = require_tensor(impl->ctx, p + "conv.pw1.bias");
+        b.conv_pw1_b  = maybe_tensor(impl->ctx, p + "conv.pw1.bias");
         b.conv_dw_w   = require_tensor(impl->ctx, p + "conv.dw.weight");
-        b.conv_dw_b   = require_tensor(impl->ctx, p + "conv.dw.bias");
+        b.conv_dw_b   = maybe_tensor(impl->ctx, p + "conv.dw.bias");
         b.conv_bn_scale = require_tensor(impl->ctx, p + "conv.bn.scale");
         b.conv_bn_shift = require_tensor(impl->ctx, p + "conv.bn.shift");
         b.conv_pw2_w  = require_tensor(impl->ctx, p + "conv.pw2.weight");
-        b.conv_pw2_b  = require_tensor(impl->ctx, p + "conv.pw2.bias");
+        b.conv_pw2_b  = maybe_tensor(impl->ctx, p + "conv.pw2.bias");
 
         b.norm_ff2_w  = require_tensor(impl->ctx, p + "norm_ff2.weight");
         b.norm_ff2_b  = require_tensor(impl->ctx, p + "norm_ff2.bias");
         b.ff2_l1_w    = require_tensor(impl->ctx, p + "ff2.linear1.weight");
-        b.ff2_l1_b    = require_tensor(impl->ctx, p + "ff2.linear1.bias");
+        b.ff2_l1_b    = maybe_tensor(impl->ctx, p + "ff2.linear1.bias");
         b.ff2_l2_w    = require_tensor(impl->ctx, p + "ff2.linear2.weight");
-        b.ff2_l2_b    = require_tensor(impl->ctx, p + "ff2.linear2.bias");
+        b.ff2_l2_b    = maybe_tensor(impl->ctx, p + "ff2.linear2.bias");
 
         b.norm_out_w  = require_tensor(impl->ctx, p + "norm_out.weight");
         b.norm_out_b  = require_tensor(impl->ctx, p + "norm_out.bias");
     }
 
-    out_model.ctc.w = require_tensor(impl->ctx, "ctc.decoder.weight");
-    out_model.ctc.b = require_tensor(impl->ctx, "ctc.decoder.bias");
+    if (out_model.model_type == ParakeetModelType::CTC) {
+        out_model.ctc.w = require_tensor(impl->ctx, "ctc.decoder.weight");
+        out_model.ctc.b = require_tensor(impl->ctx, "ctc.decoder.bias");
+    } else {
+        out_model.tdt.predict_embed = require_tensor(impl->ctx, "tdt.predict.embed.weight");
+        for (int l = 0; l < out_model.encoder_cfg.tdt_pred_rnn_layers; ++l) {
+            const std::string pl = "tdt.predict.lstm." + std::to_string(l) + ".";
+            TdtLstmLayer lyr;
+            lyr.w_ih = require_tensor(impl->ctx, pl + "w_ih");
+            lyr.w_hh = require_tensor(impl->ctx, pl + "w_hh");
+            lyr.b_ih = require_tensor(impl->ctx, pl + "b_ih");
+            lyr.b_hh = require_tensor(impl->ctx, pl + "b_hh");
+            out_model.tdt.lstm.push_back(lyr);
+        }
+        out_model.tdt.joint_enc_w  = require_tensor(impl->ctx, "tdt.joint.enc.weight");
+        out_model.tdt.joint_enc_b  = require_tensor(impl->ctx, "tdt.joint.enc.bias");
+        out_model.tdt.joint_pred_w = require_tensor(impl->ctx, "tdt.joint.pred.weight");
+        out_model.tdt.joint_pred_b = require_tensor(impl->ctx, "tdt.joint.pred.bias");
+        out_model.tdt.joint_out_w  = require_tensor(impl->ctx, "tdt.joint.out.weight");
+        out_model.tdt.joint_out_b  = require_tensor(impl->ctx, "tdt.joint.out.bias");
+    }
 
     if (impl->backend_blas) {
         ggml_backend_free(impl->backend_blas);
@@ -391,17 +445,30 @@ int load_from_gguf(const std::string & gguf_path,
 }
 
 void print_model_summary(const ParakeetCtcModel & m) {
-    std::fprintf(stderr, "parakeet-ctc loaded:\n");
-    std::fprintf(stderr, "  encoder: d_model=%d n_layers=%d n_heads=%d head_dim=%d ff_dim=%d conv_k=%d sub=%dx xscaling=%d untie=%d\n",
+    const char * mt = m.model_type == ParakeetModelType::TDT ? "tdt" : "ctc";
+    std::fprintf(stderr, "parakeet-%s loaded:\n", mt);
+    std::fprintf(stderr, "  encoder: d_model=%d n_layers=%d n_heads=%d head_dim=%d ff_dim=%d conv_k=%d sub=%dx xscaling=%d untie=%d use_bias=%d\n",
                  m.encoder_cfg.d_model, m.encoder_cfg.n_layers, m.encoder_cfg.n_heads,
                  m.encoder_cfg.head_dim, m.encoder_cfg.ff_dim, m.encoder_cfg.conv_kernel,
                  m.encoder_cfg.subsampling_factor,
-                 (int) m.encoder_cfg.xscaling, (int) m.encoder_cfg.untie_biases);
+                 (int) m.encoder_cfg.xscaling, (int) m.encoder_cfg.untie_biases,
+                 (int) m.encoder_cfg.use_bias);
     std::fprintf(stderr, "  preproc: sr=%d n_fft=%d win=%d hop=%d n_mels=%d preemph=%.2f log_guard=%.2e\n",
                  m.mel_cfg.sample_rate, m.mel_cfg.n_fft, m.mel_cfg.win_length,
                  m.mel_cfg.hop_length, m.mel_cfg.n_mels, m.mel_cfg.preemph,
                  (double) m.mel_cfg.log_zero_guard_value);
-    std::fprintf(stderr, "  ctc:     vocab=%d blank=%d\n", m.vocab_size, m.blank_id);
+    if (m.model_type == ParakeetModelType::CTC) {
+        std::fprintf(stderr, "  ctc:     vocab=%d blank=%d\n", m.vocab_size, m.blank_id);
+    } else {
+        std::fprintf(stderr, "  tdt:     vocab=%d blank=%d pred_hidden=%d pred_layers=%d joint_hidden=%d durations=[",
+                     m.vocab_size, m.blank_id,
+                     m.encoder_cfg.tdt_pred_hidden, m.encoder_cfg.tdt_pred_rnn_layers,
+                     m.encoder_cfg.tdt_joint_hidden);
+        for (size_t i = 0; i < m.tdt_durations.size(); ++i) {
+            std::fprintf(stderr, "%s%d", i ? "," : "", m.tdt_durations[i]);
+        }
+        std::fprintf(stderr, "]\n");
+    }
     std::fprintf(stderr, "  tensors: filterbank=%ldx%ld window=%ld blocks=%zu\n",
                  (long) m.mel_filterbank->ne[0], (long) m.mel_filterbank->ne[1],
                  (long) m.window->ne[0], m.blocks.size());
@@ -543,15 +610,19 @@ ggml_tensor * layer_norm_affine(ggml_context * ctx, ggml_tensor * x,
     return x;
 }
 
+ggml_tensor * maybe_add_bias(ggml_context * ctx, ggml_tensor * x, ggml_tensor * bias) {
+    return bias ? ggml_add(ctx, x, bias) : x;
+}
+
 ggml_tensor * conformer_ff_graph(ggml_context * ctx, ggml_tensor * x,
                                  ggml_tensor * norm_w, ggml_tensor * norm_b,
                                  ggml_tensor * l1_w,  ggml_tensor * l1_b,
                                  ggml_tensor * l2_w,  ggml_tensor * l2_b,
                                  float eps) {
     x = layer_norm_affine(ctx, x, norm_w, norm_b, eps);
-    x = ggml_add(ctx, ggml_mul_mat(ctx, l1_w, x), l1_b);
+    x = maybe_add_bias(ctx, ggml_mul_mat(ctx, l1_w, x), l1_b);
     x = ggml_silu(ctx, x);
-    x = ggml_add(ctx, ggml_mul_mat(ctx, l2_w, x), l2_b);
+    x = maybe_add_bias(ctx, ggml_mul_mat(ctx, l2_w, x), l2_b);
     return x;
 }
 
@@ -559,9 +630,9 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
                                 ggml_tensor * pos_emb,
                                 const BlockWeights & W,
                                 int H, int HD, int T) {
-    ggml_tensor * q = ggml_add(ctx, ggml_mul_mat(ctx, W.attn_q_w, xn), W.attn_q_b);
-    ggml_tensor * k = ggml_add(ctx, ggml_mul_mat(ctx, W.attn_k_w, xn), W.attn_k_b);
-    ggml_tensor * v = ggml_add(ctx, ggml_mul_mat(ctx, W.attn_v_w, xn), W.attn_v_b);
+    ggml_tensor * q = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_q_w, xn), W.attn_q_b);
+    ggml_tensor * k = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_k_w, xn), W.attn_k_b);
+    ggml_tensor * v = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_v_w, xn), W.attn_v_b);
     ggml_tensor * p = ggml_mul_mat(ctx, W.attn_pos_w, pos_emb);
 
     q = ggml_reshape_3d(ctx, q, HD, H, T);
@@ -598,7 +669,7 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * attn_out  = ggml_flash_attn_ext(ctx, q_u, k_perm, v_perm, bd_mask,
                                                   scale, 0.0f, 0.0f);
     ggml_tensor * flat      = ggml_reshape_2d(ctx, attn_out, HD * H, T);
-    return ggml_add(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
+    return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
 #else
     ggml_tensor * ac     = ggml_mul_mat(ctx, k_perm, q_u);
     ggml_tensor * scores = ggml_add(ctx, ac, bd_final);
@@ -610,7 +681,7 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * merged   = ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3));
     ggml_tensor * flat     = ggml_reshape_2d(ctx, merged, HD * H, T);
 
-    return ggml_add(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
+    return maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_out_w, flat), W.attn_out_b);
 #endif
 }
 
@@ -620,7 +691,7 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
                                    bool use_conv2d_dw) {
     ggml_tensor * pw1_w_2d = ggml_reshape_2d(ctx, W.conv_pw1_w, d_model, 2 * d_model);
     ggml_tensor * y = ggml_mul_mat(ctx, pw1_w_2d, xn);
-    y = ggml_add(ctx, y, W.conv_pw1_b);
+    y = maybe_add_bias(ctx, y, W.conv_pw1_b);
 
     ggml_tensor * half1 = ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
                                        y->nb[1], y->nb[2], 0);
@@ -644,7 +715,9 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
     } else {
         yt = ggml_conv_1d_dw(ctx, W.conv_dw_w, yt, 1, pad, 1);
     }
-    yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_dw_b, 1, d_model));
+    if (W.conv_dw_b) {
+        yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_dw_b, 1, d_model));
+    }
 
     yt = ggml_mul(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_scale, 1, d_model));
     yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_shift, 1, d_model));
@@ -655,7 +728,7 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
 
     ggml_tensor * pw2_w_2d = ggml_reshape_2d(ctx, W.conv_pw2_w, d_model, d_model);
     y = ggml_mul_mat(ctx, pw2_w_2d, y);
-    y = ggml_add(ctx, y, W.conv_pw2_b);
+    y = maybe_add_bias(ctx, y, W.conv_pw2_b);
 
     return y;
 }
@@ -848,7 +921,9 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     ggml_set_name(g.sub_out_node, "subsampling_out");
     ggml_set_output(g.sub_out_node);
 
-    x = ggml_scale(gctx, x, std::sqrt((float) d_model));
+    if (enc.xscaling) {
+        x = ggml_scale(gctx, x, std::sqrt((float) d_model));
+    }
 
     int n_run_layers = n_run_layers_override;
     if (n_run_layers < 0) {
@@ -922,9 +997,13 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     ggml_set_name(g.encoder_out_node, "encoder_out");
     ggml_set_output(g.encoder_out_node);
 
-    g.logits_node = ggml_add(gctx, ggml_mul_mat(gctx, model.ctc.w, x), model.ctc.b);
-    ggml_set_name(g.logits_node, "logits");
-    ggml_set_output(g.logits_node);
+    if (model.model_type == ParakeetModelType::CTC && model.ctc.w && model.ctc.b) {
+        g.logits_node = ggml_add(gctx, ggml_mul_mat(gctx, model.ctc.w, x), model.ctc.b);
+        ggml_set_name(g.logits_node, "logits");
+        ggml_set_output(g.logits_node);
+    } else {
+        g.logits_node = nullptr;
+    }
 
     g.cgraph = ggml_new_graph_custom(gctx, graph_slots, false);
     ggml_build_forward_expand(g.cgraph, g.sub_out_node);
@@ -935,7 +1014,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     if (g.block_0_out_node)    ggml_build_forward_expand(g.cgraph, g.block_0_out_node);
     if (g.block_last_out_node) ggml_build_forward_expand(g.cgraph, g.block_last_out_node);
     ggml_build_forward_expand(g.cgraph, g.encoder_out_node);
-    ggml_build_forward_expand(g.cgraph, g.logits_node);
+    if (g.logits_node) ggml_build_forward_expand(g.cgraph, g.logits_node);
 
     g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     if (!g.alloc || !ggml_gallocr_reserve(g.alloc, g.cgraph)) {

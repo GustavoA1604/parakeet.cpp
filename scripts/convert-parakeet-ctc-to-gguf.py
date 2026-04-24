@@ -1,41 +1,37 @@
 #!/usr/bin/env python3
-"""Convert NVIDIA Parakeet-CTC-0.6B (NeMo .nemo archive) to a single GGUF.
+"""Convert an NVIDIA Parakeet checkpoint (NeMo .nemo archive) to a single GGUF.
 
-Output layout (see src/parakeet_ctc.h for the consumer):
+Auto-detects the model flavour from ``cfg['target']``:
+
+  - ``EncDecCTCModelBPE``     -> CTC head only  (parakeet-ctc-0.6b, -1.1b)
+  - ``EncDecRNNTBPEModel``    -> TDT (RNN-T + duration head) (parakeet-tdt-0.6b-v3)
+
+The encoder topology is shared; only the decoder tensors + metadata differ.
+
+Output GGUF layout (see src/parakeet_ctc.h / src/parakeet_tdt.h for the
+consumer structs):
 
   Metadata:
-    general.architecture  = "parakeet-ctc"
-    general.name          = "parakeet-ctc-0.6b"
-    parakeet.encoder.*    (hyperparameters)
+    general.architecture  = "parakeet-ctc"  (kept for GGUF compat)
+    general.name          = "<derived from cfg>"
+    parakeet.model.type   = "ctc" or "tdt"
+    parakeet.encoder.*    (hyperparameters, incl. use_bias, xscaling)
     parakeet.preproc.*    (mel/stft hyperparameters)
-    parakeet.ctc.*        (vocab_size, blank_id)
+    parakeet.ctc.*        (vocab_size, blank_id)        [CTC only]
+    parakeet.tdt.*        (predictor + joint hyperparameters + durations) [TDT only]
     tokenizer.ggml.model  = "sentencepiece"
     tokenizer.ggml.sentencepiece_model = <raw tokenizer.model bytes>
 
   Tensors:
-    preproc.mel_filterbank            (80, 257)   f32
-    preproc.window                    (400,)      f32
-    encoder.subsampling.conv0.weight  (256,1,3,3) f16/f32
-    encoder.subsampling.conv0.bias    (256,)      f32
-    encoder.subsampling.conv{1,2}_dw.weight/.bias (depthwise stages)
-    encoder.subsampling.conv{1,2}_pw.weight/.bias (pointwise stages)
-    encoder.subsampling.out.weight    (1024,2560) f16/f32
-    encoder.subsampling.out.bias      (1024,)     f32
-    encoder.blk.{i}.norm_ff1.{weight,bias}
-    encoder.blk.{i}.ff1.linear{1,2}.{weight,bias}
-    encoder.blk.{i}.norm_attn.{weight,bias}
-    encoder.blk.{i}.attn.{q,k,v,pos,out}.weight / bias
-    encoder.blk.{i}.attn.pos_bias_{u,v}
-    encoder.blk.{i}.norm_conv.{weight,bias}
-    encoder.blk.{i}.conv.pw1.{weight,bias}
-    encoder.blk.{i}.conv.dw.{weight,bias}
-    encoder.blk.{i}.conv.bn.{scale,shift}        (pre-fused BN)
-    encoder.blk.{i}.conv.pw2.{weight,bias}
-    encoder.blk.{i}.norm_ff2.{weight,bias}
-    encoder.blk.{i}.ff2.linear{1,2}.{weight,bias}
-    encoder.blk.{i}.norm_out.{weight,bias}
-    ctc.decoder.weight                 (1025, 1024) f16/f32
-    ctc.decoder.bias                   (1025,)      f32
+    preproc.mel_filterbank            (n_mels, 257)   f32
+    preproc.window                    (400,)          f32
+    encoder.subsampling.{conv0,conv{1,2}_{dw,pw},out}.{weight,bias?}
+    encoder.blk.{i}.* (24 or 42 blocks; biases omitted when use_bias=False)
+    ctc.decoder.{weight,bias}                           [CTC only]
+    tdt.predict.embed.weight                            [TDT only]
+    tdt.predict.lstm.{l}.{w_ih,w_hh,b_ih,b_hh}         [TDT only]
+    tdt.joint.{enc,pred}.{weight,bias}                  [TDT only]
+    tdt.joint.out.{weight,bias}                         [TDT only]
 """
 
 import argparse
@@ -77,8 +73,7 @@ def parse_args() -> argparse.Namespace:
                    help="Output GGUF path.")
     p.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
                    help="Weight dtype for 2D projection matrices. Biases / norms / BN "
-                        "stay at f32. f32 default for the first bring-up; flip to f16 "
-                        "once parity passes to halve model size.")
+                        "stay at f32. f16 default; use q8_0 for ~2x smaller.")
     p.add_argument("--hf-repo", default="nvidia/parakeet-ctc-0.6b",
                    help="HF model id to download from if --ckpt is missing.")
     return p.parse_args()
@@ -92,7 +87,7 @@ def ensure_ckpt(path: Path, hf_repo: str) -> Path:
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     cache = path.parent / "hf-cache"
     cache.mkdir(parents=True, exist_ok=True)
-    src = hf_hub_download(repo_id=hf_repo, filename="parakeet-ctc-0.6b.nemo", cache_dir=str(cache))
+    src = hf_hub_download(repo_id=hf_repo, filename=path.name, cache_dir=str(cache))
     path.parent.mkdir(parents=True, exist_ok=True)
     import shutil
     shutil.copy(src, path)
@@ -119,6 +114,13 @@ def load_nemo(ckpt: Path):
     return cfg, sd, tok_bytes
 
 
+def detect_model_type(cfg: dict) -> str:
+    target = cfg.get("target", "")
+    if "RNNT" in target or "tdt" in cfg.get("loss", {}).get("loss_name", "").lower():
+        return "tdt"
+    return "ctc"
+
+
 def as_np(t: torch.Tensor, dtype=None) -> np.ndarray:
     a = t.detach().cpu().numpy()
     if dtype is not None:
@@ -133,6 +135,8 @@ def fuse_bn(weight, bias, running_mean, running_var, eps=1e-5):
 
 
 def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
+    model_type = detect_model_type(cfg)
+
     enc = cfg["encoder"]
     pre = cfg["preprocessor"]
     dec = cfg["decoder"]
@@ -148,6 +152,7 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     xscaling      = bool(enc.get("xscaling", True))
     untie_biases  = bool(enc.get("untie_biases", True))
     pos_max_len   = int(enc.get("pos_emb_max_len", 5000))
+    use_bias      = bool(enc.get("use_bias", True))
 
     feat_in       = int(enc["feat_in"])
     sub_freq_bins = feat_in
@@ -160,14 +165,17 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     win_length    = int(round(float(pre["window_size"]) * sample_rate))
     hop_length    = int(round(float(pre["window_stride"]) * sample_rate))
 
-    vocab_size    = int(dec["num_classes"]) + 1
-    blank_id      = vocab_size - 1
-
     writer = gguf.GGUFWriter(str(out), arch=ARCH)
 
-    writer.add_name("parakeet-ctc-0.6b")
-    writer.add_description("NVIDIA Parakeet-CTC-0.6B FastConformer ASR (CC-BY-4.0)")
+    model_name = {
+        "ctc": f"parakeet-ctc-{d_model}-{n_layers}l",
+        "tdt": f"parakeet-tdt-{d_model}-{n_layers}l",
+    }[model_type]
+    writer.add_name(model_name)
+    writer.add_description(f"NVIDIA Parakeet-{model_type.upper()} FastConformer ASR (CC-BY-4.0)")
     writer.add_file_type(FILE_TYPE_MAP[quant])
+
+    writer.add_string("parakeet.model.type", model_type)
 
     writer.add_uint32("parakeet.encoder.d_model",                     d_model)
     writer.add_uint32("parakeet.encoder.n_layers",                    n_layers)
@@ -180,6 +188,7 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     writer.add_uint32("parakeet.encoder.subsampling_freq_bins",       sub_freq_bins)
     writer.add_bool  ("parakeet.encoder.xscaling",                    xscaling)
     writer.add_bool  ("parakeet.encoder.untie_biases",                untie_biases)
+    writer.add_bool  ("parakeet.encoder.use_bias",                    use_bias)
     writer.add_uint32("parakeet.encoder.pos_emb_max_len",             pos_max_len)
 
     writer.add_uint32 ("parakeet.preproc.sample_rate",               sample_rate)
@@ -190,8 +199,30 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     writer.add_float32("parakeet.preproc.preemph",                   0.97)
     writer.add_float32("parakeet.preproc.log_zero_guard_value",      float(2 ** -24))
 
-    writer.add_uint32("parakeet.ctc.vocab_size", vocab_size)
-    writer.add_uint32("parakeet.ctc.blank_id",   blank_id)
+    if model_type == "ctc":
+        vocab_size = int(dec["num_classes"]) + 1
+        blank_id   = vocab_size - 1
+        writer.add_uint32("parakeet.ctc.vocab_size", vocab_size)
+        writer.add_uint32("parakeet.ctc.blank_id",   blank_id)
+    else:
+        pred_hidden      = int(dec["prednet"]["pred_hidden"])
+        pred_rnn_layers  = int(dec["prednet"]["pred_rnn_layers"])
+        joint_hidden     = int(cfg["joint"]["jointnet"]["joint_hidden"])
+        pred_vocab_size  = int(dec["vocab_size"])                   # label vocab (no blank)
+        joint_num_classes = int(cfg["joint"]["num_classes"])        # label vocab + blank
+        durations        = list(cfg["model_defaults"]["tdt_durations"])
+        num_durations    = int(cfg["model_defaults"]["num_tdt_durations"])
+        assert num_durations == len(durations), \
+            f"num_tdt_durations {num_durations} != len(durations) {len(durations)}"
+        blank_id         = joint_num_classes                         # blank_as_pad at vocab_size
+
+        writer.add_uint32("parakeet.tdt.vocab_size",       pred_vocab_size)
+        writer.add_uint32("parakeet.tdt.blank_id",         blank_id)
+        writer.add_uint32("parakeet.tdt.pred_hidden",      pred_hidden)
+        writer.add_uint32("parakeet.tdt.pred_rnn_layers",  pred_rnn_layers)
+        writer.add_uint32("parakeet.tdt.joint_hidden",     joint_hidden)
+        writer.add_uint32("parakeet.tdt.num_durations",    num_durations)
+        writer.add_array ("parakeet.tdt.durations",        durations)
 
     writer.add_string("tokenizer.ggml.model", "sentencepiece")
     writer.add_array ("tokenizer.ggml.sentencepiece_model",
@@ -251,18 +282,22 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         packed = gguf.quants.quantize(arr, qtype)
         writer.add_tensor(name, packed, raw_dtype=qtype)
 
+    def try_bias(name: str, key: str):
+        if key in sd:
+            add_f32(name, sd[key])
+
     add_2d ("encoder.subsampling.conv0.weight",  sd["encoder.pre_encode.conv.0.weight"])
-    add_f32("encoder.subsampling.conv0.bias",    sd["encoder.pre_encode.conv.0.bias"])
+    try_bias("encoder.subsampling.conv0.bias",    "encoder.pre_encode.conv.0.bias")
     add_2d ("encoder.subsampling.conv1_dw.weight", sd["encoder.pre_encode.conv.2.weight"])
-    add_f32("encoder.subsampling.conv1_dw.bias",   sd["encoder.pre_encode.conv.2.bias"])
+    try_bias("encoder.subsampling.conv1_dw.bias",   "encoder.pre_encode.conv.2.bias")
     add_2d ("encoder.subsampling.conv1_pw.weight", sd["encoder.pre_encode.conv.3.weight"])
-    add_f32("encoder.subsampling.conv1_pw.bias",   sd["encoder.pre_encode.conv.3.bias"])
+    try_bias("encoder.subsampling.conv1_pw.bias",   "encoder.pre_encode.conv.3.bias")
     add_2d ("encoder.subsampling.conv2_dw.weight", sd["encoder.pre_encode.conv.5.weight"])
-    add_f32("encoder.subsampling.conv2_dw.bias",   sd["encoder.pre_encode.conv.5.bias"])
+    try_bias("encoder.subsampling.conv2_dw.bias",   "encoder.pre_encode.conv.5.bias")
     add_2d ("encoder.subsampling.conv2_pw.weight", sd["encoder.pre_encode.conv.6.weight"])
-    add_f32("encoder.subsampling.conv2_pw.bias",   sd["encoder.pre_encode.conv.6.bias"])
+    try_bias("encoder.subsampling.conv2_pw.bias",   "encoder.pre_encode.conv.6.bias")
     add_2d ("encoder.subsampling.out.weight",      sd["encoder.pre_encode.out.weight"])
-    add_f32("encoder.subsampling.out.bias",        sd["encoder.pre_encode.out.bias"])
+    try_bias("encoder.subsampling.out.bias",        "encoder.pre_encode.out.bias")
 
     for i in range(n_layers):
         k = f"encoder.layers.{i}"
@@ -271,30 +306,30 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         add_f32(f"{p}.norm_ff1.weight",   sd[f"{k}.norm_feed_forward1.weight"])
         add_f32(f"{p}.norm_ff1.bias",     sd[f"{k}.norm_feed_forward1.bias"])
         add_2d (f"{p}.ff1.linear1.weight", sd[f"{k}.feed_forward1.linear1.weight"])
-        add_f32(f"{p}.ff1.linear1.bias",   sd[f"{k}.feed_forward1.linear1.bias"])
+        try_bias(f"{p}.ff1.linear1.bias",  f"{k}.feed_forward1.linear1.bias")
         add_2d (f"{p}.ff1.linear2.weight", sd[f"{k}.feed_forward1.linear2.weight"])
-        add_f32(f"{p}.ff1.linear2.bias",   sd[f"{k}.feed_forward1.linear2.bias"])
+        try_bias(f"{p}.ff1.linear2.bias",  f"{k}.feed_forward1.linear2.bias")
 
         add_f32(f"{p}.norm_attn.weight",  sd[f"{k}.norm_self_att.weight"])
         add_f32(f"{p}.norm_attn.bias",    sd[f"{k}.norm_self_att.bias"])
         q_w = sd[f"{k}.self_attn.linear_q.weight"]
         k_w = sd[f"{k}.self_attn.linear_k.weight"]
         v_w = sd[f"{k}.self_attn.linear_v.weight"]
-        q_b = sd[f"{k}.self_attn.linear_q.bias"]
-        k_b = sd[f"{k}.self_attn.linear_k.bias"]
-        v_b = sd[f"{k}.self_attn.linear_v.bias"]
-
         add_2d (f"{p}.attn.q.weight",     q_w)
-        add_f32(f"{p}.attn.q.bias",       q_b)
+        try_bias(f"{p}.attn.q.bias",      f"{k}.self_attn.linear_q.bias")
         add_2d (f"{p}.attn.k.weight",     k_w)
-        add_f32(f"{p}.attn.k.bias",       k_b)
+        try_bias(f"{p}.attn.k.bias",      f"{k}.self_attn.linear_k.bias")
         add_2d (f"{p}.attn.v.weight",     v_w)
-        add_f32(f"{p}.attn.v.bias",       v_b)
+        try_bias(f"{p}.attn.v.bias",      f"{k}.self_attn.linear_v.bias")
 
         add_2d (f"{p}.attn.qkv.weight",   torch.cat([q_w, k_w, v_w], dim=0))
-        add_f32(f"{p}.attn.qkv.bias",     torch.cat([q_b, k_b, v_b], dim=0))
+        if use_bias:
+            q_b = sd[f"{k}.self_attn.linear_q.bias"]
+            k_b = sd[f"{k}.self_attn.linear_k.bias"]
+            v_b = sd[f"{k}.self_attn.linear_v.bias"]
+            add_f32(f"{p}.attn.qkv.bias",     torch.cat([q_b, k_b, v_b], dim=0))
         add_2d (f"{p}.attn.out.weight",   sd[f"{k}.self_attn.linear_out.weight"])
-        add_f32(f"{p}.attn.out.bias",     sd[f"{k}.self_attn.linear_out.bias"])
+        try_bias(f"{p}.attn.out.bias",     f"{k}.self_attn.linear_out.bias")
         add_2d (f"{p}.attn.pos.weight",   sd[f"{k}.self_attn.linear_pos.weight"])
         add_f32(f"{p}.attn.pos_bias_u",   sd[f"{k}.self_attn.pos_bias_u"])
         add_f32(f"{p}.attn.pos_bias_v",   sd[f"{k}.self_attn.pos_bias_v"])
@@ -302,9 +337,9 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         add_f32(f"{p}.norm_conv.weight",  sd[f"{k}.norm_conv.weight"])
         add_f32(f"{p}.norm_conv.bias",    sd[f"{k}.norm_conv.bias"])
         add_2d (f"{p}.conv.pw1.weight",   sd[f"{k}.conv.pointwise_conv1.weight"])
-        add_f32(f"{p}.conv.pw1.bias",     sd[f"{k}.conv.pointwise_conv1.bias"])
+        try_bias(f"{p}.conv.pw1.bias",    f"{k}.conv.pointwise_conv1.bias")
         add_2d (f"{p}.conv.dw.weight",    sd[f"{k}.conv.depthwise_conv.weight"])
-        add_f32(f"{p}.conv.dw.bias",      sd[f"{k}.conv.depthwise_conv.bias"])
+        try_bias(f"{p}.conv.dw.bias",     f"{k}.conv.depthwise_conv.bias")
 
         bn_w    = as_np(sd[f"{k}.conv.batch_norm.weight"],        np.float32)
         bn_b    = as_np(sd[f"{k}.conv.batch_norm.bias"],          np.float32)
@@ -315,22 +350,43 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         writer.add_tensor(f"{p}.conv.bn.shift", bn_shift)
 
         add_2d (f"{p}.conv.pw2.weight",   sd[f"{k}.conv.pointwise_conv2.weight"])
-        add_f32(f"{p}.conv.pw2.bias",     sd[f"{k}.conv.pointwise_conv2.bias"])
+        try_bias(f"{p}.conv.pw2.bias",    f"{k}.conv.pointwise_conv2.bias")
 
         add_f32(f"{p}.norm_ff2.weight",   sd[f"{k}.norm_feed_forward2.weight"])
         add_f32(f"{p}.norm_ff2.bias",     sd[f"{k}.norm_feed_forward2.bias"])
         add_2d (f"{p}.ff2.linear1.weight", sd[f"{k}.feed_forward2.linear1.weight"])
-        add_f32(f"{p}.ff2.linear1.bias",   sd[f"{k}.feed_forward2.linear1.bias"])
+        try_bias(f"{p}.ff2.linear1.bias",  f"{k}.feed_forward2.linear1.bias")
         add_2d (f"{p}.ff2.linear2.weight", sd[f"{k}.feed_forward2.linear2.weight"])
-        add_f32(f"{p}.ff2.linear2.bias",   sd[f"{k}.feed_forward2.linear2.bias"])
+        try_bias(f"{p}.ff2.linear2.bias",  f"{k}.feed_forward2.linear2.bias")
 
         add_f32(f"{p}.norm_out.weight",   sd[f"{k}.norm_out.weight"])
         add_f32(f"{p}.norm_out.bias",     sd[f"{k}.norm_out.bias"])
 
-    dec_w = sd["decoder.decoder_layers.0.weight"].squeeze(-1)
-    dec_b = sd["decoder.decoder_layers.0.bias"]
-    add_2d ("ctc.decoder.weight", dec_w)
-    add_f32("ctc.decoder.bias",   dec_b)
+    if model_type == "ctc":
+        dec_w = sd["decoder.decoder_layers.0.weight"].squeeze(-1)
+        dec_b = sd["decoder.decoder_layers.0.bias"]
+        add_2d ("ctc.decoder.weight", dec_w)
+        add_f32("ctc.decoder.bias",   dec_b)
+    else:
+        add_2d ("tdt.predict.embed.weight", sd["decoder.prediction.embed.weight"])
+
+        pred_rnn_layers = int(cfg["decoder"]["prednet"]["pred_rnn_layers"])
+        for l in range(pred_rnn_layers):
+            add_2d (f"tdt.predict.lstm.{l}.w_ih",
+                    sd[f"decoder.prediction.dec_rnn.lstm.weight_ih_l{l}"])
+            add_2d (f"tdt.predict.lstm.{l}.w_hh",
+                    sd[f"decoder.prediction.dec_rnn.lstm.weight_hh_l{l}"])
+            add_f32(f"tdt.predict.lstm.{l}.b_ih",
+                    sd[f"decoder.prediction.dec_rnn.lstm.bias_ih_l{l}"])
+            add_f32(f"tdt.predict.lstm.{l}.b_hh",
+                    sd[f"decoder.prediction.dec_rnn.lstm.bias_hh_l{l}"])
+
+        add_2d ("tdt.joint.enc.weight",  sd["joint.enc.weight"])
+        add_f32("tdt.joint.enc.bias",    sd["joint.enc.bias"])
+        add_2d ("tdt.joint.pred.weight", sd["joint.pred.weight"])
+        add_f32("tdt.joint.pred.bias",   sd["joint.pred.bias"])
+        add_2d ("tdt.joint.out.weight",  sd["joint.joint_net.2.weight"])
+        add_f32("tdt.joint.out.bias",    sd["joint.joint_net.2.bias"])
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -338,7 +394,11 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     writer.close()
 
     size_mb = out.stat().st_size / (1024 * 1024)
-    print(f"[convert] wrote {out} ({size_mb:.1f} MiB, quant={quant}, vocab={vocab_size}, layers={n_layers})", file=sys.stderr)
+    if model_type == "ctc":
+        vocab_note = f"ctc_vocab={int(cfg['decoder']['num_classes'])+1}"
+    else:
+        vocab_note = f"tdt_vocab={int(cfg['decoder']['vocab_size'])} durations={cfg['model_defaults']['tdt_durations']}"
+    print(f"[convert] wrote {out} ({size_mb:.1f} MiB, type={model_type}, quant={quant}, {vocab_note}, layers={n_layers}, use_bias={use_bias})", file=sys.stderr)
 
 
 def main():

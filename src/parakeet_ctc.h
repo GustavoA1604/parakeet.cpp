@@ -32,7 +32,13 @@ struct EncoderConfig {
     int pos_emb_max_len        = 5000;
     bool xscaling              = true;
     bool untie_biases          = true;
+    bool use_bias              = true;
     float layer_norm_eps       = 1.0e-5f;
+
+    int tdt_pred_hidden        = 640;
+    int tdt_pred_rnn_layers    = 2;
+    int tdt_joint_hidden       = 640;
+    int tdt_num_durations      = 5;
 };
 
 struct SubsamplingWeights {
@@ -101,7 +107,33 @@ struct CtcHeadWeights {
     ggml_tensor * b = nullptr;
 };
 
+struct TdtLstmLayer {
+    ggml_tensor * w_ih = nullptr;
+    ggml_tensor * w_hh = nullptr;
+    ggml_tensor * b_ih = nullptr;
+    ggml_tensor * b_hh = nullptr;
+};
+
+struct TdtWeights {
+    ggml_tensor * predict_embed = nullptr;
+    std::vector<TdtLstmLayer> lstm;
+
+    ggml_tensor * joint_enc_w  = nullptr;
+    ggml_tensor * joint_enc_b  = nullptr;
+    ggml_tensor * joint_pred_w = nullptr;
+    ggml_tensor * joint_pred_b = nullptr;
+    ggml_tensor * joint_out_w  = nullptr;
+    ggml_tensor * joint_out_b  = nullptr;
+};
+
+enum class ParakeetModelType {
+    CTC,
+    TDT,
+};
+
 struct ParakeetCtcModel {
+    ParakeetModelType model_type = ParakeetModelType::CTC;
+
     EncoderConfig encoder_cfg;
     MelConfig     mel_cfg;
     BpeVocab      vocab;
@@ -111,9 +143,12 @@ struct ParakeetCtcModel {
 
     bool supports_streaming = false;
 
+    std::vector<int32_t> tdt_durations;
+
     SubsamplingWeights       subsampling;
     std::vector<BlockWeights> blocks;
     CtcHeadWeights            ctc;
+    TdtWeights                tdt;
 
     ggml_tensor * mel_filterbank = nullptr;
     ggml_tensor * window         = nullptr;

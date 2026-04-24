@@ -51,6 +51,20 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
     }
 }
 
+namespace {
+
+void ensure_ctc_model(const ParakeetCtcModel & model, const char * context) {
+    if (model.model_type != ParakeetModelType::CTC) {
+        throw std::runtime_error(
+            std::string(context) +
+            ": loaded GGUF is a TDT (RNN-T + duration) model; the TDT decoder "
+            "is not yet implemented in this repo. Track progress in PROGRESS.md "
+            "Phase 10. Use a parakeet-ctc-*.gguf for now.");
+    }
+}
+
+}
+
 Engine::~Engine() = default;
 Engine::Engine(Engine &&) noexcept = default;
 Engine & Engine::operator=(Engine &&) noexcept = default;
@@ -82,6 +96,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
                                  std::to_string(sample_rate) + " Hz but model expects " +
                                  std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
     }
+    ensure_ctc_model(pimpl_->model, "qvac_parakeet::ctc::Engine::transcribe_samples");
 
     pimpl_->cancel_flag.store(false);
 
@@ -162,6 +177,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
         throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: "
                                  "StreamingOptions.chunk_ms must be > 0");
     }
+    ensure_ctc_model(pimpl_->model, "qvac_parakeet::ctc::Engine::transcribe_samples_stream");
 
     pimpl_->cancel_flag.store(false);
 
@@ -478,6 +494,7 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     if (opts.left_context_ms < 0 || opts.right_lookahead_ms < 0) {
         throw std::runtime_error("Engine::stream_start: left_context_ms and right_lookahead_ms must be >= 0");
     }
+    ensure_ctc_model(pimpl_->model, "Engine::stream_start");
 
     auto impl = std::make_unique<StreamSession::Impl>();
     impl->engine_impl  = pimpl_.get();
