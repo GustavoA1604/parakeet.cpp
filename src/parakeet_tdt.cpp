@@ -157,80 +157,117 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     return 0;
 }
 
-int tdt_greedy_decode(const ParakeetCtcModel & model,
+void tdt_init_state(const TdtRuntimeWeights & W, int blank_id, TdtDecodeState & state) {
+    const int H = W.H_pred;
+    const int L = W.L;
+
+    state.h_state.assign((size_t) L * H, 0.0f);
+    state.c_state.assign((size_t) L * H, 0.0f);
+    state.pred_out.assign(H, 0.0f);
+    state.symbols_this_step = 0;
+    state.carry_frames      = 0;
+
+    std::vector<float> scratch;
+    const float * embed_row = W.embed.data() + (size_t) blank_id * H;
+    lstm_step(W, embed_row, state.h_state.data(), state.c_state.data(), scratch);
+    std::memcpy(state.pred_out.data(),
+                state.h_state.data() + (size_t) (L - 1) * H,
+                (size_t) H * sizeof(float));
+
+    state.initialized = true;
+}
+
+int tdt_decode_window(const ParakeetCtcModel & model,
                       const TdtRuntimeWeights & W,
-                      const float * encoder_out,
-                      int T_enc, int D_enc,
+                      const float * encoder_out_window,
+                      int n_frames, int D_enc,
                       const TdtDecodeOptions & opts,
-                      TdtDecodeResult & result) {
+                      TdtDecodeState & state,
+                      std::vector<int32_t> & out_tokens,
+                      int & out_steps) {
     if (D_enc != W.D_enc) {
-        std::fprintf(stderr, "tdt_greedy_decode: encoder d_model mismatch (%d vs %d)\n",
+        std::fprintf(stderr, "tdt_decode_window: encoder d_model mismatch (%d vs %d)\n",
                      D_enc, W.D_enc);
         return 1;
     }
+    if (!state.initialized) {
+        tdt_init_state(W, (int) model.blank_id, state);
+    }
+
     const int H     = W.H_pred;
     const int L     = W.L;
     const int V_p1  = W.V_plus_1;
     const int D_n   = W.num_durations;
     const int blank = (int) model.blank_id;
 
-    const auto t0 = std::chrono::steady_clock::now();
-
-    std::vector<float> h_state((size_t) L * H, 0.0f);
-    std::vector<float> c_state((size_t) L * H, 0.0f);
-
     std::vector<float> scratch_lstm;
     std::vector<float> scratch_joint_hidden;
     std::vector<float> scratch_joint_logits;
-    std::vector<float> pred_out(H);
-
-    {
-        const float * embed_row = W.embed.data() + (size_t) blank * H;
-        lstm_step(W, embed_row, h_state.data(), c_state.data(), scratch_lstm);
-        std::memcpy(pred_out.data(), h_state.data() + (size_t) (L - 1) * H,
-                    (size_t) H * sizeof(float));
-    }
-
-    result.token_ids.clear();
-    result.token_ids.reserve(T_enc);
 
     int t = 0;
-    int symbols_this_step = 0;
-    int total_steps = 0;
+    if (state.carry_frames > 0) {
+        t = std::min(state.carry_frames, n_frames);
+        state.carry_frames -= t;
+    }
 
-    while (t < T_enc) {
-        const float * enc_frame = encoder_out + (size_t) t * D_enc;
-        joint_step(W, enc_frame, pred_out.data(), scratch_joint_hidden, scratch_joint_logits);
-        ++total_steps;
+    out_steps = 0;
 
-        const int best_token = argmax_f32(scratch_joint_logits.data(), V_p1);
+    while (t < n_frames) {
+        const float * enc_frame = encoder_out_window + (size_t) t * D_enc;
+        joint_step(W, enc_frame, state.pred_out.data(),
+                   scratch_joint_hidden, scratch_joint_logits);
+        ++out_steps;
+
+        const int best_token   = argmax_f32(scratch_joint_logits.data(), V_p1);
         const int best_dur_idx = argmax_f32(scratch_joint_logits.data() + V_p1, D_n);
-        const int best_dur = model.tdt_durations.empty()
-                               ? best_dur_idx
-                               : model.tdt_durations[best_dur_idx];
+        const int best_dur     = model.tdt_durations.empty()
+                                   ? best_dur_idx
+                                   : model.tdt_durations[best_dur_idx];
 
         if (best_token == blank) {
             t += std::max(1, best_dur);
-            symbols_this_step = 0;
+            state.symbols_this_step = 0;
             continue;
         }
 
-        result.token_ids.push_back((int32_t) best_token);
+        out_tokens.push_back((int32_t) best_token);
 
         const float * embed_row = W.embed.data() + (size_t) best_token * H;
-        lstm_step(W, embed_row, h_state.data(), c_state.data(), scratch_lstm);
-        std::memcpy(pred_out.data(), h_state.data() + (size_t) (L - 1) * H,
+        lstm_step(W, embed_row, state.h_state.data(), state.c_state.data(), scratch_lstm);
+        std::memcpy(state.pred_out.data(),
+                    state.h_state.data() + (size_t) (L - 1) * H,
                     (size_t) H * sizeof(float));
 
-        ++symbols_this_step;
-        if (best_dur > 0 || symbols_this_step >= opts.max_symbols_per_step) {
+        ++state.symbols_this_step;
+        if (best_dur > 0 || state.symbols_this_step >= opts.max_symbols_per_step) {
             t += std::max(1, best_dur);
-            symbols_this_step = 0;
+            state.symbols_this_step = 0;
         }
     }
 
+    state.carry_frames = std::max(0, t - n_frames);
+    return 0;
+}
+
+int tdt_greedy_decode(const ParakeetCtcModel & model,
+                      const TdtRuntimeWeights & W,
+                      const float * encoder_out,
+                      int T_enc, int D_enc,
+                      const TdtDecodeOptions & opts,
+                      TdtDecodeResult & result) {
+    const auto t0 = std::chrono::steady_clock::now();
+
+    TdtDecodeState state;
+    result.token_ids.clear();
+    result.token_ids.reserve(T_enc);
+
+    if (int rc = tdt_decode_window(model, W, encoder_out, T_enc, D_enc,
+                                   opts, state, result.token_ids, result.steps);
+        rc != 0) {
+        return rc;
+    }
+
     result.text = detokenize(model.vocab, result.token_ids);
-    result.steps = total_steps;
     const auto t1 = std::chrono::steady_clock::now();
     result.decode_ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
     return 0;

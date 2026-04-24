@@ -328,12 +328,6 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     const double wav_ms = ms_since(t_wav);
     const double audio_ms = 1000.0 * (double) samples.size() / (double) sr;
 
-    if (model.model_type != ParakeetModelType::CTC && extra.stream) {
-        std::fprintf(stderr, "error: --stream is not yet wired for TDT models; use one-shot mode\n"
-                             "       (omit --stream) for parakeet-tdt-*.gguf. Tracked in PROGRESS.md Phase 10.\n");
-        return 5;
-    }
-
     auto run_once = [&](std::string & text_out, std::vector<int32_t> & ids_out,
                         int & n_frames_out, RunTimes & times) -> int {
         const auto t1 = clock::now();

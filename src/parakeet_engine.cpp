@@ -62,19 +62,6 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
     }
 }
 
-namespace {
-
-void ensure_ctc_only(const ParakeetCtcModel & model, const char * context) {
-    if (model.model_type != ParakeetModelType::CTC) {
-        throw std::runtime_error(
-            std::string(context) +
-            ": loaded GGUF is a TDT model; streaming (Mode 2/3) is not yet "
-            "wired for TDT. Phase 10 tracks this follow-up. For TDT use "
-            "Engine::transcribe()/transcribe_samples() (one-shot only).");
-    }
-}
-
-}
 
 Engine::~Engine() = default;
 Engine::Engine(Engine &&) noexcept = default;
@@ -82,6 +69,10 @@ Engine & Engine::operator=(Engine &&) noexcept = default;
 
 const EngineOptions & Engine::options() const {
     return pimpl_->opts;
+}
+
+std::string Engine::model_type() const {
+    return pimpl_->model.model_type == ParakeetModelType::TDT ? "tdt" : "ctc";
 }
 
 void Engine::cancel() {
@@ -202,7 +193,6 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
         throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: "
                                  "StreamingOptions.chunk_ms must be > 0");
     }
-    ensure_ctc_only(pimpl_->model, "qvac_parakeet::ctc::Engine::transcribe_samples_stream");
 
     pimpl_->cancel_flag.store(false);
 
@@ -245,7 +235,12 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
 
     const auto t_dec = clock::now();
 
+    const bool is_tdt = (pimpl_->model.model_type == ParakeetModelType::TDT);
+
     int32_t prev_token = -1;
+    TdtDecodeState tdt_state;
+    if (is_tdt) tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, tdt_state);
+
     int chunk_index = 0;
     bool first_segment = true;
 
@@ -258,9 +253,23 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
         const auto t_win = clock::now();
 
         std::vector<int32_t> win_tokens;
-        ctc_greedy_decode_window(enc_out.logits.data(),
-                                 start, end, vocab, blank,
-                                 prev_token, win_tokens, nullptr);
+        if (is_tdt) {
+            TdtDecodeOptions dopts;
+            int steps = 0;
+            const float * win_enc = enc_out.encoder_out.data()
+                                  + static_cast<size_t>(start) * enc_out.d_model;
+            if (int rc = tdt_decode_window(pimpl_->model, pimpl_->tdt_rt,
+                                           win_enc, end - start, enc_out.d_model,
+                                           dopts, tdt_state, win_tokens, steps);
+                rc != 0) {
+                throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: "
+                                         "tdt_decode_window failed (rc=" + std::to_string(rc) + ")");
+            }
+        } else {
+            ctc_greedy_decode_window(enc_out.logits.data(),
+                                     start, end, vocab, blank,
+                                     prev_token, win_tokens, nullptr);
+        }
 
         const size_t prev_cumulative_len = result.text.size();
         result.token_ids.insert(result.token_ids.end(),
@@ -307,6 +316,7 @@ struct StreamSession::Impl {
     int     chunk_index    = 0;
     int64_t emitted_samples = 0;
     int32_t prev_token     = -1;
+    TdtDecodeState tdt_state;
 
     std::string             cumulative_text;
     std::vector<int32_t>    cumulative_token_ids;
@@ -373,11 +383,26 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
 
     const auto t_dec = clock::now();
     std::vector<int32_t> win_tokens;
-    ctc_greedy_decode_window(enc_out.logits.data(),
-                             left_drop_frames, center_end_frame,
-                             engine_impl->model.vocab_size,
-                             engine_impl->model.blank_id,
-                             prev_token, win_tokens, nullptr);
+    if (engine_impl->model.model_type == ParakeetModelType::TDT) {
+        TdtDecodeOptions dopts;
+        int steps = 0;
+        const int n_frames = std::max(0, center_end_frame - left_drop_frames);
+        const float * win_enc = enc_out.encoder_out.data()
+                              + static_cast<size_t>(left_drop_frames) * enc_out.d_model;
+        if (int rc = tdt_decode_window(engine_impl->model, engine_impl->tdt_rt,
+                                       win_enc, n_frames, enc_out.d_model,
+                                       dopts, tdt_state, win_tokens, steps);
+            rc != 0) {
+            throw std::runtime_error("StreamSession: tdt_decode_window failed (rc=" +
+                                     std::to_string(rc) + ")");
+        }
+    } else {
+        ctc_greedy_decode_window(enc_out.logits.data(),
+                                 left_drop_frames, center_end_frame,
+                                 engine_impl->model.vocab_size,
+                                 engine_impl->model.blank_id,
+                                 prev_token, win_tokens, nullptr);
+    }
 
     const size_t prev_cumulative_len = cumulative_text.size();
     cumulative_token_ids.insert(cumulative_token_ids.end(),
@@ -519,7 +544,6 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     if (opts.left_context_ms < 0 || opts.right_lookahead_ms < 0) {
         throw std::runtime_error("Engine::stream_start: left_context_ms and right_lookahead_ms must be >= 0");
     }
-    ensure_ctc_only(pimpl_->model, "Engine::stream_start");
 
     auto impl = std::make_unique<StreamSession::Impl>();
     impl->engine_impl  = pimpl_.get();
@@ -533,6 +557,10 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
 
     impl->left_history.reserve(impl->left_context_samples);
     impl->pending.reserve(impl->chunk_samples + impl->right_lookahead_samples);
+
+    if (pimpl_->model.model_type == ParakeetModelType::TDT) {
+        tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, impl->tdt_state);
+    }
 
     return std::make_unique<StreamSession>(std::move(impl));
 }

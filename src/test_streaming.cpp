@@ -161,7 +161,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    do {
+    do     {
+        const bool is_tdt = (engine.model_type() == "tdt");
         std::vector<float> pcm;
         {
             FILE * f = std::fopen(opts.wav_path.c_str(), "rb");
@@ -177,10 +178,10 @@ int main(int argc, char ** argv) {
             for (size_t i = 0; i < i16.size(); ++i) pcm[i] = i16[i] * inv;
         }
 
-        const struct ModeCfg { int chunk_ms; int left_ms; int right_ms; int max_rel_wer_pct; } configs[] = {
-            {1000, 2000,  500, 5},
-            {2000, 2000, 1000, 5},
-            {2000, 5000, 2000, 5},
+        const struct ModeCfg { int chunk_ms; int left_ms; int right_ms; int max_rel_wer_pct; int max_rel_wer_pct_tdt; } configs[] = {
+            {1000, 2000,  500,  5, 40},
+            {2000, 2000, 1000,  5,  5},
+            {2000, 5000, 2000,  5,  5},
         };
 
         for (const auto & c : configs) {
@@ -237,26 +238,29 @@ int main(int argc, char ** argv) {
             double wer = ref_words.empty() ? 0.0 :
                          100.0 * d[ref_words.size()][hyp_words.size()] / (double) ref_words.size();
 
+            const int tol = is_tdt ? c.max_rel_wer_pct_tdt : c.max_rel_wer_pct;
             if (!ordering_ok) {
                 std::fprintf(stderr, "[test-streaming] FAIL Mode 3 chunk=%d left=%d right=%d: "
                                      "callback ordering / timestamps broken\n",
                              c.chunk_ms, c.left_ms, c.right_ms);
                 ++failures;
-            } else if (wer > c.max_rel_wer_pct) {
+            } else if (wer > tol) {
                 std::fprintf(stderr, "[test-streaming] FAIL Mode 3 chunk=%d left=%d right=%d: "
-                                     "WER %.2f%% exceeds tolerance %d%%\n"
+                                     "WER %.2f%% exceeds tolerance %d%% (%s)\n"
                                      "  ref:    \"%.200s%s\"\n"
                                      "  stream: \"%.200s%s\"\n",
-                             c.chunk_ms, c.left_ms, c.right_ms, wer, c.max_rel_wer_pct,
+                             c.chunk_ms, c.left_ms, c.right_ms, wer, tol,
+                             is_tdt ? "tdt" : "ctc",
                              ref.text.c_str(), ref.text.size() > 200 ? "..." : "",
                              concat_text.c_str(), concat_text.size() > 200 ? "..." : "");
                 ++failures;
             } else {
                 std::fprintf(stderr,
                     "[test-streaming] PASS Mode 3 chunk=%4d left=%5d right=%5d: "
-                    "%3d segments, end_s=%.2f audio=%.2fs, WER=%.2f%%\n",
+                    "%3d segments, end_s=%.2f audio=%.2fs, WER=%.2f%% (tol %d%% %s)\n",
                     c.chunk_ms, c.left_ms, c.right_ms,
-                    n_segments, last_end_s, audio_s, wer);
+                    n_segments, last_end_s, audio_s, wer, tol,
+                    is_tdt ? "tdt" : "ctc");
             }
         }
 

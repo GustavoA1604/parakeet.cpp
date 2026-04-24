@@ -64,7 +64,30 @@ struct TdtDecodeResult {
     double decode_ms = 0.0;
 };
 
+struct TdtDecodeState {
+    std::vector<float> h_state;
+    std::vector<float> c_state;
+    std::vector<float> pred_out;
+
+    int  symbols_this_step = 0;
+    bool initialized       = false;
+    int  carry_frames      = 0;
+};
+
 int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & out);
+
+void tdt_init_state(const TdtRuntimeWeights & W,
+                    int blank_id,
+                    TdtDecodeState & state);
+
+int tdt_decode_window(const ParakeetCtcModel & model,
+                      const TdtRuntimeWeights & W,
+                      const float * encoder_out_window,
+                      int n_frames, int D_enc,
+                      const TdtDecodeOptions & opts,
+                      TdtDecodeState & state,
+                      std::vector<int32_t> & out_tokens,
+                      int & out_steps);
 
 int tdt_greedy_decode(const ParakeetCtcModel & model,
                       const TdtRuntimeWeights & W,

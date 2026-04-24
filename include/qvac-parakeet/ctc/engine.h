@@ -156,6 +156,9 @@ public:
 
     const EngineOptions & options() const;
 
+    // "ctc" or "tdt", reflecting parakeet.model.type metadata of the loaded GGUF.
+    std::string model_type() const;
+
     struct Impl;
 
 private:
