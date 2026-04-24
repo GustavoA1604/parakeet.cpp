@@ -1138,3 +1138,99 @@ Prerequisites and scope tracked for Phase 8:
    clip, `chunk_ms=500`: ~350-450 ms total, first segment ~0.55 s;
    60 s clip, `chunk_ms=2000`: ~700 ms total (vs offline ~850 ms —
    linear-in-T attention wins on long-form).
+
+## Phase 8 — Mode 3 cache-aware streaming  _(in progress)_
+
+### Phase 8.0 — checkpoint landscape (done)
+
+The NeMo registry has only one cache-aware streaming Conformer family:
+`stt_en_fastconformer_hybrid_large_streaming_{multi,80ms,480ms,1040ms}`.
+Same family powers `qvac/packages/qvac-lib-infer-parakeet`'s `'eou'`
+modelType today. It's a 115M-parameter, RNN-T+aux_CTC hybrid trained
+with chunked-limited attention. Real-world quality is not great
+(~2x WER vs Parakeet-CTC-0.6B offline) — the user's existing
+production has confirmed this.
+
+So Phase 8 is **not** going to ship a port of streaming_multi. Instead,
+the chosen approach is **cache-aware *inference* on the existing
+offline-trained Parakeet-CTC-0.6B weights**: same 600M model, same
+quality ceiling, just driven through a streaming forward pass. The
+cost is some accuracy degradation because the model wasn't trained
+with chunked attention masks.
+
+### Phase 8.1 — Python reference + accuracy bake-off (done)
+
+`scripts/streaming-reference.py` implements the **chunking-with-context**
+strategy in Python on top of the NeMo offline model: each chunk feeds
+`[left_context + chunk + right_lookahead]` into the offline encoder,
+slices out the center frames, runs CTC greedy with a stateful
+`prev_token` carried across chunks. This mirrors what the eventual C++
+streaming path does (modulo the future Phase 8.5 KV-cache optimisation).
+
+Sweep results on `test/samples/jfk.wav` (11 s clean speech) and
+`LastQuestion_long_EN.raw` (5.5 min sci-fi narration with proper nouns,
+representing the "harder" production case):
+
+| chunk_ms | left_ctx_ms | right_lookahead_ms | jfk WER | long-clip WER | first-seg latency |
+|---------:|------------:|-------------------:|--------:|--------------:|------------------:|
+| 1000 | 0     | 0    | 40.91% | n/a    | 1.0 s |
+| 1000 | 2000  | 500  | 0.00%  | 14.86% | 1.5 s |
+| 2000 | 2000  | 1000 | 0.00%  | 7.64%  | 3.0 s |
+| 2000 | 5000  | 1000 | 0.00%  | n/a    | 3.0 s |
+| 2000 | 5000  | 2000 | n/a    | 4.02%  | 4.0 s |
+| 2000 | 10000 | 1000 | n/a    | 7.53%  | 3.0 s |
+| **2000** | **10000** | **2000** | n/a | **3.82%** | **4.0 s** |
+| 4000 | 5000  | 1000 | 0.00%  | 4.75%  | 5.0 s |
+
+Key observations:
+
+- **Right lookahead is the single most impactful knob.** Going from
+  1000 → 2000 ms right-lookahead drops long-clip WER from 7.64% to
+  4.02% at the same chunk + left configuration. The conv module uses
+  symmetric `kernel=9` padding (designed at training to see future
+  context), so denying it future frames at chunk boundaries hurts more
+  than denying past frames.
+- **Short audio is forgiving, long audio compounds errors.** jfk is
+  at 0% with modest context; 5.5 min same-config drifts to ~7-8%
+  because (a) per-window CMVN drifts vs the offline single-statistic
+  pass and (b) more boundary opportunities for misreads. Per-window
+  CMVN is the suspect; running CMVN may close some of the gap and is
+  noted as a Phase 8.5 follow-up.
+- **`right=0` (pure causal) is uniformly bad** unless chunks are large
+  enough to hide the boundary (chunk=2000 + right=0 → 4.55% on jfk;
+  chunk=500 + right=0 → 40.9%). Pure-causal mode is supportable but
+  not the recommended default.
+- **Left context past 5 s gives diminishing returns** on this model.
+
+**Recommended C++ defaults (subject to revision once C++ measurements
+are in):**
+
+- `StreamingOptions{ chunk_ms = 2000, left_context_ms = 10000,
+  right_lookahead_ms = 2000 }` — sweet-spot accuracy
+  (~4 % WER on long-form, 0 % on short clean speech), ~4 s
+  first-segment latency. Suits production live-captioning.
+- For lower latency, callers can pick e.g. `chunk_ms=1000,
+  left=2000, right=500` and accept ~10-15 % WER on long-form.
+
+### Phase 8.2 — C++ implementation plan
+
+Next milestones in order:
+
+1. Extend `StreamingOptions` with `left_context_ms` +
+   `right_lookahead_ms`; remove the runtime gate in `stream_start()`
+   (any Parakeet-CTC GGUF works in streaming mode now — no metadata
+   probe needed).
+2. Implement `StreamSession` state machine (sample ring, chunk
+   dispatch, per-window mel + encoder call, logits center-slicing,
+   CTC stateful decode, segment emission with absolute timestamps).
+3. Wire the CLI `--stream` path to drive `stream_start()` when
+   `--pcm-in` is used (or always — same flag for Mode 2 vs Mode 3 is
+   surprising; revisit in §8.3).
+4. Per-chunk numerical parity vs the Python reference at the same
+   `(chunk_ms, left_ctx_ms, right_lookahead_ms)` config to make sure
+   the C++ port lands on the same logits, not approximately.
+5. Test harness extension covering Mode 3 with random burst feeds.
+
+Phase 8.5 (perf follow-up): replace chunking-with-context with true
+KV cache + conv state tensors, ~6× compute reduction on long-form
+audio without changing accuracy.
