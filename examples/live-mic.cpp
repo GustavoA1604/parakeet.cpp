@@ -2,6 +2,7 @@
 #include "miniaudio.h"
 
 #include "qvac-parakeet/ctc/engine.h"
+#include "ggml.h"
 
 #include <atomic>
 #include <chrono>
@@ -25,6 +26,13 @@ std::atomic<bool>       g_stop{false};
 void on_sigint(int) {
     g_stop.store(true);
     g_cv.notify_all();
+}
+
+std::atomic<int> g_min_log_level{GGML_LOG_LEVEL_WARN};
+
+void ggml_log_filter(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (level < g_min_log_level.load()) return;
+    std::fputs(text, stderr);
 }
 
 void data_callback(ma_device * /*device*/, void * /*output*/, const void * input, ma_uint32 frame_count) {
@@ -55,6 +63,7 @@ void print_usage(const char * argv0) {
         "  --right-lookahead-ms N         right lookahead per chunk in ms (default 1000)\n"
         "  --list-devices                 list available capture devices and exit\n"
         "  --device N                     use device with this index (default: system default)\n"
+        "  --verbose                      let ggml / Metal info logs through to stderr\n"
         "  --help                         print this help\n",
         argv0);
 }
@@ -68,6 +77,7 @@ struct Args {
     int  right_ms     = 1000;
     bool list_devices = false;
     int  device_index = -1;
+    bool verbose      = false;
 };
 
 bool parse_args(int argc, char ** argv, Args & a) {
@@ -82,6 +92,7 @@ bool parse_args(int argc, char ** argv, Args & a) {
         else if (s == "--right-lookahead-ms" && i + 1 < argc) a.right_ms      = std::atoi(argv[++i]);
         else if (s == "--list-devices")                       a.list_devices  = true;
         else if (s == "--device"             && i + 1 < argc) a.device_index  = std::atoi(argv[++i]);
+        else if (s == "--verbose" || s == "-v")               a.verbose       = true;
         else {
             std::fprintf(stderr, "unknown option: %s\n", s.c_str());
             print_usage(argv[0]);
@@ -125,6 +136,10 @@ int list_devices_and_exit() {
 int main(int argc, char ** argv) {
     Args args;
     if (!parse_args(argc, argv, args)) return 2;
+
+    g_min_log_level.store(args.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_WARN);
+    ggml_log_set(ggml_log_filter, nullptr);
+
     if (args.list_devices) return list_devices_and_exit();
 
     std::fprintf(stderr, "[live-mic] loading %s\n", args.model_path.c_str());
