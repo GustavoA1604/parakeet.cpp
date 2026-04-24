@@ -21,9 +21,17 @@ hyperparameters.
 
 The TDT decoder (prediction net + joint net + transducer greedy) runs
 on CPU in pure float32 after dequantizing its ~70 MiB of weights once
-at Engine construction. One-shot transcription only for now
-(`Engine::transcribe()` / `--wav` / `--pcm-in`); Mode 2/3 streaming is
-still CTC-only.
+at Engine construction. All three entry points work for both model
+families:
+
+- `Engine::transcribe()` (one-shot) — CTC or TDT.
+- `Engine::transcribe_stream()` (Mode 2, offline encoder + streamed
+  segments) — CTC or TDT.
+- `Engine::stream_start()` -> `StreamSession` (Mode 3, live duplex
+  cache-aware) — CTC or TDT; TDT needs slightly more context than CTC
+  at the same chunk size (TDT's transducer is more sensitive to
+  missing right-lookahead at chunk boundaries; typical WER delta
+  vs offline is +5-10 %).
 
 Mirrors [`chatterbox.cpp`](https://github.com/GustavoA1604/chatterbox.cpp)'s
 layout and staged-validation methodology, so contributors familiar with
@@ -443,13 +451,14 @@ Phases 0 through 7 are complete:
   net + joint MLP + transducer greedy decode running on CPU in f32
   after dequantization. Byte-identical to NeMo on jfk.wav with
   proper capitalization + punctuation; clean multilingual output on
-  es/fr/de/it/pt/ru samples. One-shot transcription only; TDT in
-  streaming modes tracked in PROGRESS.md §10.5.
+  es/fr/de/it/pt/ru samples. One-shot + Mode 2 + Mode 3 streaming
+  all work with TDT GGUFs (phase 10.5), including `live-mic` for
+  native microphone capture.
 
 Next: Phase 8.5 (true KV cache + conv state for ~6x compute reduction on
-long-form audio without accuracy change), TDT in streaming (Phase 10.5).
-Then `CONV_2D_DW` on Metal (upstream ggml contribution), Metal
-flash-attn, EOU / Sortformer pipelines.
+long-form audio without accuracy change), Accelerate BLAS for the TDT
+decoder's LSTM + joint gemvs, `CONV_2D_DW` on Metal (upstream ggml
+contribution), Metal flash-attn, EOU / Sortformer pipelines.
 
 ## Repository layout
 
