@@ -8,13 +8,22 @@ follow-ups.
 
 Supported checkpoints:
 
-| HF repo | `d_model × n_layers` | Params | GGUF Q8_0 size | Encoder RTF (M3 Ultra, Metal) |
-|-|-|-|-|-|
-| `nvidia/parakeet-ctc-0.6b` | 1024 × 24 | 600 M | 697 MiB | 0.014-0.046 depending on clip length |
-| `nvidia/parakeet-ctc-1.1b` | 1024 × 42 | 1.1 B | 1217 MiB | 0.026-0.074 |
+| HF repo | Decoder | Mel | `d_model × n_layers` | Vocab | Params | GGUF size | RTF (Metal) | Languages |
+|-|-|-|-|-|-|-|-|-|
+| `nvidia/parakeet-ctc-0.6b`    | CTC  | 80  | 1024 × 24 | 1024 | 600 M  | 697 MiB q8_0 / 1.3 GiB f16  | 0.014-0.046 | English only |
+| `nvidia/parakeet-ctc-1.1b`    | CTC  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1217 MiB q8_0               | 0.026-0.074 | English only |
+| `nvidia/parakeet-tdt-0.6b-v3` | TDT  | 128 | 1024 × 24 | 8192 | 600 M  | 715 MiB q8_0 / 1.34 GiB f16 | 0.024-0.050 | ~25 languages + PnC |
 
-Same converter, same encoder graph, same GGUF schema — model identity
-lives entirely in `parakeet.encoder.n_layers` metadata.
+Same converter, same encoder graph (biases go through an optional
+path when the checkpoint sets `use_bias=False`), same GGUF schema.
+Model identity lives entirely in `parakeet.model.type` + the encoder
+hyperparameters.
+
+The TDT decoder (prediction net + joint net + transducer greedy) runs
+on CPU in pure float32 after dequantizing its ~70 MiB of weights once
+at Engine construction. One-shot transcription only for now
+(`Engine::transcribe()` / `--wav` / `--pcm-in`); Mode 2/3 streaming is
+still CTC-only.
 
 Mirrors [`chatterbox.cpp`](https://github.com/GustavoA1604/chatterbox.cpp)'s
 layout and staged-validation methodology, so contributors familiar with
@@ -429,10 +438,18 @@ Phases 0 through 7 are complete:
   Rounds 5–8, §6.x for the Metal bring-up, §7.x for Mode 2 streaming,
   §8.x for Mode 3 cache-aware streaming).
 
+- **Phase 10 — TDT (Token-and-Duration Transducer)**: multilingual
+  port of `nvidia/parakeet-tdt-0.6b-v3` — 2-layer LSTM prediction
+  net + joint MLP + transducer greedy decode running on CPU in f32
+  after dequantization. Byte-identical to NeMo on jfk.wav with
+  proper capitalization + punctuation; clean multilingual output on
+  es/fr/de/it/pt/ru samples. One-shot transcription only; TDT in
+  streaming modes tracked in PROGRESS.md §10.5.
+
 Next: Phase 8.5 (true KV cache + conv state for ~6x compute reduction on
-long-form audio without accuracy change). Then `CONV_2D_DW` on Metal
-(upstream ggml contribution), Metal flash-attn, TDT / EOU / Sortformer
-pipelines.
+long-form audio without accuracy change), TDT in streaming (Phase 10.5).
+Then `CONV_2D_DW` on Metal (upstream ggml contribution), Metal
+flash-attn, EOU / Sortformer pipelines.
 
 ## Repository layout
 

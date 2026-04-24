@@ -1384,3 +1384,135 @@ Natural follow-ups that reuse the same converter + encoder graph:
   transducer-decoder port, larger encoder.
 - `nvidia/parakeet-ctc-110m`: smaller CTC-only variant if it exists;
   would land as a converter-flag change only.
+
+## Phase 10 — TDT (Token-and-Duration Transducer) support _(in progress)_
+
+Phase 10 ports `nvidia/parakeet-tdt-0.6b-v3`, the multilingual (~25
+languages) TDT ASR model with punctuation-and-capitalization. Shares
+the FastConformer encoder backbone with the CTC checkpoints but needs
+its own decoder: 2-layer LSTM prediction network, joint MLP, and a
+transducer greedy loop that interleaves token + duration predictions.
+
+### Phase 10.1 — converter + loader (done, commit c501c4c)
+
+Auto-detects model flavour from the NeMo `target` field
+(`EncDecCTCModelBPE` vs `EncDecRNNTBPEModel`). Writes
+`parakeet.model.type` + `parakeet.tdt.*` metadata and tensors:
+
+- `tdt.predict.embed.weight`                (V+1, 640)
+- `tdt.predict.lstm.{0,1}.{w_ih,w_hh,b_ih,b_hh}`
+- `tdt.joint.{enc,pred,out}.{weight,bias}`
+
+Handles the architectural differences from CTC:
+
+- `use_bias=False` — all encoder linear biases are optional; the
+  loader reads them via `maybe_tensor()` and the graph skips every
+  `mul_mat + bias` via a new `maybe_add_bias()` helper.
+- `xscaling=False` — gated the `ggml_scale(x, sqrt(d_model))` entry.
+- 128 mel bins (vs 80) — the existing `n_mels` plumbing handles it,
+  `subsampling_freq_bins` derives correctly (128/8 = 16 freq bins
+  after subsampling -> `pre_encode.out` = (1024, 4096)).
+- 8192-vocab SentencePiece (vs 1024) — `blank_as_pad` semantics; the
+  joint output is 8192 labels + 1 blank + 5 durations = 8198.
+
+CTC regression: re-converting parakeet-ctc-0.6b produces an identical
+tensor set to the shipping GGUF (zero additions/removals), plus two
+new metadata keys (`parakeet.model.type`, `parakeet.encoder.use_bias`)
+that the loader reads with safe fallbacks.
+
+### Phase 10.2 — encoder parity (done, commit 48be18b)
+
+`scripts/dump-tdt-reference.py` dumps NeMo per-stage tensors (log-mel,
+encoder_out, LSTM init state, transcribe() text). New
+`src/test_tdt_encoder_parity.cpp` harness loads a TDT GGUF + wav +
+reference dir, runs the C++ encoder, compares.
+
+Results on jfk.wav:
+
+| dtype  | mel max_abs / rel   | enc_out max_abs / rel | verdict |
+|--------|---------------------|-----------------------|---------|
+| n/a    | 7.29e-1 / 2.77e-3   | —                     | — (mel same as CTC) |
+| f16    | (see above)         | 1.11e-3 / 2.15e-3     | PASS (< 5e-3 f16 floor) |
+| q8_0   | (see above)         | 1.43e-2 / 1.97e-2     | q8_0 accumulation over 24 layers without biases; PASS functionally (downstream transcripts stable) |
+
+Encoder graph works correctly — any numerical differences are pure
+quantization accumulation, matching the CTC precedent.
+
+### Phase 10.3 — TDT decoder (done, commit 3224e23)
+
+`src/parakeet_tdt.{h,cpp}` implements LSTM + joint + transducer greedy
+on CPU in pure f32. Weights are dequantized from the loaded GGUF once
+at Engine construction via `ggml_get_type_traits(type)->to_float`,
+which handles f32 / f16 / q8_0 / q5_0 / q4_0 uniformly. Post-dequant
+footprint: ~70 MiB f32 for the decoder (embedding + 2-layer LSTM +
+joint MLP).
+
+Decode loop:
+
+1. Initialize LSTM h/c to zeros, feed blank through the prediction
+   net to produce the initial `g` output.
+2. Per encoder frame:
+   - Compute joint logits (8198,) = ReLU(enc_proj + pred_proj) @ W_out.
+   - argmax over first V+1=8193 -> token; argmax over last 5 -> duration.
+   - If token == blank: advance `t` by `max(1, dur)`, reset sym counter.
+   - Else: emit token, step LSTM on token embedding, update `g`;
+     advance `t` only when `dur > 0` or `sym_count >= max_symbols`
+     (max_symbols=10 matches NeMo's greedy config).
+3. Detokenize through the existing `sentencepiece_bpe` helper (shared
+   with CTC). NeMo's TDT v3 tokenizer has 8192 SBPE pieces covering
+   ~25 languages + multilingual PnC.
+
+Engine wiring:
+
+- `Engine::Impl` owns the `TdtRuntimeWeights` populated at
+  construction for TDT GGUFs; the CTC path ignores it.
+- `Engine::transcribe()` / `transcribe_samples()` branch on model
+  type. Streaming entry points still reject TDT via
+  `ensure_ctc_only()` — transducer streaming is a Phase 10.5 item.
+- CLI `run_once` lambda has the same branch; TDT GGUFs now transcribe
+  end-to-end via `--wav` / `--pcm-in`.
+
+### Phase 10.4 — end-to-end results
+
+All measured on Apple M4 Metal, f16 GGUF (1.34 GiB), unless noted.
+
+**jfk.wav (11 s):** C++ transcript is *byte-identical* to NeMo:
+
+> "And so, my fellow Americans, ask not what your country can do for
+>  you, ask what you can do for your country."
+
+`load=490 ms, mel=5.5 ms, enc=211 ms, dec=48 ms, total=264 ms,
+RTF=0.024` (42× real-time).
+
+**LastQuestion_long_EN.raw (5.5 min):** clean long-form transcription
+with proper nouns (Multivac / Adele / Lupov / Pluto), commas,
+periods, dialog structure. `RTF=0.050` (20× real-time), 1825 tokens,
+1472 ms pure-CPU decode.
+
+**Multilingual sanity** (qvac-lib-infer-whispercpp sample_*.raw):
+
+- Spanish: *"Se recomienda enfáticamente a los viajeros..."*
+- French:  *"L'accident a eu lieu en terrain montagneux..."*
+- German:  *"Für die besten Aussichten auf Hongkong..."*
+- Italian, Portuguese, Russian: native-script transcripts with
+  punctuation.
+- Japanese: produces garbled output (same as NeMo reference on the
+  same sample; confirmed model limitation, not a port bug).
+
+### Phase 10.5 — pending follow-ups
+
+- **TDT in streaming modes.** Mode 2 (offline encoder + chunked text
+  emission) would need a stateful transducer-decode analogue of
+  `ctc_greedy_decode_window`. Mode 3 (cache-aware live) needs the
+  same + re-feeding LSTM state per chunk. Both reuse the LSTM+joint
+  machinery already built.
+- **BLAS / Accelerate for the gemv calls** in LSTM + joint. Current
+  decode is 48 ms / 11 s on f16 (pure scalar loops), 1.5 s / 5.5 min.
+  Not a bottleneck today but would be worth wiring when targeting
+  high-throughput server use.
+- **Quantized (q8_0 / q4_0) TDT GGUFs.** The converter and loader
+  both already handle these storage types (via the universal
+  dequant path), but the transcripts haven't been sweep-tested for
+  WER drift yet.
+- **parakeet-tdt_ctc-110m support.** Same TDT decoder, smaller
+  encoder; already have the .nemo file cached locally.
