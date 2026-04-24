@@ -63,6 +63,10 @@ void print_usage(const char * argv0) {
         "  --right-lookahead-ms N         right lookahead per chunk in ms (default 1000)\n"
         "  --list-devices                 list available capture devices and exit\n"
         "  --device N                     use device with this index (default: system default)\n"
+        "  --accumulate                   accumulate transcription on one line; emit a\n"
+        "                                 newline after --silence-flush-ms of silence\n"
+        "  --silence-flush-ms N           silence duration that triggers a newline in\n"
+        "                                 --accumulate mode (default 1000)\n"
         "  --verbose                      let ggml / Metal info logs through to stderr\n"
         "  --help                         print this help\n",
         argv0);
@@ -78,6 +82,8 @@ struct Args {
     bool list_devices = false;
     int  device_index = -1;
     bool verbose      = false;
+    bool accumulate   = false;
+    int  silence_flush_ms = 1000;
 };
 
 bool parse_args(int argc, char ** argv, Args & a) {
@@ -92,6 +98,8 @@ bool parse_args(int argc, char ** argv, Args & a) {
         else if (s == "--right-lookahead-ms" && i + 1 < argc) a.right_ms      = std::atoi(argv[++i]);
         else if (s == "--list-devices")                       a.list_devices  = true;
         else if (s == "--device"             && i + 1 < argc) a.device_index  = std::atoi(argv[++i]);
+        else if (s == "--accumulate")                          a.accumulate    = true;
+        else if (s == "--silence-flush-ms"   && i + 1 < argc) a.silence_flush_ms = std::atoi(argv[++i]);
         else if (s == "--verbose" || s == "-v")               a.verbose       = true;
         else {
             std::fprintf(stderr, "unknown option: %s\n", s.c_str());
@@ -156,11 +164,38 @@ int main(int argc, char ** argv) {
     sopts.left_context_ms    = args.left_ms;
     sopts.right_lookahead_ms = args.right_ms;
 
+    bool   line_open       = false;
+    double last_voice_end_s = 0.0;
+
     auto sess = engine.stream_start(sopts,
         [&](const qvac_parakeet::ctc::StreamingSegment & seg) {
-            if (seg.text.empty()) return;
-            std::printf("\033[2K\r[%.2f-%.2f]%s\n", seg.start_s, seg.end_s, seg.text.c_str());
-            std::fflush(stdout);
+            if (!args.accumulate) {
+                if (seg.text.empty()) return;
+                std::printf("\033[2K\r[%.2f-%.2f]%s\n", seg.start_s, seg.end_s, seg.text.c_str());
+                std::fflush(stdout);
+                return;
+            }
+
+            if (!seg.text.empty()) {
+                if (!line_open) {
+                    std::fputs(seg.text.c_str() +
+                               (seg.text.front() == ' ' ? 1 : 0),
+                               stdout);
+                    line_open = true;
+                } else {
+                    std::fputs(seg.text.c_str(), stdout);
+                }
+                std::fflush(stdout);
+                last_voice_end_s = seg.end_s;
+                return;
+            }
+
+            if (line_open &&
+                (seg.end_s - last_voice_end_s) * 1000.0 >= args.silence_flush_ms) {
+                std::fputc('\n', stdout);
+                std::fflush(stdout);
+                line_open = false;
+            }
         });
 
     ma_context ctx;
@@ -247,6 +282,11 @@ int main(int argc, char ** argv) {
     }
 
     sess->finalize();
+
+    if (args.accumulate && line_open) {
+        std::fputc('\n', stdout);
+        std::fflush(stdout);
+    }
 
     ma_device_uninit(&device);
     ma_context_uninit(&ctx);
