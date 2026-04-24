@@ -59,6 +59,25 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 ```
 
+For a GPU backend — Metal on Apple Silicon (**~2.5x faster than CPU**),
+CUDA on NVIDIA, Vulkan elsewhere:
+
+```bash
+# Apple Silicon:
+cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
+# or: -DGGML_CUDA=ON / -DGGML_VULKAN=ON
+cmake --build build-metal -j$(sysctl -n hw.ncpu)
+
+# Run — pass any value > 0 to --n-gpu-layers to enable GPU
+# (the whole encoder runs on one backend; the value is currently a
+# yes/no toggle, named for compat with llama.cpp / whisper.cpp convention):
+./build-metal/qvac-parakeet \
+    --n-gpu-layers 1 \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf \
+    --wav   test/samples/jfk.wav
+```
+
 This produces the main binary plus per-stage validation harnesses:
 
 | Binary                  | What it does |
@@ -119,7 +138,7 @@ you want the `q5_0` size tier specifically.
 
 ### Reference comparison vs onnxruntime (20 s clip, sample-16k.wav, 5 warmup + 15 timed runs)
 
-**f16 vs f16** — same floating-point precision, different runtimes:
+**CPU f16 vs f16** — same floating-point precision, different runtimes:
 
 ```
                    onnxruntime-f16    ggml-cpu-f16
@@ -134,7 +153,7 @@ you want the `q5_0` size tier specifically.
   Transcripts            match          match
 ```
 
-**int8 vs int8** — same quantization level, different runtimes:
+**CPU int8 vs int8** — same quantization level, different runtimes:
 
 ```
                    onnxruntime-int8    ggml-cpu-q8_0
@@ -149,10 +168,27 @@ you want the `q5_0` size tier specifically.
   Transcripts            match           match
 ```
 
-onnxruntime uses hand-tuned AMX coprocessor kernels on Apple Silicon for both
-f16 and int8. ggml is 12–25 % slower on throughput but has 2–3× tighter
-run-to-run variance and far faster cold-start load times (11–26×). The Metal
-/ GPU backend is the next step to close the throughput gap.
+**GPU Metal** — same GGUF, Metal backend (`-DGGML_METAL=ON`, `PARAKEET_BACKEND=metal`):
+
+```
+                   onnxruntime-int8    ggml-metal-q8_0
+  ---------------------------------------------------
+  model size          583.9 MiB         697 MiB
+  load ms               2 295              420      (5.5x faster)
+  inf best ms             682              282      (2.4x faster)
+  inf median ms           712              283      (2.5x faster)
+  inf stdev ms             18             0.83      (21x tighter)
+  RTF best               0.034           0.014
+  RTF median             0.035           0.014
+  Transcripts            match           match      (73x real-time!)
+```
+
+On CPU, onnxruntime uses AMX-accelerated kernels and is 12–25 %
+faster on raw throughput. On Metal (Apple Silicon GPU), ggml is
+**2.4–2.5× faster** than onnxruntime int8 with 21× tighter run-to-run
+variance (0.83 ms stdev vs 18 ms). Metal inference is compute-bound
+on shader units, so the choice of quant tier (f16 / Q8_0 / Q4_0) only
+affects file size — all three land at ~272 ms encoder on a 20 s clip.
 
 ## 3. Run - wav -> text
 
@@ -193,21 +229,24 @@ to ~25x, but the transcript stays bit-equal on clean speech. See
 
 ## Current status
 
-Phases 0 through 5 (rounds 1–8) are complete:
+Phases 0 through 6 are complete:
 
 - `qvac-parakeet --model ... --wav ...` produces the expected
   transcript end-to-end, matching NeMo PyTorch bit-equivalently on
   `jfk.wav` and `sample-16k.wav` at every quant tier (f16 through
-  Q4_0).
+  Q4_0) on both CPU and Metal backends.
 - Per-stage numerical parity is at the f16 quantization floor
   (1–2e-3 rel vs NeMo PyTorch) on every intermediate encoder tensor.
-- Best-case Q8_0 encoder runs 24x real-time on an M3 Ultra CPU —
-  11 % faster than `onnxruntime` with a 91x faster cold start and a
-  3.4x smaller model file.
-- See PROGRESS.md for the round-by-round journal.
+- **CPU Q8_0**: encoder runs 22x real-time on an M3 Ultra CPU.
+  Faster than ONNX f16 by 12 %, slower than ONNX int8 by 22 %.
+- **Metal Q8_0**: encoder runs **73x real-time** on the M3 Ultra
+  GPU. **2.5x faster than onnxruntime int8** with 21x tighter
+  variance (0.83 ms stdev).
+- See PROGRESS.md for the round-by-round journal (§5.11–5.17 for
+  Rounds 5–8, §6.x for the Metal bring-up).
 
-Next phase: Metal backend + `ggml_backend_sched` for GPU offload,
-then TDT / EOU / Sortformer pipelines.
+Next: `CONV_2D_DW` op on Metal (upstream ggml contribution), Metal
+flash-attn, then TDT / EOU / Sortformer pipelines.
 
 ## Repository layout
 

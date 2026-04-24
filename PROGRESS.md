@@ -825,7 +825,115 @@ Snapshots:
   - `artifacts/bench/ggml-cpu-round8-q8_0-jfk-m3ultra.json`
   - `artifacts/bench/ggml-cpu-round8-f16-m3ultra.json`
 
-### 5.18 — still planned
+## Phase 6 — Metal backend  _(done, experimental)_
+
+Bring-up of the `ggml_backend_metal` path for GPU offload on Apple
+Silicon.  End-to-end on the M3 Ultra GPU (48-core):
+
+### 6.1 — wire-up
+
+  - `init_gpu_backend(n_gpu_layers, verbose)` helper chooses CUDA →
+    Metal → Vulkan → CPU based on compile flags and returns
+    `nullptr` when `n_gpu_layers <= 0` or no GPU backend is
+    compiled in. Matches the convention used by `llama.cpp`,
+    `whisper.cpp`, and `chatterbox.cpp`.
+  - `Impl::backend_active` pointer — one of CPU or GPU — drives
+    `ggml_backend_alloc_ctx_tensors`, `ggml_backend_graph_compute`,
+    and the per-call `safe_set` tensor uploads.  All weights live on
+    the GPU backend (unified memory on Apple Silicon), graph runs
+    entirely on GPU.
+  - Standard CLI flag: `--n-gpu-layers N` (same spelling as
+    llama.cpp / whisper.cpp). Any value > 0 moves the whole encoder
+    to GPU — this model has one encoder, so we don't actually need
+    per-layer granularity.
+  - Compile via `cmake -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON`
+    (or `-DGGML_CUDA=ON`, `-DGGML_VULKAN=ON`).
+  - `ggml_conv_2d_dw_direct` (Round 8a) is **not yet implemented on
+    Metal** (`ggml_metal_op_encode_impl: error: unsupported op
+    'CONV_2D_DW'`). `conformer_conv_graph` takes a `use_conv2d_dw`
+    bool, chosen at graph-build time via `ggml_backend_is_cpu(backend)`:
+    CPU path uses the fast direct kernel, GPU paths revert to
+    `ggml_conv_1d_dw` (im2col + mul_mat, Metal/CUDA/Vulkan supported).
+  - `flash_attn_ext` left behind `#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN`
+    from Round 7 — should be tested on Metal as a separate follow-up.
+
+### 6.2 — parity
+
+Metal `test-encoder` on `jfk.wav` + `artifacts/ctc-ref`:
+
+```
+stage B  subsampling_out        rel=7.641e-04  (CPU: 1.156e-03)
+stage C0 post_ff1  (b0)         rel=4.859e-04  (CPU: 9.970e-04)
+stage C1 post_attn (b0)         rel=4.866e-04  (CPU: 9.984e-04)
+stage C2 post_conv (b0)         rel=4.870e-04  (CPU: 9.987e-04)
+stage C3 post_ff2  (b0)         rel=4.880e-04  (CPU: 1.000e-03)
+stage C  block_0_out            rel=6.756e-04  (CPU: 1.060e-03)
+stage D  block_last_out         rel=1.698e-03  (CPU: 1.730e-03)
+stage E  encoder_out            rel=1.698e-03  (CPU: 1.730e-03)
+stage F  logits (log_softmax)   rel=3.871e-04  (CPU: 1.362e-03)
+```
+
+All 9 gates pass, and Metal per-stage rel is **tighter than CPU**
+(the Metal f16 mul_mat kernels use f32 accumulators throughout, which
+happens to track NeMo PyTorch's f32 reference more closely than the
+CPU path's mixed-precision accumulation).
+
+### 6.3 — bench
+
+`sample-16k.wav` (20 s), `--bench-warmup 5 --bench-runs 15`:
+
+| variant            | enc best | enc median | stdev | RTF best | real-time multiple |
+|--------------------|---------:|-----------:|------:|---------:|-------------------:|
+| CPU f16 (Round 8)  |    1 117 |      1 132 |    18 |    0.055 |              18x   |
+| CPU Q8_0 (Round 8) |      898 |        928 |    25 |    0.045 |              22x   |
+| CPU Q4_0 (Round 8) |    1 080 |      1 286 |   138 |    0.054 |              19x   |
+| **Metal f16**      |    **266** |    **268** | **1.1** | **0.013** |        **75x**   |
+| **Metal Q8_0**     |    **272** |    **274** | **1.5** | **0.014** |        **73x**   |
+| Metal Q4_0         |      271 |        272 |   0.5 |    0.014 |              74x   |
+
+On `jfk.wav` (11 s): Metal f16 encoder best 152 ms, median 154 ms.
+
+### 6.4 — comparison vs onnxruntime
+
+`sample-16k.wav`, 5 warmup + 15 timed runs, ggml run with
+`--n-gpu-layers 1`:
+
+```
+                   onnxruntime-int8    ggml-metal-Q8_0
+  ---------------------------------------------------
+  model size           583.9 MiB         697 MiB
+  load ms               2 295              420      (5.5x faster cold start)
+  inf best ms             682              282      (2.4x faster)
+  inf median ms           712              283      (2.5x faster)
+  inf stdev ms             18             0.83      (21x tighter)
+  RTF best               0.034           0.014
+  RTF median             0.035           0.014
+  Transcripts            match           match
+```
+
+**Metal ggml is 2.4x–2.5x faster than onnxruntime's AMX-accelerated
+int8 path**, with 21x tighter variance (0.83 ms vs 18 ms stdev).
+Metal is compute-bound on GPU shader units, so quantization does not
+help (f16 / Q8_0 / Q4_0 all cluster around 272 ms) — but it does
+shrink the model file and the unified-memory footprint.
+
+### 6.5 — remaining work
+
+  - Implement `CONV_2D_DW` on the Metal backend (upstream contribution
+    to ggml) so the CPU and Metal paths share `conformer_conv_graph`.
+    Would buy a few ms more on Metal since the direct path is
+    asymptotically cheaper than im2col.
+  - Test `ggml_flash_attn_ext` on Metal — likely a meaningful win given
+    the fused softmax + V-multiply kernel, plus the dormant infra from
+    Round 7 is already in place.
+  - Hybrid `ggml_backend_sched` with Metal for the encoder + CPU for
+    the mel preprocessor, so the CPU mel path doesn't block the GPU
+    encoder. Today the mel runs inline on host before the encoder
+    starts; with a sched we could overlap them.
+
+---
+
+### 5.18 — still planned (CPU-only work)
 
 Phase 5 (CPU optimization) is effectively complete: Round 8 Q8_0 is
 11 % faster than `onnxruntime` on the 20 s clip.  Remaining candidate

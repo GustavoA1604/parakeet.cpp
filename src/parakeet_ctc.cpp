@@ -5,6 +5,15 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-blas.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
 #include "gguf.h"
 
 #include <algorithm>
@@ -65,6 +74,8 @@ struct ParakeetCtcModel::Impl {
     ggml_context         * ctx            = nullptr;
     ggml_backend_t         backend_cpu    = nullptr;
     ggml_backend_t         backend_blas   = nullptr;
+    ggml_backend_t         backend_gpu    = nullptr;
+    ggml_backend_t         backend_active = nullptr;
     ggml_backend_buffer_t  weights_buffer = nullptr;
     std::vector<std::unique_ptr<EncoderGraph>> encoder_graphs;
     static constexpr size_t k_encoder_graph_cache_max = 3;
@@ -78,12 +89,37 @@ struct ParakeetCtcModel::Impl {
         if (ctx)            ggml_free(ctx);
         if (gguf)           gguf_free(gguf);
         if (backend_blas)   ggml_backend_free(backend_blas);
+        if (backend_gpu)    ggml_backend_free(backend_gpu);
         if (backend_cpu)    ggml_backend_free(backend_cpu);
     }
 };
 
 
 namespace {
+
+ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
+    if (n_gpu_layers <= 0) return nullptr;
+#ifdef GGML_USE_CUDA
+    if (auto * b = ggml_backend_cuda_init(0)) {
+        if (verbose) std::fprintf(stderr, "parakeet: using CUDA backend\n");
+        return b;
+    }
+#endif
+#ifdef GGML_USE_METAL
+    if (auto * b = ggml_backend_metal_init()) {
+        if (verbose) std::fprintf(stderr, "parakeet: using Metal backend\n");
+        return b;
+    }
+#endif
+#ifdef GGML_USE_VULKAN
+    if (auto * b = ggml_backend_vk_init(0)) {
+        if (verbose) std::fprintf(stderr, "parakeet: using Vulkan backend\n");
+        return b;
+    }
+#endif
+    if (verbose) std::fprintf(stderr, "parakeet: no GPU backend compiled in, falling back to CPU\n");
+    return nullptr;
+}
 
 int find_key(const gguf_context * g, const std::string & k) {
     return (int) gguf_find_key(g, k.c_str());
@@ -153,6 +189,9 @@ int load_from_gguf(const std::string & gguf_path,
         ggml_backend_blas_set_n_threads(impl->backend_blas, resolved_threads);
     }
 
+    impl->backend_gpu    = init_gpu_backend(n_gpu_layers, verbose);
+    impl->backend_active = impl->backend_gpu ? impl->backend_gpu : impl->backend_cpu;
+
     gguf_init_params params = { /*no_alloc=*/ true, &impl->ctx };
     impl->gguf = gguf_init_from_file(gguf_path.c_str(), params);
     if (!impl->gguf) {
@@ -162,7 +201,7 @@ int load_from_gguf(const std::string & gguf_path,
 
     gguf_context * g = impl->gguf;
 
-    impl->weights_buffer = ggml_backend_alloc_ctx_tensors(impl->ctx, impl->backend_cpu);
+    impl->weights_buffer = ggml_backend_alloc_ctx_tensors(impl->ctx, impl->backend_active);
     if (!impl->weights_buffer) {
         std::fprintf(stderr, "gguf: ggml_backend_alloc_ctx_tensors failed\n");
         return 12;
@@ -341,7 +380,10 @@ int load_from_gguf(const std::string & gguf_path,
 
     if (verbose) {
         print_model_summary(out_model);
-        std::fprintf(stderr, "  backend: cpu  (threads=%d)\n", resolved_threads);
+        const char * be = impl->backend_gpu
+                            ? ggml_backend_name(impl->backend_gpu)
+                            : "CPU";
+        std::fprintf(stderr, "  backend: %s  (threads=%d)\n", be, resolved_threads);
     }
     return 0;
 }
@@ -572,7 +614,8 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
 
 ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
                                    const BlockWeights & W,
-                                   int d_model, int /*T*/, int conv_kernel) {
+                                   int d_model, int /*T*/, int conv_kernel,
+                                   bool use_conv2d_dw) {
     ggml_tensor * pw1_w_2d = ggml_reshape_2d(ctx, W.conv_pw1_w, d_model, 2 * d_model);
     ggml_tensor * y = ggml_mul_mat(ctx, pw1_w_2d, xn);
     y = ggml_add(ctx, y, W.conv_pw1_b);
@@ -587,14 +630,18 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * yt = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
 
     const int pad = (conv_kernel - 1) / 2;
-    const int T_local = (int) yt->ne[0];
-    ggml_tensor * yt_4d = ggml_reshape_4d(ctx, yt, T_local, 1, d_model, 1);
-    ggml_tensor * dw_kernel_f32 = W.conv_dw_w->type == GGML_TYPE_F32
-                                ? W.conv_dw_w
-                                : ggml_cast(ctx, W.conv_dw_w, GGML_TYPE_F32);
-    ggml_tensor * dw_kernel_4d = ggml_reshape_4d(ctx, dw_kernel_f32, conv_kernel, 1, 1, d_model);
-    ggml_tensor * dw_out = ggml_conv_2d_dw_direct(ctx, dw_kernel_4d, yt_4d, 1, 1, pad, 0, 1, 1);
-    yt = ggml_reshape_3d(ctx, dw_out, dw_out->ne[0], d_model, 1);
+    if (use_conv2d_dw) {
+        const int T_local = (int) yt->ne[0];
+        ggml_tensor * yt_4d = ggml_reshape_4d(ctx, yt, T_local, 1, d_model, 1);
+        ggml_tensor * dw_kernel_f32 = W.conv_dw_w->type == GGML_TYPE_F32
+                                    ? W.conv_dw_w
+                                    : ggml_cast(ctx, W.conv_dw_w, GGML_TYPE_F32);
+        ggml_tensor * dw_kernel_4d = ggml_reshape_4d(ctx, dw_kernel_f32, conv_kernel, 1, 1, d_model);
+        ggml_tensor * dw_out = ggml_conv_2d_dw_direct(ctx, dw_kernel_4d, yt_4d, 1, 1, pad, 0, 1, 1);
+        yt = ggml_reshape_3d(ctx, dw_out, dw_out->ne[0], d_model, 1);
+    } else {
+        yt = ggml_conv_1d_dw(ctx, W.conv_dw_w, yt, 1, pad, 1);
+    }
     yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_dw_b, 1, d_model));
 
     yt = ggml_mul(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_scale, 1, d_model));
@@ -615,7 +662,8 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
                                     ggml_tensor * pos_emb,
                                     const BlockWeights & W,
                                     int d_model, int H, int HD, int T,
-                                    int conv_kernel, float eps) {
+                                    int conv_kernel, float eps,
+                                    bool use_conv2d_dw) {
     ggml_tensor * residual = x;
     ggml_tensor * y = conformer_ff_graph(ctx, x,
                                          W.norm_ff1_w, W.norm_ff1_b,
@@ -631,7 +679,7 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
 
     residual = x;
     xn = layer_norm_affine(ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel);
+    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw);
     x = ggml_add(ctx, residual, y);
 
     residual = x;
@@ -654,9 +702,9 @@ int run_subsampling(ParakeetCtcModel   & model,
                     int                  n_mels,
                     std::vector<float> & out_feats,
                     int                & out_n_frames) {
-    if (!model.impl || !model.impl->backend_cpu) return -1;
+    if (!model.impl || !model.impl->backend_active) return -1;
 
-    ggml_backend_t backend = model.impl->backend_cpu;
+    ggml_backend_t backend = model.impl->backend_active;
     const int C_sub = model.encoder_cfg.subsampling_channels;
     const int d_model = model.encoder_cfg.d_model;
 
@@ -759,6 +807,10 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     const int conv_kernel = enc.conv_kernel;
     const float eps = enc.layer_norm_eps;
 
+    // Metal / CUDA / Vulkan don't implement CONV_2D_DW yet; use the
+    // im2col+matmul lowering on any non-CPU backend.
+    const bool use_conv2d_dw = ggml_backend_is_cpu(backend);
+
     const int L0 = n_mel_frames;
     const int L1 = _conv_out_len(L0, 3, 2, 1);
     const int L2 = _conv_out_len(L1, 3, 2, 1);
@@ -830,7 +882,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
             residual = x;
             xn = layer_norm_affine(gctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel);
+            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw);
             x = ggml_add(gctx, residual, y);
             g.post_conv_0_node = x;
             ggml_set_name(g.post_conv_0_node, "block_0_post_conv");
@@ -854,7 +906,8 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
             ggml_set_output(g.block_0_out_node);
         } else {
             x = conformer_block_graph(gctx, x, g.pe_in, model.blocks[i],
-                                      d_model, H, HD, T, conv_kernel, eps);
+                                      d_model, H, HD, T, conv_kernel, eps,
+                                      use_conv2d_dw);
         }
         if (i == n_run_layers - 1) {
             g.block_last_out_node = x;
@@ -899,9 +952,9 @@ int run_encoder(ParakeetCtcModel   & model,
                 int                  n_mels,
                 EncoderOutputs     & out,
                 int                  max_layers) {
-    if (!model.impl || !model.impl->backend_cpu) return -1;
+    if (!model.impl || !model.impl->backend_active) return -1;
 
-    ggml_backend_t backend = model.impl->backend_cpu;
+    ggml_backend_t backend = model.impl->backend_active;
     const EncoderConfig & enc = model.encoder_cfg;
     const int d_model = enc.d_model;
 
@@ -1074,7 +1127,8 @@ static int build_substage_graph(const ParakeetCtcModel & model,
     if (stage == Substage::CONV || stage == Substage::FULL_BLOCK) {
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-        ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel);
+        const bool use_conv2d_dw = ggml_backend_is_cpu(backend);
+        ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw);
         x = ggml_add(g.ctx, r, y);
     }
     if (stage == Substage::FF2 || stage == Substage::FULL_BLOCK) {
@@ -1111,8 +1165,8 @@ int profile_block_substages(ParakeetCtcModel & model,
                             int warmup_runs,
                             int timed_runs,
                             BlockSubstageTimes & out) {
-    if (!model.impl || !model.impl->backend_cpu) return -1;
-    ggml_backend_t backend = model.impl->backend_cpu;
+    if (!model.impl || !model.impl->backend_active) return -1;
+    ggml_backend_t backend = model.impl->backend_active;
     const int d_model = model.encoder_cfg.d_model;
 
     std::vector<float> x_host((size_t) d_model * T_enc);
