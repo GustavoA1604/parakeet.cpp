@@ -252,16 +252,172 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
 }
 
 struct StreamSession::Impl {
-    StreamingOptions  opts;
-    StreamingCallback on_segment;
-    bool              finalized = false;
-    bool              cancelled = false;
+    Engine::Impl *      engine_impl = nullptr;
+    StreamingOptions    opts;
+    StreamingCallback   on_segment;
+
+    int chunk_samples           = 0;
+    int left_context_samples    = 0;
+    int right_lookahead_samples = 0;
+
+    std::vector<float>   left_history;
+    std::vector<float>   pending;
+
+    int     chunk_index    = 0;
+    int64_t emitted_samples = 0;
+    int32_t prev_token     = -1;
+
+    std::string             cumulative_text;
+    std::vector<int32_t>    cumulative_token_ids;
+
+    bool finalized = false;
+    bool cancelled = false;
+
+    void process_window(const float * window_samples, int window_n,
+                        int center_start_sample,
+                        int center_end_sample,
+                        bool is_final_chunk);
+    void try_emit_chunks();
+    void flush_remainder();
 };
+
+void StreamSession::Impl::process_window(const float * window_samples, int window_n,
+                                         int center_start_sample,
+                                         int center_end_sample,
+                                         bool is_final_chunk) {
+    if (cancelled) return;
+    if (window_n <= 0) return;
+
+    using clock = std::chrono::steady_clock;
+    const auto t_chunk = clock::now();
+
+    std::vector<float> mel;
+    int n_mel_frames = 0;
+    if (int rc = compute_log_mel(window_samples, window_n,
+                                 engine_impl->model.mel_cfg,
+                                 mel, n_mel_frames); rc != 0) {
+        throw std::runtime_error("StreamSession: compute_log_mel failed (rc=" +
+                                 std::to_string(rc) + ")");
+    }
+
+    EncoderOutputs enc_out;
+    if (int rc = run_encoder(engine_impl->model, mel.data(), n_mel_frames,
+                             engine_impl->model.mel_cfg.n_mels, enc_out); rc != 0) {
+        throw std::runtime_error("StreamSession: run_encoder failed (rc=" +
+                                 std::to_string(rc) + ")");
+    }
+
+    const double encoder_ms = ms_since(t_chunk);
+
+    const int T_enc = enc_out.n_enc_frames;
+    const int sr    = opts.sample_rate;
+    const int frame_samples = sr * ENCODER_FRAME_STRIDE_MS / 1000;
+
+    int left_drop_frames     = center_start_sample / frame_samples;
+    int center_frame_count   = (center_end_sample - center_start_sample) / frame_samples;
+    int right_drop_frames    = T_enc - left_drop_frames - center_frame_count;
+    if (is_final_chunk) {
+        right_drop_frames = 0;
+        center_frame_count = T_enc - left_drop_frames;
+    }
+
+    if (left_drop_frames < 0) left_drop_frames = 0;
+    if (left_drop_frames > T_enc) left_drop_frames = T_enc;
+    if (right_drop_frames < 0) right_drop_frames = 0;
+    if (right_drop_frames > T_enc - left_drop_frames) {
+        right_drop_frames = T_enc - left_drop_frames;
+    }
+
+    const int center_end_frame = T_enc - right_drop_frames;
+
+    const auto t_dec = clock::now();
+    std::vector<int32_t> win_tokens;
+    ctc_greedy_decode_window(enc_out.logits.data(),
+                             left_drop_frames, center_end_frame,
+                             engine_impl->model.vocab_size,
+                             engine_impl->model.blank_id,
+                             prev_token, win_tokens, nullptr);
+
+    const size_t prev_cumulative_len = cumulative_text.size();
+    cumulative_token_ids.insert(cumulative_token_ids.end(),
+                                win_tokens.begin(), win_tokens.end());
+    cumulative_text = detokenize(engine_impl->model.vocab, cumulative_token_ids);
+    const std::string win_text = cumulative_text.substr(prev_cumulative_len);
+
+    const double decode_ms = ms_since(t_dec);
+
+    if (on_segment) {
+        StreamingSegment seg;
+        seg.text        = win_text;
+        seg.token_ids   = win_tokens;
+        seg.start_s     = static_cast<double>(emitted_samples) / sr;
+        seg.end_s       = static_cast<double>(emitted_samples +
+                                              (center_end_sample - center_start_sample)) / sr;
+        seg.chunk_index = chunk_index;
+        seg.is_final    = true;
+        seg.encoder_ms  = encoder_ms;
+        seg.decode_ms   = decode_ms;
+        on_segment(seg);
+    }
+
+    emitted_samples += (center_end_sample - center_start_sample);
+    ++chunk_index;
+}
+
+void StreamSession::Impl::try_emit_chunks() {
+    if (cancelled) return;
+    while (!cancelled &&
+           static_cast<int>(pending.size()) >= chunk_samples + right_lookahead_samples) {
+        std::vector<float> window;
+        window.reserve(left_history.size() + chunk_samples + right_lookahead_samples);
+        window.insert(window.end(), left_history.begin(), left_history.end());
+        window.insert(window.end(), pending.begin(),
+                      pending.begin() + chunk_samples + right_lookahead_samples);
+
+        const int center_start = static_cast<int>(left_history.size());
+        const int center_end   = center_start + chunk_samples;
+
+        process_window(window.data(), static_cast<int>(window.size()),
+                       center_start, center_end, /*is_final_chunk=*/false);
+
+        left_history.insert(left_history.end(),
+                            pending.begin(), pending.begin() + chunk_samples);
+        if (static_cast<int>(left_history.size()) > left_context_samples) {
+            left_history.erase(left_history.begin(),
+                               left_history.end() - left_context_samples);
+        }
+
+        pending.erase(pending.begin(), pending.begin() + chunk_samples);
+    }
+}
+
+void StreamSession::Impl::flush_remainder() {
+    if (cancelled) return;
+    if (pending.empty()) return;
+
+    std::vector<float> window;
+    window.reserve(left_history.size() + pending.size());
+    window.insert(window.end(), left_history.begin(), left_history.end());
+    window.insert(window.end(), pending.begin(), pending.end());
+
+    const int center_start = static_cast<int>(left_history.size());
+    const int center_end   = center_start + static_cast<int>(pending.size());
+
+    process_window(window.data(), static_cast<int>(window.size()),
+                   center_start, center_end, /*is_final_chunk=*/true);
+
+    pending.clear();
+    left_history.clear();
+}
 
 StreamSession::StreamSession(std::unique_ptr<Impl> impl)
     : pimpl_(std::move(impl)) {}
 
-StreamSession::~StreamSession() = default;
+StreamSession::~StreamSession() {
+    if (pimpl_ && !pimpl_->finalized && !pimpl_->cancelled) {
+        try { pimpl_->cancelled = true; } catch (...) {}
+    }
+}
 StreamSession::StreamSession(StreamSession &&) noexcept = default;
 StreamSession & StreamSession::operator=(StreamSession &&) noexcept = default;
 
@@ -269,40 +425,73 @@ const StreamingOptions & StreamSession::options() const {
     return pimpl_->opts;
 }
 
-void StreamSession::feed_pcm_f32(const float *, int) {
-    throw std::runtime_error(
-        "qvac_parakeet::ctc::StreamSession::feed_pcm_f32: live duplex streaming "
-        "requires a cache-aware streaming GGUF; see PROGRESS.md Phase 8.");
+void StreamSession::feed_pcm_f32(const float * samples, int n_samples) {
+    if (!pimpl_) throw std::runtime_error("StreamSession: moved-from session");
+    if (pimpl_->finalized) {
+        throw std::runtime_error("StreamSession::feed_pcm_f32: session already finalized");
+    }
+    if (pimpl_->cancelled) return;
+    if (!samples || n_samples <= 0) return;
+    pimpl_->pending.insert(pimpl_->pending.end(), samples, samples + n_samples);
+    pimpl_->try_emit_chunks();
 }
 
-void StreamSession::feed_pcm_i16(const int16_t *, int) {
-    throw std::runtime_error(
-        "qvac_parakeet::ctc::StreamSession::feed_pcm_i16: live duplex streaming "
-        "requires a cache-aware streaming GGUF; see PROGRESS.md Phase 8.");
+void StreamSession::feed_pcm_i16(const int16_t * samples, int n_samples) {
+    if (!pimpl_) throw std::runtime_error("StreamSession: moved-from session");
+    if (pimpl_->finalized) {
+        throw std::runtime_error("StreamSession::feed_pcm_i16: session already finalized");
+    }
+    if (pimpl_->cancelled) return;
+    if (!samples || n_samples <= 0) return;
+    const size_t prev = pimpl_->pending.size();
+    pimpl_->pending.resize(prev + n_samples);
+    constexpr float inv = 1.0f / 32768.0f;
+    for (int i = 0; i < n_samples; ++i) {
+        pimpl_->pending[prev + i] = static_cast<float>(samples[i]) * inv;
+    }
+    pimpl_->try_emit_chunks();
 }
 
 void StreamSession::finalize() {
+    if (!pimpl_) return;
+    if (pimpl_->finalized) return;
     pimpl_->finalized = true;
+    pimpl_->try_emit_chunks();
+    pimpl_->flush_remainder();
 }
 
 void StreamSession::cancel() {
+    if (!pimpl_) return;
     pimpl_->cancelled = true;
 }
 
 std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opts,
                                                     StreamingCallback on_segment) {
-    if (!pimpl_->model.supports_streaming) {
+    if (opts.sample_rate != pimpl_->model.mel_cfg.sample_rate) {
         throw std::runtime_error(
-            "qvac_parakeet::ctc::Engine::stream_start: loaded GGUF does not support "
-            "live duplex streaming. This requires a cache-aware streaming checkpoint "
-            "with 'parakeet.encoder.streaming.enabled=true' metadata. "
-            "See PROGRESS.md Phase 8 for the streaming pipeline milestone. "
-            "For full-audio streamed output, use transcribe_stream() instead.");
+            "Engine::stream_start: opts.sample_rate=" + std::to_string(opts.sample_rate) +
+            " does not match model rate=" + std::to_string(pimpl_->model.mel_cfg.sample_rate));
+    }
+    if (opts.chunk_ms <= 0) {
+        throw std::runtime_error("Engine::stream_start: chunk_ms must be > 0");
+    }
+    if (opts.left_context_ms < 0 || opts.right_lookahead_ms < 0) {
+        throw std::runtime_error("Engine::stream_start: left_context_ms and right_lookahead_ms must be >= 0");
     }
 
     auto impl = std::make_unique<StreamSession::Impl>();
-    impl->opts       = opts;
-    impl->on_segment = std::move(on_segment);
+    impl->engine_impl  = pimpl_.get();
+    impl->opts         = opts;
+    impl->on_segment   = std::move(on_segment);
+
+    const int sr = opts.sample_rate;
+    impl->chunk_samples           = sr * opts.chunk_ms / 1000;
+    impl->left_context_samples    = sr * opts.left_context_ms / 1000;
+    impl->right_lookahead_samples = sr * opts.right_lookahead_ms / 1000;
+
+    impl->left_history.reserve(impl->left_context_samples);
+    impl->pending.reserve(impl->chunk_samples + impl->right_lookahead_samples);
+
     return std::make_unique<StreamSession>(std::move(impl));
 }
 

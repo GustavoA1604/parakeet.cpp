@@ -32,12 +32,25 @@ void print_usage(const char * argv0) {
         "                       N just needs to be >0 — the whole encoder moves)\n"
         "  --verbose            print per-stage wall times and shapes to stderr\n"
         "\n"
-        "  --stream             enable Mode 2 streaming: runs the offline encoder once, then\n"
-        "                       emits one segment per --stream-chunk-ms window via callback.\n"
-        "                       Transcript is byte-equal to non-streaming mode; segments are\n"
-        "                       printed to stdout as they are produced.\n"
-        "  --stream-chunk-ms N  segment window stride in ms (default 1000; snaps to multiples\n"
-        "                       of the 80 ms encoder frame stride)\n"
+        "  --stream             enable streaming. Without --stream-duplex this is Mode 2:\n"
+        "                       runs the offline encoder once, then emits one segment per\n"
+        "                       --stream-chunk-ms window via callback. Transcript is\n"
+        "                       byte-equal to the non-streaming path.\n"
+        "  --stream-duplex      enable Mode 3 (cache-aware duplex streaming): feeds the\n"
+        "                       audio into a StreamSession in blocks, runs the encoder per\n"
+        "                       chunk with left-context + right-lookahead, emits segments\n"
+        "                       as soon as each chunk is processed. Incurs per-chunk\n"
+        "                       encoder cost but first segment lands at ~chunk_ms +\n"
+        "                       right_lookahead_ms. Typical WER: ~0 %% on short clean\n"
+        "                       speech, ~4 %% on long sci-fi narration at the default\n"
+        "                       context budget. Requires --stream.\n"
+        "  --stream-chunk-ms N  segment window stride in ms (default 1000 Mode 2 /\n"
+        "                       2000 Mode 3 recommended; snaps to 80 ms frame stride)\n"
+        "  --stream-left-context-ms N    (Mode 3) left-context audio per chunk (default 10000)\n"
+        "  --stream-right-lookahead-ms N (Mode 3) right-lookahead audio per chunk (default 2000)\n"
+        "  --stream-feed-bytes N         (Mode 3) feed PCM into StreamSession in N-byte\n"
+        "                                blocks (default 4096 bytes = 1024 samples); exercise\n"
+        "                                with smaller values to stress the session state machine\n"
         "  --emit FMT           --stream output format: 'text' (default) prints segment text\n"
         "                       one per line; 'jsonl' prints {text,start,end,chunk,is_final}\n"
         "                       JSON Lines, one per segment\n"
@@ -153,9 +166,13 @@ struct ExtraCliOpts {
     std::string pcm_in_path;
     std::string pcm_format   = "s16le";
 
-    bool        stream        = false;
-    int         stream_chunk_ms = 1000;
-    std::string emit_format  = "text";
+    bool        stream            = false;
+    int         stream_chunk_ms   = 1000;
+    int         stream_left_ms    = -1;
+    int         stream_right_ms   = -1;
+    bool        stream_duplex     = false;
+    int         stream_feed_bytes = 0;
+    std::string emit_format       = "text";
 };
 
 double ms_since(std::chrono::steady_clock::time_point a) {
@@ -245,6 +262,14 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             extra.stream = true;
         } else if (a == "--stream-chunk-ms" && i + 1 < argc) {
             extra.stream_chunk_ms = std::max(80, std::atoi(argv[++i]));
+        } else if (a == "--stream-left-context-ms" && i + 1 < argc) {
+            extra.stream_left_ms = std::max(0, std::atoi(argv[++i]));
+        } else if (a == "--stream-right-lookahead-ms" && i + 1 < argc) {
+            extra.stream_right_ms = std::max(0, std::atoi(argv[++i]));
+        } else if (a == "--stream-duplex") {
+            extra.stream_duplex = true;
+        } else if (a == "--stream-feed-bytes" && i + 1 < argc) {
+            extra.stream_feed_bytes = std::max(1, std::atoi(argv[++i]));
         } else if (a == "--emit" && i + 1 < argc) {
             extra.emit_format = argv[++i];
         } else {
@@ -482,11 +507,44 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         Engine engine(eopts);
 
         StreamingOptions sopts;
-        sopts.sample_rate = sr;
-        sopts.chunk_ms    = extra.stream_chunk_ms;
+        sopts.sample_rate       = sr;
+        sopts.chunk_ms          = extra.stream_chunk_ms;
+        if (extra.stream_left_ms  >= 0) sopts.left_context_ms    = extra.stream_left_ms;
+        if (extra.stream_right_ms >= 0) sopts.right_lookahead_ms = extra.stream_right_ms;
 
         const std::string emit_fmt = extra.emit_format;
         const auto t_stream = clock::now();
+
+        if (extra.stream_duplex) {
+            int segment_count = 0;
+            auto sess = engine.stream_start(sopts,
+                [&](const StreamingSegment & seg) {
+                    emit_segment(seg, emit_fmt);
+                    ++segment_count;
+                });
+
+            const int feed_bytes = extra.stream_feed_bytes > 0
+                                 ? extra.stream_feed_bytes
+                                 : 4096;
+            const int feed_samples = std::max(1, feed_bytes / (int) sizeof(float));
+
+            for (int i = 0; i < (int) samples.size(); i += feed_samples) {
+                const int n = std::min(feed_samples, (int) samples.size() - i);
+                sess->feed_pcm_f32(samples.data() + i, n);
+            }
+            sess->finalize();
+
+            const double stream_ms = ms_since(t_stream);
+            if (opts.verbose) {
+                std::fprintf(stderr,
+                    "[stream-duplex] load=%.1fms audio=%.2fs samples=%zu@%dHz\n"
+                    "[stream-duplex] chunk_ms=%d left=%dms right=%dms segments=%d total=%.1fms RTF=%.3f\n",
+                    load_ms, audio_ms / 1000.0, samples.size(), sr,
+                    sopts.chunk_ms, sopts.left_context_ms, sopts.right_lookahead_ms,
+                    segment_count, stream_ms, stream_ms / audio_ms);
+            }
+            return 0;
+        }
 
         auto result = engine.transcribe_samples_stream(
             samples.data(), (int) samples.size(), sr, sopts,

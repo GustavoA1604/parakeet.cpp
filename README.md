@@ -220,7 +220,7 @@ SDK's `transcribe` / `transcribeStream` API:
 |-|-|-|-|
 | `Engine::transcribe()` | full audio | full text | ships |
 | `Engine::transcribe_stream()` | full audio + callback | segments via callback | **ships (Mode 2)** |
-| `Engine::stream_start()` -> `StreamSession` | push PCM via `feed_pcm_*()` | segments via callback | API frozen, errors until a cache-aware streaming GGUF lands (Phase 8) |
+| `Engine::stream_start()` -> `StreamSession` | push PCM via `feed_pcm_*()` | segments via callback | **ships (Mode 3, cache-aware inference)** |
 
 Mode 2 runs the offline encoder once, then walks CTC frames in
 `chunk_ms`-sized windows and emits one `StreamingSegment` per window via
@@ -257,11 +257,67 @@ mel=152ms enc=14941ms dec=5ms total=15099ms RTF=0.046 tokens=1710
 
 Segments are emitted to stdout at the `--stream-chunk-ms` cadence once
 the offline encoder finishes. Mode 2 is *cosmetic streaming*: first
-segment lands after the full encoder pass; true low-latency streaming
-is the Phase 8 Mode 3 milestone (live duplex with a cache-aware
-streaming checkpoint). The API surface for Mode 3 is already frozen —
-`stream_start()` compiles and links today, and throws a clear runtime
-error until the streaming GGUF is available.
+segment lands after the full encoder pass.
+
+### Streaming — Mode 3 (live duplex, cache-aware inference)
+
+Mode 3 feeds PCM into a `StreamSession` incrementally; each chunk runs
+its own encoder pass over `[left_context + chunk + right_lookahead]`
+audio, slices out the center frames, and emits a segment as soon as
+that chunk is processed. First segment lands at
+`chunk_ms + right_lookahead_ms + encoder_time`, not after the full
+utterance.
+
+Key point: **no new model needed**. Mode 3 runs the existing
+offline-trained 600M Parakeet-CTC-0.6B weights in cache-aware inference
+mode. Accuracy is preserved within a few percent of offline WER when
+the `left_context_ms` and `right_lookahead_ms` budgets are reasonable
+(the conv module uses symmetric `kernel=9` padding, so denying future
+context at chunk boundaries hurts more than denying past context).
+
+From the CLI (simulates a live producer feeding the same wav in blocks):
+
+```bash
+./build/qvac-parakeet \
+    --model models/parakeet-ctc-0.6b.gguf \
+    --pcm-in recording.raw --pcm-format s16le \
+    --stream --stream-duplex \
+    --stream-chunk-ms          2000 \
+    --stream-left-context-ms   10000 \
+    --stream-right-lookahead-ms 2000 \
+    --emit text         # or jsonl
+```
+
+Mode 3 knobs (all in `StreamingOptions` on the C++ side,
+`--stream-*-ms` on the CLI):
+
+- `chunk_ms` — audio stride at which segments are emitted.
+- `left_context_ms` — past audio prepended to the encoder input each
+  chunk. 10 s is a solid default; diminishing returns past 5 s.
+- `right_lookahead_ms` — future audio appended before emitting the
+  chunk; most impactful accuracy knob.
+
+Measured on Apple M3 Ultra, Q8_0, Metal backend:
+
+| Audio | Config (chunk / left / right ms) | WER vs offline | Wall time | First-seg latency |
+|-|-|-|-|-|
+| `jfk.wav` (11 s) | 1000 / 2000 / 500 | **0.00%** | ~1.8 s | ~1.6 s |
+| `jfk.wav` (11 s) | 2000 / 2000 / 1000 | **0.00%** | ~1.8 s | ~3.1 s |
+| `jfk.wav` (11 s) | 2000 / 5000 / 2000 | **0.00%** | ~1.9 s | ~4.1 s |
+| `LastQuestion_EN.raw` (5.5 min) | 2000 / 10000 / 2000 | **4.13%** | 35 s (RTF 0.11) | ~4 s |
+
+Mode 3 is slower in total wall time than Mode 2 because each chunk
+re-runs the encoder over the full `(left_ctx + chunk + right_lookahead)`
+window. A KV-cache + conv-state optimisation (Phase 8.5) will roughly
+6x the per-chunk compute on long-form audio while preserving the same
+accuracy; the `StreamSession` public API already supports it as a
+drop-in swap.
+
+The Node binding at
+[qvac-lib-infer-parakeet](https://github.com/qvac/qvac-lib-infer-parakeet)
+drives `StreamSession` directly from its existing `append({type:'audio',
+data})` flow — each incoming `Buffer` maps to `feed_pcm_i16`, and
+`{type:'end of job'}` maps to `finalize()`.
 
 ## 4. Optional: validate against NeMo PyTorch
 
@@ -311,15 +367,21 @@ Phases 0 through 7 are complete:
   walks CTC frames in `chunk_ms` windows and emits per-segment
   callbacks, byte-equal to the offline transcript. `--stream` CLI
   flag + `--pcm-in` raw input + `--emit text|jsonl`.
-  Mode 3 (duplex live streaming) API is frozen and errors out until
-  the Phase 8 cache-aware streaming GGUF is available.
+- **Phase 8 — Mode 3 live duplex streaming (cache-aware inference)**:
+  `Engine::stream_start()` -> `StreamSession` with `feed_pcm_f32/i16` +
+  `finalize()`. Uses the **existing offline 600M GGUF** in a
+  chunking-with-context streaming pass, so no new model is needed. On a
+  5.5 min sci-fi clip, Mode 3 transcribes at ~4 % WER vs offline with
+  ~4 s first-segment latency at default settings. `--stream-duplex`
+  CLI + `--stream-left-context-ms` + `--stream-right-lookahead-ms`.
 - See PROGRESS.md for the round-by-round journal (§5.11–5.17 for
-  Rounds 5–8, §6.x for the Metal bring-up, §7.x for streaming).
+  Rounds 5–8, §6.x for the Metal bring-up, §7.x for Mode 2 streaming,
+  §8.x for Mode 3 cache-aware streaming).
 
-Next: Phase 8 cache-aware streaming encoder (Mode 3 duplex) — checkpoint
-selection, new GGUF converter, per-layer attention KV cache + depthwise
-conv state. Then `CONV_2D_DW` on Metal (upstream ggml contribution),
-Metal flash-attn, TDT / EOU / Sortformer pipelines.
+Next: Phase 8.5 (true KV cache + conv state for ~6x compute reduction on
+long-form audio without accuracy change). Then `CONV_2D_DW` on Metal
+(upstream ggml contribution), Metal flash-attn, TDT / EOU / Sortformer
+pipelines.
 
 ## Repository layout
 

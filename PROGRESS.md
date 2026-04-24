@@ -1234,3 +1234,89 @@ Next milestones in order:
 Phase 8.5 (perf follow-up): replace chunking-with-context with true
 KV cache + conv state tensors, ~6× compute reduction on long-form
 audio without changing accuracy.
+
+### Phase 8.2 — C++ StreamSession (done)
+
+Landed the Mode 3 state machine in [src/parakeet_engine.cpp](qvac-parakeet.cpp/src/parakeet_engine.cpp)
+(`StreamSession::Impl`), backed by the existing `Engine::Impl::model`
+through a borrowed pointer. Key pieces:
+
+- `feed_pcm_f32` / `feed_pcm_i16` append samples to a `pending`
+  buffer and trigger `try_emit_chunks()`.
+- `try_emit_chunks()` consumes one chunk at a time while
+  `pending.size() >= chunk_samples + right_lookahead_samples`.
+  Per-chunk window = `left_history + chunk + right_lookahead`.
+  After the encoder run, the consumed chunk is appended to
+  `left_history` (rolling cap at `left_context_samples`).
+- `flush_remainder()` (called from `finalize()`) processes the tail
+  with whatever lookahead is left. No right-lookahead on the final
+  chunk, so the last ~`right_lookahead_ms` of audio sees less conv
+  context — acceptable for a one-shot end-of-audio case.
+- Per-chunk numerical path reuses `compute_log_mel` + `run_encoder` +
+  `ctc_greedy_decode_window` + `detokenize` from the offline stack
+  unchanged. Cumulative detokenize with suffix slicing preserves the
+  leading-space invariant that bit Mode 2 in §7.3.
+- Segment timestamps: `start_s = emitted_samples / sr`,
+  `end_s = (emitted_samples + consumed_chunk_samples) / sr`, absolute
+  from the start of the session. Matches what the binding's
+  `TranscriptionSegment { start, end, toAppend }` expects.
+- `StreamingOptions::left_context_ms` and `right_lookahead_ms`
+  landed on the public API (defaults 10000 / 2000 respectively, the
+  winners from §8.1's sweep).
+- `Engine::stream_start()` no longer gates on the GGUF metadata
+  `parakeet.encoder.streaming.enabled` — any Parakeet-CTC GGUF works.
+  The metadata key survives in the loader for Phase 8.5 / 9 use.
+
+### Phase 8.3 — CLI + validation (done)
+
+CLI:
+
+- `--stream --stream-duplex` routes through `stream_start()` +
+  `feed_pcm_f32` with 4 kB default block size (configurable via
+  `--stream-feed-bytes`, useful to stress the session state machine).
+- `--stream-left-context-ms` + `--stream-right-lookahead-ms` override
+  the `StreamingOptions` defaults.
+- `--emit text|jsonl` reused unchanged.
+
+Test harness (`src/test_streaming.cpp`) adds three Mode 3 configs on
+`jfk.wav` (`chunk_ms × left_ms × right_ms ∈ {1000,2000,500},
+{2000,2000,1000}, {2000,5000,2000}`) plus a cancel-path assertion.
+PCM is fed in **random-size bursts (512-4000 samples)** via
+`feed_pcm_f32` to exercise the ring / chunk-dispatch paths; each
+config asserts WER ≤ 5 % vs the Mode 1 reference (all hit 0 %).
+
+### Phase 8.4 — end-to-end numbers
+
+`LastQuestion_long_EN.raw` (5.46 min, 16 kHz s16le, Apple M3 Ultra,
+Metal Q8_0), default config `chunk_ms=2000, left=10000, right=2000`:
+
+- C++ Mode 3 transcript: 972 words, **4.13 % WER** vs offline.
+- Python f32 reference at the same config: 3.82 % WER. The 0.3 %
+  delta is Q8_0 quantisation noise, matches §6.x's measurements.
+- Wall time: 35.3 s, RTF 0.108 (9× real-time). ~2.4× slower than the
+  Mode 2 offline encoder (RTF 0.046) because each chunk re-runs the
+  encoder on a 14 s window (`left + chunk + right`) instead of the
+  shipping-forward incremental state. This is the chunking-with-context
+  tax; Phase 8.5 closes it.
+- First-segment latency: `chunk_ms + right_lookahead_ms` ≈ 4 s wall
+  (matches Python reference).
+
+### Phase 8.5 — KV cache / conv state (pending)
+
+Same `StreamSession` public API, swap the internal loop: keep
+per-layer `K`, `V`, and depthwise-conv left-state tensors around as
+backend buffers, slid forward each chunk. Each encoder call then only
+computes over new-chunk + right-lookahead frames instead of the full
+`(left + chunk + right)` window. Projected wins:
+
+- Per-chunk compute: down from `O(left + chunk + right)` to
+  `O(chunk + right)`, i.e. ~5× on the default config
+  (2 + 2 vs 10 + 2 + 2).
+- Total wall on the 5.5 min clip: down from 35 s to ~10-15 s (ballpark
+  close to the offline 15 s baseline).
+- Accuracy unchanged — this is a pure compute-layout refactor.
+
+Requires graph changes (persistent cache tensors for attention + conv
+module, streaming attention mask with `att_context_size` plumbing
+already used by NeMo's own cache-aware export path), plus a per-stage
+parity harness vs the §8.1 Python reference. Out of scope for this PR.

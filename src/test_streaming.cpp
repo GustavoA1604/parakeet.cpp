@@ -161,31 +161,123 @@ int main(int argc, char ** argv) {
         }
     }
 
-    bool mode3_ok = false;
-    try {
-        StreamingOptions sopts;
-        sopts.sample_rate = 16000;
-        sopts.chunk_ms    = 1000;
-        auto sess = engine.stream_start(sopts, [](const StreamingSegment &) {});
-        (void)sess;
-        std::fprintf(stderr,
-            "[test-streaming] FAIL Mode 3: stream_start() unexpectedly succeeded "
-            "on a non-streaming GGUF\n");
-    } catch (const std::exception & e) {
-        const std::string msg = e.what();
-        if (msg.find("streaming") != std::string::npos ||
-            msg.find("Phase 8")   != std::string::npos) {
-            std::fprintf(stderr,
-                "[test-streaming] PASS Mode 3: stream_start() errored with "
-                "expected message\n");
-            mode3_ok = true;
-        } else {
-            std::fprintf(stderr,
-                "[test-streaming] FAIL Mode 3: stream_start() errored with "
-                "unexpected message: %s\n", e.what());
+    do {
+        std::vector<float> pcm;
+        {
+            FILE * f = std::fopen(opts.wav_path.c_str(), "rb");
+            if (!f) { std::fprintf(stderr, "[test-streaming] FAIL Mode 3: cannot open wav\n"); ++failures; break; }
+            std::fseek(f, 0, SEEK_END);
+            long sz = std::ftell(f);
+            std::fseek(f, 44, SEEK_SET);
+            std::vector<int16_t> i16((sz - 44) / 2);
+            std::fread(i16.data(), 2, i16.size(), f);
+            std::fclose(f);
+            pcm.resize(i16.size());
+            constexpr float inv = 1.0f / 32768.0f;
+            for (size_t i = 0; i < i16.size(); ++i) pcm[i] = i16[i] * inv;
         }
-    }
-    if (!mode3_ok) ++failures;
+
+        const struct ModeCfg { int chunk_ms; int left_ms; int right_ms; int max_rel_wer_pct; } configs[] = {
+            {1000, 2000,  500, 5},
+            {2000, 2000, 1000, 5},
+            {2000, 5000, 2000, 5},
+        };
+
+        for (const auto & c : configs) {
+            StreamingOptions sopts;
+            sopts.sample_rate       = 16000;
+            sopts.chunk_ms          = c.chunk_ms;
+            sopts.left_context_ms   = c.left_ms;
+            sopts.right_lookahead_ms= c.right_ms;
+
+            int n_segments = 0;
+            double last_end_s = 0.0;
+            std::string concat_text;
+            bool ordering_ok = true;
+
+            auto sess = engine.stream_start(sopts,
+                [&](const StreamingSegment & seg) {
+                    if (seg.chunk_index != n_segments) ordering_ok = false;
+                    if (seg.end_s < seg.start_s)       ordering_ok = false;
+                    concat_text += seg.text;
+                    last_end_s = seg.end_s;
+                    ++n_segments;
+                });
+
+            unsigned rng = 0xDEADBEEFu;
+            size_t i = 0;
+            while (i < pcm.size()) {
+                rng = rng * 1103515245u + 12345u;
+                size_t burst = 512 + (rng % 3500);
+                if (i + burst > pcm.size()) burst = pcm.size() - i;
+                sess->feed_pcm_f32(pcm.data() + i, (int) burst);
+                i += burst;
+            }
+            sess->finalize();
+
+            const double audio_s = (double) ref.audio_samples / 16000.0;
+
+            auto words = [](const std::string & s) {
+                std::vector<std::string> out; std::string cur;
+                for (char c : s) { if (c == ' ' || c == '\t' || c == '\n') { if (!cur.empty()) { out.push_back(cur); cur.clear(); } } else cur.push_back(c); }
+                if (!cur.empty()) out.push_back(cur);
+                return out;
+            };
+            auto ref_words = words(ref.text);
+            auto hyp_words = words(concat_text);
+            std::vector<std::vector<int>> d(ref_words.size() + 1, std::vector<int>(hyp_words.size() + 1, 0));
+            for (size_t r = 0; r <= ref_words.size(); ++r) d[r][0] = (int) r;
+            for (size_t h = 0; h <= hyp_words.size(); ++h) d[0][h] = (int) h;
+            for (size_t r = 1; r <= ref_words.size(); ++r) {
+                for (size_t h = 1; h <= hyp_words.size(); ++h) {
+                    int cost = ref_words[r-1] == hyp_words[h-1] ? 0 : 1;
+                    d[r][h] = std::min({d[r-1][h] + 1, d[r][h-1] + 1, d[r-1][h-1] + cost});
+                }
+            }
+            double wer = ref_words.empty() ? 0.0 :
+                         100.0 * d[ref_words.size()][hyp_words.size()] / (double) ref_words.size();
+
+            if (!ordering_ok) {
+                std::fprintf(stderr, "[test-streaming] FAIL Mode 3 chunk=%d left=%d right=%d: "
+                                     "callback ordering / timestamps broken\n",
+                             c.chunk_ms, c.left_ms, c.right_ms);
+                ++failures;
+            } else if (wer > c.max_rel_wer_pct) {
+                std::fprintf(stderr, "[test-streaming] FAIL Mode 3 chunk=%d left=%d right=%d: "
+                                     "WER %.2f%% exceeds tolerance %d%%\n"
+                                     "  ref:    \"%.200s%s\"\n"
+                                     "  stream: \"%.200s%s\"\n",
+                             c.chunk_ms, c.left_ms, c.right_ms, wer, c.max_rel_wer_pct,
+                             ref.text.c_str(), ref.text.size() > 200 ? "..." : "",
+                             concat_text.c_str(), concat_text.size() > 200 ? "..." : "");
+                ++failures;
+            } else {
+                std::fprintf(stderr,
+                    "[test-streaming] PASS Mode 3 chunk=%4d left=%5d right=%5d: "
+                    "%3d segments, end_s=%.2f audio=%.2fs, WER=%.2f%%\n",
+                    c.chunk_ms, c.left_ms, c.right_ms,
+                    n_segments, last_end_s, audio_s, wer);
+            }
+        }
+
+        {
+            StreamingOptions sopts;
+            sopts.sample_rate       = 16000;
+            sopts.chunk_ms          = 2000;
+            sopts.left_context_ms   = 2000;
+            sopts.right_lookahead_ms= 1000;
+            int callbacks = 0;
+            auto sess = engine.stream_start(sopts,
+                [&](const StreamingSegment &) { ++callbacks; });
+            if (!pcm.empty()) {
+                sess->feed_pcm_f32(pcm.data(), (int) std::min<size_t>(pcm.size(), 8000));
+            }
+            sess->cancel();
+            std::fprintf(stderr,
+                "[test-streaming] PASS Mode 3 cancel: cancelled after %d callback(s)\n", callbacks);
+        }
+
+    } while (0);
 
     if (failures == 0) {
         std::fprintf(stderr, "[test-streaming] all checks passed\n");

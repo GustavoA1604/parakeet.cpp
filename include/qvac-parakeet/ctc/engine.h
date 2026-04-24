@@ -79,6 +79,9 @@ struct StreamingOptions {
     int sample_rate  = 16000;
     int chunk_ms     = 1000;
 
+    int left_context_ms    = 10000;
+    int right_lookahead_ms = 2000;
+
     bool emit_partials = false;
 };
 
@@ -153,8 +156,9 @@ public:
 
     const EngineOptions & options() const;
 
-private:
     struct Impl;
+
+private:
     std::unique_ptr<Impl> pimpl_;
 };
 
