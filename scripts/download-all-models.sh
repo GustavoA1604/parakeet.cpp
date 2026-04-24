@@ -64,9 +64,14 @@ hr() { printf '%.0s=' {1..70}; echo; }
 if (( want_nemo )); then
   if [[ "${1:-all}" == "tdt" ]] || [[ "${1:-all}" != "tdt" ]]; then
     hr
-    echo "== nemo: parakeet-tdt-0.6b-v3 (multilingual, 25 langs, ~2.4 GiB)"
+    echo "== nemo: parakeet-tdt-0.6b-v3 (multilingual, 25 langs, +PnC, ~2.4 GiB)"
     fetch "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo" \
           "$NEMO_DIR/parakeet-tdt-0.6b-v3.nemo"
+
+    hr
+    echo "== nemo: parakeet-tdt-1.1b (English-only, best WER, 42 layers, ~4.3 GiB)"
+    fetch "https://huggingface.co/nvidia/parakeet-tdt-1.1b/resolve/main/parakeet-tdt-1.1b.nemo" \
+          "$NEMO_DIR/parakeet-tdt-1.1b.nemo"
   fi
 
   if [[ "${1:-all}" != "tdt" ]]; then

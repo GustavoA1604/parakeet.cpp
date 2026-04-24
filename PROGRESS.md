@@ -1575,14 +1575,53 @@ End-to-end numbers on `parakeet-tdt-0.6b-v3.f16.gguf`, M4 Metal:
 `live-mic` now works with TDT GGUFs unchanged, so native-microphone
 captions stream out properly-cased + punctuated text end-to-end.
 
-### Phase 10.6 — pending follow-ups
+### Phase 10.6 — parakeet-tdt-1.1b (done, zero code changes)
+
+`nvidia/parakeet-tdt-1.1b` is the deeper English-only TDT sibling of
+`parakeet-tdt-0.6b-v3`:
+
+| Config | tdt-0.6b-v3 | **tdt-1.1b** |
+|-|-|-|
+| Encoder layers     | 24  | **42** |
+| Mel bins           | 128 | **80** |
+| Vocab              | 8192 (multilingual + PnC) | **1024** (English only, lowercase no PnC) |
+| `use_bias`         | False | **True** (default) |
+| Decoder / joint    | 2-layer LSTM 640 / joint 640 + 5 durations | *same* |
+
+Every one of those dimensions (`n_layers`, `n_mels`, `vocab_size`,
+`use_bias`) is already read from GGUF metadata, so the converter and
+C++ loader/decoder support this checkpoint with **no code changes**.
+
+Measured on Apple M4 Metal, q8_0 GGUF (1.22 GiB):
+
+- **Byte-identical to NeMo on jfk.wav**:
+  `"and so my fellow americans ask not what your country can do for
+   you ask what you can do for your country"` (lowercase/no-PnC;
+  matches NeMo `parakeet-tdt-1.1b.transcribe()` exactly).
+- `jfk.wav` (11 s): `load=419 ms, mel=5 ms, enc=277 ms, dec=20 ms,
+  total=301 ms, RTF=0.027` (37× real-time). Encoder scales 1.75×
+  vs tdt-0.6b-v3 as expected (42/24 layers). Decode is **faster**
+  than tdt-0.6b-v3 (20 ms vs 48 ms) because the 1024-class output
+  layer is 8× smaller than the 8192-class multilingual one.
+- `LastQuestion_long_EN.raw` (5.5 min): `RTF=0.079` (13× real-time),
+  1716 tokens, high-quality transcript of all dialog content.
+- `test-streaming` on tdt-1.1b: **10/10 PASS**, including 0 % WER on
+  *all three* Mode 3 configs (even the aggressive chunk=1000/left=2000/
+  right=500 slot where tdt-0.6b-v3 had 36 % — the deeper encoder +
+  English-only training gives better streaming quality too).
+- Mode 2 + Mode 3 streaming work end-to-end with no tuning; `live-mic`
+  just works.
+
+`scripts/download-all-models.sh` gains parakeet-tdt-1.1b so offline
+bootstrapping picks it up automatically.
+
+### Phase 10.7 — pending follow-ups
 
 - **BLAS / Accelerate for the LSTM + joint gemvs.** Current decode
-  uses pure scalar loops: 48 ms / 11 s on f16 (one-shot), 1.5 s /
-  5.5 min. Not a bottleneck today; easy win at high throughput.
-- **Quantized (q8_0 / q4_0) TDT GGUFs.** The converter and loader
-  both already handle these storage types via the universal dequant
-  path, but the transcripts haven't been sweep-tested for WER drift
-  yet.
-- **parakeet-tdt_ctc-110m support.** Same TDT decoder, smaller 512 ×
-  17 FastConformer encoder; `.nemo` already cached locally.
+  uses pure scalar loops: 20-48 ms / 11 s on f16 one-shot, 890 ms -
+  1.5 s / 5.5 min. Not a bottleneck today; easy win at high throughput.
+- **Quantized (q8_0 / q4_0) TDT GGUFs sweep.** Converter and loader
+  already handle these storage types via the universal dequant path,
+  but haven't been sweep-tested for WER drift.
+- **parakeet-tdt_ctc-110m support.** Same TDT decoder, smaller
+  512 × 17 FastConformer encoder; `.nemo` already cached locally.
