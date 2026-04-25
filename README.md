@@ -149,7 +149,7 @@ This produces the main binary plus per-stage validation harnesses:
 
 ## 2. One-time: convert weights
 
-The converter (`scripts/convert-parakeet-ctc-to-gguf.py` -- name is
+The converter (`scripts/convert-nemo-to-gguf.py` -- name is
 historical; it auto-detects CTC, TDT and Sortformer from the .nemo
 config and writes the right GGUF in each case) takes a `.nemo` archive
 and produces a single self-contained GGUF (encoder + decoder weights +
@@ -160,35 +160,35 @@ python -m venv venv && . venv/bin/activate
 pip install "nemo_toolkit[asr]" gguf numpy soundfile librosa sentencepiece
 
 # Parakeet-CTC 0.6B / 1.1B (English, fast)
-python scripts/convert-parakeet-ctc-to-gguf.py \
+python scripts/convert-nemo-to-gguf.py \
   --ckpt models/parakeet-ctc-0.6b.nemo \
   --out  models/parakeet-ctc-0.6b.gguf
 
-python scripts/convert-parakeet-ctc-to-gguf.py \
+python scripts/convert-nemo-to-gguf.py \
   --ckpt models/parakeet-ctc-1.1b.nemo \
   --out  models/parakeet-ctc-1.1b.q8_0.gguf \
   --quant q8_0
 
 # Parakeet-TDT 0.6B-v3 / 1.1B (multilingual, punctuation, capitalisation)
-python scripts/convert-parakeet-ctc-to-gguf.py \
+python scripts/convert-nemo-to-gguf.py \
   --ckpt    models/parakeet-tdt-0.6b-v3.nemo \
   --hf-repo nvidia/parakeet-tdt-0.6b-v3 \
   --out     models/parakeet-tdt-0.6b-v3.q8_0.gguf \
   --quant   q8_0
 
-python scripts/convert-parakeet-ctc-to-gguf.py \
+python scripts/convert-nemo-to-gguf.py \
   --ckpt    models/parakeet-tdt-1.1b.nemo \
   --hf-repo nvidia/parakeet-tdt-1.1b \
   --out     models/parakeet-tdt-1.1b.q8_0.gguf \
   --quant   q8_0
 
 # Sortformer 4-speaker diarization (offline v1, streaming-trained v2)
-python scripts/convert-parakeet-ctc-to-gguf.py \
+python scripts/convert-nemo-to-gguf.py \
   --ckpt    models/diar_sortformer_4spk-v1.nemo \
   --hf-repo nvidia/diar_sortformer_4spk-v1 \
   --out     models/sortformer-4spk-v1.f16.gguf
 
-python scripts/convert-parakeet-ctc-to-gguf.py \
+python scripts/convert-nemo-to-gguf.py \
   --ckpt    models/diar_streaming_sortformer_4spk-v2.nemo \
   --hf-repo nvidia/diar_streaming_sortformer_4spk-v2 \
   --out     models/sortformer-streaming-4spk-v2.f16.gguf
@@ -773,7 +773,7 @@ qvac-parakeet.cpp/
     miniaudio.h                  vendored single-header audio capture (MIT).
   scripts/
     setup-ggml.sh                pin + clone ggml
-    convert-parakeet-ctc-to-gguf.py    .nemo -> GGUF (auto-detects CTC / TDT / Sortformer)
+    convert-nemo-to-gguf.py    .nemo -> GGUF (auto-detects CTC / TDT / Sortformer)
     dump-ctc-reference.py        NeMo PyTorch -> .npy reference tensors (CTC stages)
     dump-tdt-reference.py        NeMo PyTorch -> .npy reference tensors (TDT stages)
     dump-sortformer-reference.py NeMo PyTorch -> .npy reference tensors (Sortformer stages)

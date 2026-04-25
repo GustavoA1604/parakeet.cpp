@@ -24,7 +24,7 @@ harness asserting rel error below a documented threshold.
 
 ## Phase 1 — converter + GGUF round-trip  _(done)_
 
-- `scripts/convert-parakeet-ctc-to-gguf.py` extracts `model_config.yaml`
+- `scripts/convert-nemo-to-gguf.py` extracts `model_config.yaml`
   + `model_weights.ckpt` + `tokenizer.model` from the HF `.nemo`
   tarball and writes a single GGUF.
 - Tensor naming is a flat namespace built for the C++ side:
@@ -572,7 +572,7 @@ ggml-cpu's hand-tuned Q8_0 / Q5_0 / Q4_0 kernels.  Small tensors
 subsampling convs) stay at f32 / f16 because their innermost dim
 doesn't divide the 32-element block size.
 
-Converter side (`scripts/convert-parakeet-ctc-to-gguf.py`):
+Converter side (`scripts/convert-nemo-to-gguf.py`):
 
   - New `--quant {f32, f16, q8_0, q5_0, q4_0}`.
   - Single `add_2d` helper routes each 2D weight through
@@ -1133,7 +1133,7 @@ Prerequisites and scope tracked for Phase 8:
    `stt_en_fastconformer_hybrid_large_streaming_multi`. Accept only
    if WER on reference set is within ±0.5 % of current offline.
 2. **New converter** `scripts/convert-parakeet-streaming-to-gguf.py`,
-   scoped similarly to `convert-parakeet-ctc-to-gguf.py`. Sets the
+   scoped similarly to `convert-nemo-to-gguf.py`. Sets the
    `parakeet.encoder.streaming.enabled = true` metadata flag that
    `stream_start()` already probes.
 3. **Streaming encoder graph**: per-layer attention KV cache tensors
@@ -1658,7 +1658,7 @@ sigmoid output handles overlapping speech).
 
 ### Phase 11.1 — converter + C++ loader (done, commit dee5e86)
 
-scripts/convert-parakeet-ctc-to-gguf.py auto-detects Sortformer
+scripts/convert-nemo-to-gguf.py auto-detects Sortformer
 checkpoints (target == SortformerEncLabelModel) and:
 
 - Skips tokenizer extraction (Sortformer has no SentencePiece).
@@ -1830,7 +1830,7 @@ All four read-paths flow from existing GGUF metadata
 v2 and running it through our offline diarize() pipeline works with
 no code changes:
 
-  python scripts/convert-parakeet-ctc-to-gguf.py \
+  python scripts/convert-nemo-to-gguf.py \
       --ckpt models/diar_streaming_sortformer_4spk-v2.nemo \
       --out  models/sortformer-streaming-4spk-v2.f16.gguf --quant f16
   -> 250.9 MiB f16

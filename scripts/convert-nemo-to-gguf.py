@@ -1,37 +1,52 @@
 #!/usr/bin/env python3
-"""Convert an NVIDIA Parakeet checkpoint (NeMo .nemo archive) to a single GGUF.
+"""Convert an NVIDIA NeMo .nemo archive to a single GGUF for the
+qvac-parakeet.cpp Engine.
 
 Auto-detects the model flavour from ``cfg['target']``:
 
-  - ``EncDecCTCModelBPE``     -> CTC head only  (parakeet-ctc-0.6b, -1.1b)
-  - ``EncDecRNNTBPEModel``    -> TDT (RNN-T + duration head) (parakeet-tdt-0.6b-v3)
+  - ``EncDecCTCModelBPE``                -> CTC head      (parakeet-ctc-0.6b, -1.1b)
+  - ``EncDecRNNTBPEModel``               -> TDT (RNN-T + duration head)
+                                            (parakeet-tdt-0.6b-v3, -1.1b)
+  - ``EncDecDiarLabelModel``             -> Sortformer    (diar_sortformer_4spk-v1,
+                                            diar_streaming_sortformer_4spk-v2)
 
-The encoder topology is shared; only the decoder tensors + metadata differ.
+The FastConformer encoder topology is shared across all three flavours;
+only the decoder / head tensors + metadata differ.
 
-Output GGUF layout (see src/parakeet_ctc.h / src/parakeet_tdt.h for the
-consumer structs):
+Footgun: the script's ``--hf-repo`` default is ``nvidia/parakeet-ctc-0.6b``,
+so when ``--ckpt`` points at a non-CTC path that does not exist locally
+**you must pass ``--hf-repo`` explicitly** -- otherwise the script will
+download the CTC checkpoint instead of the one named in ``--ckpt``.
+
+Output GGUF layout (see src/parakeet_ctc.h / src/parakeet_tdt.h /
+src/parakeet_sortformer.h for the consumer structs):
 
   Metadata:
     general.architecture  = "parakeet-ctc"  (kept for GGUF compat)
     general.name          = "<derived from cfg>"
-    parakeet.model.type   = "ctc" or "tdt"
+    parakeet.model.type   = "ctc", "tdt", or "sortformer"
     parakeet.encoder.*    (hyperparameters, incl. use_bias, xscaling)
     parakeet.preproc.*    (mel/stft hyperparameters)
-    parakeet.ctc.*        (vocab_size, blank_id)        [CTC only]
-    parakeet.tdt.*        (predictor + joint hyperparameters + durations) [TDT only]
-    tokenizer.ggml.model  = "sentencepiece"
-    tokenizer.ggml.sentencepiece_model = <raw tokenizer.model bytes>
+    parakeet.ctc.*        (vocab_size, blank_id)                    [CTC only]
+    parakeet.tdt.*        (predictor + joint hyperparameters
+                           + durations)                              [TDT only]
+    parakeet.sortformer.* (num_spks, fc/tf dims, tf layer count, ...)[Sortformer only]
+    tokenizer.ggml.model  = "sentencepiece"                          [CTC, TDT]
+    tokenizer.ggml.sentencepiece_model = <raw tokenizer.model bytes> [CTC, TDT]
 
   Tensors:
     preproc.mel_filterbank            (n_mels, 257)   f32
     preproc.window                    (400,)          f32
     encoder.subsampling.{conv0,conv{1,2}_{dw,pw},out}.{weight,bias?}
-    encoder.blk.{i}.* (24 or 42 blocks; biases omitted when use_bias=False)
-    ctc.decoder.{weight,bias}                           [CTC only]
-    tdt.predict.embed.weight                            [TDT only]
-    tdt.predict.lstm.{l}.{w_ih,w_hh,b_ih,b_hh}         [TDT only]
-    tdt.joint.{enc,pred}.{weight,bias}                  [TDT only]
-    tdt.joint.out.{weight,bias}                         [TDT only]
+    encoder.blk.{i}.* (17-42 blocks; biases omitted when use_bias=False)
+    ctc.decoder.{weight,bias}                                       [CTC only]
+    tdt.predict.embed.weight                                         [TDT only]
+    tdt.predict.lstm.{l}.{w_ih,w_hh,b_ih,b_hh}                       [TDT only]
+    tdt.joint.{enc,pred}.{weight,bias}                               [TDT only]
+    tdt.joint.out.{weight,bias}                                      [TDT only]
+    sortformer.encoder_proj.{weight,bias}                            [Sortformer only]
+    sortformer.transformer.blk.{i}.* (18 blocks)                     [Sortformer only]
+    sortformer.head.{weight,bias}                                    [Sortformer only]
 """
 
 import argparse

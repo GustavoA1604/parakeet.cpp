@@ -4,7 +4,7 @@
 For each GGUF tensor we:
 
   1. Recreate the expected NumPy array from the NeMo state_dict (applying
-     the same layout transforms as scripts/convert-parakeet-ctc-to-gguf.py:
+     the same layout transforms as scripts/convert-nemo-to-gguf.py:
      squeezing the CTC Conv1d kernel, fusing conv-module BatchNorm into
      scale+shift).
   2. Read the GGUF tensor back through the gguf Python reader.

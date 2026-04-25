@@ -21,7 +21,7 @@ BIN="${3:-$BIN_DEFAULT}"
 
 if [ ! -f "$MODEL" ]; then
     echo "error: model GGUF not found at $MODEL" >&2
-    echo "  hint: run scripts/convert-parakeet-ctc-to-gguf.py first" >&2
+    echo "  hint: run scripts/convert-nemo-to-gguf.py first" >&2
     exit 3
 fi
 
