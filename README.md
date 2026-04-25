@@ -14,6 +14,7 @@ Supported checkpoints:
 | `nvidia/parakeet-ctc-1.1b`    | CTC  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1217 MiB q8_0               | 0.026-0.074 | English only |
 | `nvidia/parakeet-tdt-0.6b-v3` | TDT  | 128 | 1024 × 24 | 8192 | 600 M  | 715 MiB q8_0 / 1.34 GiB f16 | 0.024-0.050 | ~25 languages + PnC |
 | `nvidia/parakeet-tdt-1.1b`    | TDT  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1225 MiB q8_0               | 0.027-0.079 | English only, lowest WER (no PnC) |
+| `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
 
 Same converter, same encoder graph (biases go through an optional
 path when the checkpoint sets `use_bias=False`), same GGUF schema.
@@ -455,11 +456,21 @@ Phases 0 through 7 are complete:
   es/fr/de/it/pt/ru samples. One-shot + Mode 2 + Mode 3 streaming
   all work with TDT GGUFs (phase 10.5), including `live-mic` for
   native microphone capture.
+- **Phase 11 — Sortformer (4-speaker diarization)**: port of
+  `nvidia/diar_sortformer_4spk-v1` — 18-layer FastConformer encoder
+  (reused) -> Linear projection (512 -> 192) -> 18-layer post-LN
+  Transformer encoder -> ReLU MLP -> sigmoid head producing per-frame
+  speaker probabilities. New `Engine::diarize()` API + CLI
+  auto-routing. Output: per-frame probabilities and threshold-based
+  segments {speaker, start, end}. Speaker probability parity is
+  rel 2.0e-4 vs NeMo reference. Streaming (v2) is the next follow-up.
 
 Next: Phase 8.5 (true KV cache + conv state for ~6x compute reduction on
 long-form audio without accuracy change), Accelerate BLAS for the TDT
-decoder's LSTM + joint gemvs, `CONV_2D_DW` on Metal (upstream ggml
-contribution), Metal flash-attn, EOU / Sortformer pipelines.
+decoder's LSTM + joint gemvs and Sortformer's transformer attention,
+`CONV_2D_DW` on Metal (upstream ggml contribution), Metal flash-attn,
+Sortformer v2 streaming, speaker-attributed transcription (Parakeet +
+Sortformer combined), EOU pipelines.
 
 ## Repository layout
 

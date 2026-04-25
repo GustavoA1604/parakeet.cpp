@@ -94,6 +94,11 @@ if (( want_nemo )); then
     echo "== nemo: stt_en_fastconformer_hybrid_large_streaming_multi (EOU/streaming, ~440 MiB)"
     fetch "https://huggingface.co/nvidia/stt_en_fastconformer_hybrid_large_streaming_multi/resolve/main/stt_en_fastconformer_hybrid_large_streaming_multi.nemo" \
           "$NEMO_DIR/stt_en_fastconformer_hybrid_large_streaming_multi.nemo"
+
+    hr
+    echo "== nemo: diar_sortformer_4spk-v1 (4-speaker diarization, offline, ~490 MiB)"
+    fetch "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/diar_sortformer_4spk-v1.nemo" \
+          "$NEMO_DIR/diar_sortformer_4spk-v1.nemo"
   fi
 fi
 

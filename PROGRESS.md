@@ -1625,3 +1625,118 @@ bootstrapping picks it up automatically.
   but haven't been sweep-tested for WER drift.
 - **parakeet-tdt_ctc-110m support.** Same TDT decoder, smaller
   512 × 17 FastConformer encoder; `.nemo` already cached locally.
+
+## Phase 11 — Sortformer (4-speaker diarization) _(in progress)_
+
+Phase 11 ports `nvidia/diar_sortformer_4spk-v1`, a speaker-diarization
+model that shares the FastConformer encoder backbone with our Parakeet
+ports but adds a Sortformer-specific head: encoder projection, an
+18-layer post-LN Transformer encoder, and a small MLP that produces
+per-frame, per-speaker probabilities for up to 4 speakers (multi-label
+sigmoid output handles overlapping speech).
+
+### Phase 11.1 — converter + C++ loader (done, commit dee5e86)
+
+scripts/convert-parakeet-ctc-to-gguf.py auto-detects Sortformer
+checkpoints (target == SortformerEncLabelModel) and:
+
+- Skips tokenizer extraction (Sortformer has no SentencePiece).
+- Writes parakeet.sortformer.* metadata: num_spks, fc_d_model,
+  tf_d_model, tf_n_layers, tf_n_heads, tf_inner_size, tf_pre_ln,
+  tf_hidden_act.
+- Writes new tensors: encoder_proj (512 -> 192), 18 transformer
+  blocks (attn q/k/v/out + ln1 + ffn in/out + ln2), and the head
+  (first_hidden_to_hidden + single_hidden_to_spks). The 384-wide
+  hidden_to_spks (used only in v2 streaming) is intentionally
+  skipped.
+
+C++ loader (src/parakeet_ctc.{h,cpp}):
+
+- ParakeetModelType::SORTFORMER added; EncoderConfig grows
+  sortformer_{num_spks,fc_d_model,tf_d_model,tf_n_layers,tf_n_heads,
+  tf_inner_size,tf_pre_ln} fields.
+- New SortformerWeights / SortformerTransformerBlock structs hold the
+  18 blocks + head linears.
+- Engine::transcribe / streaming entry points reject Sortformer GGUFs
+  with a clear message pointing at PROGRESS.md.
+
+### Phase 11.2-11.4 — Python reference + C++ forward pass (done, commit 4c55c16)
+
+scripts/dump-sortformer-reference.py replicates NeMo's
+process_signal -> frontend_encoder -> transformer_encoder ->
+forward_speaker_sigmoids chain on a wav and dumps per-stage
+references (mel, encoder_out, post_proj, post_transformer,
+speaker_probs).
+
+src/parakeet_sortformer.{h,cpp} is the CPU forward:
+
+- SortformerRuntimeWeights holds f32-dequantised tensors. Same
+  to_float trait pattern as TDT, so f32/f16/q8_0/q4_0 all just work.
+- sortformer_diarize() pipeline:
+  1. linear_batch(encoder_proj) -> (T, 192)
+  2. for each transformer block (post-LN, pre_ln=False):
+       attn(Q,K,V) + residual + layer_norm_1 -> ffn(ReLU) + residual
+       + layer_norm_2
+  3. ReLU -> first_hidden_to_hidden -> ReLU -> single_hidden_to_spks
+     -> sigmoid -> (T, num_spks)
+  4. Threshold-based per-speaker segment formation, sorted by start
+     time then speaker_id.
+
+Numerical parity on jfk.wav vs NeMo (Apple M4 Metal, f16 GGUF):
+
+  mel    : max_abs=3.36e-1 rel=1.65e-3  PASS  (peak-norm matches)
+  enc    : max_abs=3.50e-3 rel=1.62e-3  PASS  (FastConformer)
+  probs  : max_abs=8.68e-4 rel=2.03e-4  PASS  (encoder_proj +
+                                               18-layer transformer +
+                                               head + sigmoid)
+  speaker activity matches NeMo exactly: 118/138 frames active,
+  only speaker 0, max 1 simultaneous speaker.
+
+### Phase 11.5-11.7 — public API + CLI (done, commit 9d06d60)
+
+Public engine.h additions:
+
+  struct DiarizationOptions  { float threshold = 0.5f; int min_segment_ms = 0; };
+  struct DiarizationSegment  { int speaker_id; double start_s, end_s; };
+  struct DiarizationResult   { segments + per-frame speaker_probs +
+                               n_frames + num_spks + frame_stride_s +
+                               per-stage timings };
+
+  Engine::diarize(wav_path, opts) and diarize_samples(samples, n, sr, opts).
+
+Engine::Impl primes a SortformerRuntimeWeights at construction so
+the dequant cost is paid once.
+
+CLI: when a Sortformer GGUF is loaded, the existing --wav / --pcm-in
+pipeline routes through diarize_samples and emits one line per
+segment:
+
+  text:  [start-end] speaker_<id>
+  jsonl: {"speaker":N,"start":S,"end":E}
+
+Measured on Apple M4 Metal, sortformer-4spk-v1.f16.gguf:
+
+| Clip | encoder | decode (CPU) | total | RTF |
+|---|---|---|---|---|
+| jfk.wav (11 s)               |  96 ms |  83 ms |  187 ms | 0.017 (58x) |
+| LastQuestion_long_EN (5.5 m) | 9.2 s  | 22.5 s | 31.9 s  | 0.097 (10x) |
+
+Decoder cost grows fast on long-form because the post-LN Transformer
+has O(T^2) attention with no chunking. At T=4099 (5.5 min) that's
+~16.8 M attention pairs per layer x 18 layers — Phase 11.11
+(streaming v2) brings chunked attention.
+
+### Phase 11.x — pending follow-ups
+
+- **Phase 11.10**: speaker-attributed transcription (Parakeet ASR +
+  Sortformer combined). Run both models on the same audio, align
+  Parakeet word/segment boundaries with Sortformer speaker frames,
+  emit `[{speaker, text, start, end}]`. Mirrors the qvac binding's
+  quickstart-diarized.js pattern.
+- **Phase 11.11**: `nvidia/diar_streaming_sortformer_4spk-v2`
+  streaming variant. Adds chunked attention + speaker cache + FIFO
+  buffer (the 384-wide hidden_to_spks layer is for this path). Big
+  win on long-form decode time.
+- **BLAS / Accelerate for transformer attention**. Same opportunity
+  as TDT's LSTM + joint gemvs; current scalar attention is the long-
+  form bottleneck.
