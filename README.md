@@ -15,7 +15,7 @@ Supported checkpoints:
 | `nvidia/parakeet-tdt-0.6b-v3` | TDT  | 128 | 1024 × 24 | 8192 | 600 M  | 715 MiB q8_0 / 1.34 GiB f16 | 0.024-0.050 | ~25 languages + PnC |
 | `nvidia/parakeet-tdt-1.1b`    | TDT  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1225 MiB q8_0               | 0.027-0.079 | English only, lowest WER (no PnC) |
 | `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
-| `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline pipeline supported today; live duplex API coming in Phase 11.11) |
+| `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline + Phase 11.11.1 sliding-history live streaming today; full NeMo-style spkcache streaming in Phase 11.11.2) |
 
 Same converter, same encoder graph (biases go through an optional
 path when the checkpoint sets `use_bias=False`), same GGUF schema.
@@ -390,6 +390,137 @@ Defaults chosen for an interactive feel: first segment lands ~2 s
 after you start speaking (`chunk_ms + right_lookahead_ms`), segments
 afterward at the `chunk_ms` cadence.
 
+When `--model` points at a Sortformer GGUF (e.g.
+`models/sortformer-4spk-v1.f16.gguf`) `live-mic` automatically switches
+to live diarization mode: instead of transcript segments it prints
+`[start-end] speaker_N` per chunk via the same push API
+(`SortformerStreamSession`). See "Streaming — Sortformer (live
+diarization)" below.
+
+### Live microphone with speaker attribution (`live-mic-attributed`)
+
+`examples/live-mic-attributed.cpp` runs a transcription engine
+(CTC/TDT) and a Sortformer engine on the **same** mic feed and tags
+each transcript segment with the speaker whose live diarization range
+overlaps it the most. Output:
+
+```
+[2.10-3.00] speaker_0: hello there how are you
+[3.00-4.00] speaker_0: doing today
+[4.00-5.20] speaker_1: I am fine thanks
+```
+
+```bash
+./build/live-mic-attributed \
+    --asr-model  models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+    --diar-model models/sortformer-4spk-v1.f16.gguf \
+    --asr-chunk-ms 1000  --asr-left-context-ms 5000 --asr-right-lookahead-ms 1000 \
+    --diar-chunk-ms 2000 --diar-history-ms 30000
+```
+
+Each captured audio batch is forwarded to both `StreamSession`
+(transcription) and `SortformerStreamSession` (diarization). The
+diarization callback maintains a sliding deque of recent
+`[start, end, speaker]` spans; the transcription callback looks up the
+most-overlapping span at the segment's time range and tags the line.
+A short stderr log line `[diar] active speaker_N at t.ts` fires on
+speaker switches.
+
+Knobs:
+
+- `--asr-chunk-ms / --asr-left-context-ms / --asr-right-lookahead-ms`:
+  same as `live-mic` for transcription.
+- `--diar-chunk-ms / --diar-history-ms`: same as `Engine::diarize_start`.
+- `--speaker-history-ms` (default 60000): how much diarization history
+  to retain for the attribution lookup. Increase for very long
+  conversations; decrease if memory is tight.
+- `--asr-n-gpu-layers / --diar-n-gpu-layers`: independent GPU offload
+  knobs so you can run e.g. ASR on Metal and diarization on CPU (or
+  vice versa) on machines with a single GPU.
+- `--accumulate`: instead of one line per transcription chunk,
+  accumulate text on a single line per speaker and emit a newline on
+  speaker change or after `--silence-flush-ms` of silence (default
+  1000). Same UX as `live-mic --accumulate`, but each line is
+  prefixed with `speaker_N:`. Output looks like:
+
+  ```
+  speaker_0: hello there how are you doing today
+  speaker_1: I am fine thanks how about yourself
+  speaker_0: pretty good thanks for asking
+  ```
+
+Metal-backed binary lives under `build-metal/live-mic-attributed`
+once the project has been configured with `-DGGML_METAL=ON` (the
+existing `build-metal/` directory in this repo is already configured
+for that):
+
+```bash
+./build-metal/live-mic-attributed \
+    --asr-model  models/parakeet-tdt-0.6b-v3.q8_0.gguf  --asr-n-gpu-layers 1 \
+    --diar-model models/sortformer-4spk-v1.f16.gguf    --diar-n-gpu-layers 1 \
+    --accumulate
+```
+
+Caveat (Phase 11.11.1): the underlying `SortformerStreamSession` uses
+sliding-history streaming, so speaker IDs may shift in the very first
+chunks before the history fills. Phase 11.11.2 will fix this with
+spkcache compression.
+
+### Streaming — Sortformer (live diarization)
+
+Phase 11.11.1 ships a push-API `SortformerStreamSession`. The session
+buffers audio internally and, every `chunk_ms`, runs
+`Engine::diarize()` over the trailing `history_ms` of audio, emits
+segments that overlap the new chunk via callback, and slides the chunk
+pointer forward.
+
+```cpp
+SortformerStreamingOptions opts;
+opts.sample_rate    = 16000;
+opts.chunk_ms       = 2000;     // emit cadence
+opts.history_ms     = 30000;    // sliding context window
+opts.threshold      = 0.5f;
+opts.min_segment_ms = 200;
+
+auto session = sortformer_engine.diarize_start(opts,
+    [](const StreamingDiarizationSegment & s) {
+        std::printf("[%.2f-%.2f] speaker_%d (chunk %d%s)\n",
+                    s.start_s, s.end_s, s.speaker_id, s.chunk_index,
+                    s.is_final ? ", final" : "");
+    });
+
+session->feed_pcm_f32(samples, n);
+// ...feed more...
+session->finalize();
+```
+
+CLI:
+
+```bash
+./build/qvac-parakeet \
+    --model models/sortformer-4spk-v1.f16.gguf \
+    --pcm-in recording.raw --pcm-format s16le \
+    --stream \
+    --stream-chunk-ms 2000 --stream-history-ms 30000 \
+    --emit text   # or jsonl
+```
+
+Trade-offs of the Phase 11.11.1 pragmatic implementation:
+
+- **Pro**: works with both v1 and v2 Sortformer GGUFs out of the box,
+  no encoder graph split, no spkcache state. ~RTF 0.25 on M3 with
+  `chunk_ms=2000 history_ms=30000` (each chunk re-runs the full
+  encoder over the trailing 30 s).
+- **Pro**: speaker IDs stabilise within a few chunks once the history
+  window contains both speakers' audio.
+- **Con**: speaker IDs are derived from each per-chunk `diarize()`
+  independently and may shift on the *very first* chunks, before the
+  history window is full enough to disambiguate speakers.
+
+Phase 11.11.2 (planned) implements true NeMo-style streaming with
+`spkcache` compression + encoder graph split for fully stable
+cross-chunk speaker identity at lower per-chunk compute.
+
 ## 4. Optional: validate against NeMo PyTorch
 
 ```bash
@@ -471,6 +602,16 @@ Phases 0 through 7 are complete:
     segments with CTC/TDT transcripts in one C++ binary. Same
     pipeline as the qvac binding's `quickstart-diarized.js`, but
     native.
+  - **§11.11.1 Sortformer live streaming (pragmatic v1)** ships:
+    `Engine::diarize_start()` -> `SortformerStreamSession` with
+    `feed_pcm_f32/i16` + `finalize()` push API. Sliding-history
+    implementation: each `chunk_ms` re-runs `diarize()` over the
+    trailing `history_ms` and emits segments overlapping the new
+    chunk. Auto-routed by the CLI when `--stream` is set on a
+    Sortformer model. The `live-mic` example also auto-detects
+    Sortformer GGUFs and switches to live diarization. Trade-off:
+    speaker IDs may shift in the very first chunks until history
+    fills; stable thereafter.
   - **§11.11.0 Sortformer v2 offline support** ships:
     `nvidia/diar_streaming_sortformer_4spk-v2` GGUF converts and
     runs through the same offline `diarize()` path. Live duplex

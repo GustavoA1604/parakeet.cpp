@@ -127,6 +127,10 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     target_link_libraries(test-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-streaming PRIVATE include src ggml/include)
 
+    add_executable(test-sortformer-streaming src/test_sortformer_streaming.cpp)
+    target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
+    target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
+
     add_executable(test-tdt-encoder-parity
         src/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp
@@ -160,21 +164,32 @@ if (QVAC_PARAKEET_BUILD_EXAMPLES)
     target_include_directories(live-mic PRIVATE include examples)
     target_compile_options(live-mic PRIVATE -Wno-deprecated-declarations)
 
+    add_executable(live-mic-attributed examples/live-mic-attributed.cpp)
+    target_link_libraries(live-mic-attributed PRIVATE qvac-parakeet)
+    target_include_directories(live-mic-attributed PRIVATE include examples)
+    target_compile_options(live-mic-attributed PRIVATE -Wno-deprecated-declarations)
+
     if (APPLE)
         find_library(COREAUDIO_LIBRARY CoreAudio REQUIRED)
         find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
         find_library(AUDIOUNIT_LIBRARY AudioUnit REQUIRED)
         find_library(AUDIOTOOLBOX_LIBRARY AudioToolbox REQUIRED)
-        target_link_libraries(live-mic PRIVATE
-            ${COREAUDIO_LIBRARY}
-            ${COREFOUNDATION_LIBRARY}
-            ${AUDIOUNIT_LIBRARY}
-            ${AUDIOTOOLBOX_LIBRARY})
+        foreach (tgt live-mic live-mic-attributed)
+            target_link_libraries(${tgt} PRIVATE
+                ${COREAUDIO_LIBRARY}
+                ${COREFOUNDATION_LIBRARY}
+                ${AUDIOUNIT_LIBRARY}
+                ${AUDIOTOOLBOX_LIBRARY})
+        endforeach()
     elseif (UNIX)
         find_package(Threads REQUIRED)
-        target_link_libraries(live-mic PRIVATE Threads::Threads dl m)
+        foreach (tgt live-mic live-mic-attributed)
+            target_link_libraries(${tgt} PRIVATE Threads::Threads dl m)
+        endforeach()
     elseif (WIN32)
-        target_link_libraries(live-mic PRIVATE winmm ole32)
+        foreach (tgt live-mic live-mic-attributed)
+            target_link_libraries(${tgt} PRIVATE winmm ole32)
+        endforeach()
     endif()
 endif()
 

@@ -1903,6 +1903,160 @@ Open design questions (need to resolve when work starts):
 Estimated effort: 1-2 weeks of focused work + parity validation.
 Tracked as a separate workstream rather than rushed mid-session.
 
+### Phase 11.11.1 — Sortformer live streaming (pragmatic v1, sliding history)
+
+Phase 11.11.x is a multi-week effort to land the full NeMo
+`forward_streaming` algorithm (spkcache + fifo + `_compress_spkcache`
++ encoder graph split). To unblock product integration *now*, Phase
+11.11.1 ships a pragmatic streaming layer that reuses the existing
+offline `Engine::diarize()` path under a sliding-history window.
+
+API (in `include/qvac-parakeet/ctc/engine.h`):
+
+```cpp
+struct SortformerStreamingOptions {
+    int   sample_rate    = 16000;
+    int   chunk_ms       = 2000;     // emit cadence
+    int   history_ms     = 30000;    // sliding context window
+    float threshold      = 0.5f;
+    int   min_segment_ms = 200;
+    bool  emit_partials  = true;
+};
+
+struct StreamingDiarizationSegment {
+    int    speaker_id;
+    double start_s, end_s;
+    int    chunk_index;
+    bool   is_final;
+};
+
+using SortformerSegmentCallback =
+    std::function<void(const StreamingDiarizationSegment &)>;
+
+class SortformerStreamSession {
+public:
+    void feed_pcm_f32(const float *, int n);
+    void feed_pcm_i16(const int16_t *, int n);
+    void finalize();
+    void cancel();
+    const SortformerStreamingOptions & options() const;
+};
+
+std::unique_ptr<SortformerStreamSession>
+Engine::diarize_start(const SortformerStreamingOptions &,
+                      SortformerSegmentCallback);
+```
+
+Algorithm (per chunk):
+1. `feed_pcm_*()` appends samples to a `std::vector<float> ring`.
+2. Once `chunk_samples` of new audio is available beyond
+   `emitted_samples`, take a window
+   `[max(ring_origin, emit_end - history_samples) , emit_end]` and run
+   the full offline `engine_impl_diarize_helper(...)` on it (mel +
+   encoder + sortformer head + threshold-segmentation).
+3. For every returned segment whose absolute time range overlaps the
+   new chunk's `[emitted_samples, emit_end]`, emit a
+   `StreamingDiarizationSegment` clipped to the chunk.
+4. Advance `emitted_samples = emit_end`. Trim `ring` to keep only
+   `history_samples` of audio behind us (so the buffer stays bounded
+   for arbitrarily long sessions).
+5. `finalize()` flushes any tail (audio shorter than `chunk_ms`); if
+   no tail exists it re-emits the last chunk's segments with
+   `is_final = true` so consumers always see a finalisation marker.
+6. `cancel()` short-circuits; subsequent `feed_*` calls are no-ops.
+
+Trade-offs (vs the planned full Phase 11.11.2 NeMo-style streaming):
+
+- **Pro**: ~150 lines of code; zero changes to the encoder graph;
+  works with both v1 and v2 Sortformer GGUFs; reuses the parity-tested
+  offline `diarize()` path.
+- **Pro**: speaker IDs stabilise within a few chunks once the history
+  window contains both speakers' audio; matches offline IDs exactly
+  once the history covers the full session.
+- **Con**: each chunk re-runs the full encoder over the trailing
+  `history_ms` of audio. Measured RTF ~0.25 on M3 Ultra CPU at
+  `chunk_ms=2000 history_ms=30000` for the 22 s `two-speakers-16k.wav`
+  sample (5.5 s wall for 22 s of audio). Phase 11.11.2's `spkcache`
+  approach will fix this.
+- **Con**: speaker IDs in the *very first* chunks may be arbitrary
+  before the history window contains both speakers. Verified on
+  `two-speakers-16k.wav`: chunk 1 mislabels speaker_0 as speaker_1 at
+  `[2.00-4.00]`; chunks 2-10 align with the offline reference
+  (`speaker_0` for [1.84-10.00], `speaker_1` for [13.36-21.04]).
+
+CLI:
+
+```bash
+./build/qvac-parakeet \
+    --model models/sortformer-4spk-v1.f16.gguf \
+    --pcm-in recording.raw --pcm-format s16le \
+    --stream \
+    --stream-chunk-ms 2000 --stream-history-ms 30000 \
+    --emit text     # or jsonl
+```
+
+The CLI auto-routes `Sortformer + --stream` through the streaming path
+(no separate flag). `--emit jsonl` produces
+`{"speaker", "start", "end", "chunk", "is_final"}` per line.
+
+Live mic auto-detects diarization mode when `--model` resolves to a
+Sortformer GGUF — `examples/live-mic.cpp` swaps in a
+`SortformerStreamSession` instead of `StreamSession` and prints
+`[start-end] speaker_N` per chunk:
+
+```bash
+./build/live-mic --model models/sortformer-4spk-v1.f16.gguf \
+                 --chunk-ms 2000 --history-ms 30000
+```
+
+For combined live transcription + speaker labels in a single binary,
+`examples/live-mic-attributed.cpp` loads two engines (a CTC/TDT ASR
+engine and a Sortformer engine), forwards each captured audio batch
+to both `StreamSession` and `SortformerStreamSession`, and tags each
+transcript segment with the speaker whose live diarization range
+overlaps it the most. `--accumulate` accumulates text on a single
+line per speaker and emits a newline on speaker change or
+`--silence-flush-ms` of silence:
+
+```bash
+./build/live-mic-attributed \
+    --asr-model  models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+    --diar-model models/sortformer-4spk-v1.f16.gguf \
+    --accumulate
+```
+
+Independent `--asr-n-gpu-layers` / `--diar-n-gpu-layers` allow
+splitting the two engines across CPU and GPU on machines where
+running both on the GPU would compete for resources.
+
+Testing: `src/test_sortformer_streaming.cpp` (built as
+`test-sortformer-streaming` when `QVAC_PARAKEET_BUILD_TESTS=ON`) feeds
+the multi-speaker sample in random burst sizes (1-5000 samples per
+`feed_pcm_f32()` call) and asserts:
+- ≥1 callback received,
+- exactly one `is_final=true` callback after `finalize()`,
+- `max_end` is within the audio duration,
+- `cancel()` on a half-fed session is idempotent.
+
+Verified end-to-end on `two-speakers-16k.wav`:
+```
+offline:  [1.84-10.00] speaker_0  [13.36-21.04] speaker_1
+streaming (chunk=2000, history=30000):
+  [2.00-4.00] speaker_1  (chunk 1)        # cold-start mislabel
+  [4.00-6.00] speaker_0  (chunk 2)
+  [6.00-8.00] speaker_0  (chunk 3)
+  [8.00-10.00] speaker_0 (chunk 4)
+  [13.36-14.00] speaker_1 (chunk 6)
+  [14.00-16.00] speaker_1 (chunk 7)
+  [16.00-18.00] speaker_1 (chunk 8)
+  [18.00-20.00] speaker_1 (chunk 9)
+  [20.00-21.04] speaker_1 (chunk 10)
+  [20.00-21.04] speaker_1 (chunk 10, final)
+```
+
+Phase 11.11.2 (true NeMo streaming with spkcache compression) remains
+the eventual destination; 11.11.1 is what ships today.
+
 ### Phase 11.x — pending optimisations
 
 - **BLAS / Accelerate for transformer attention**. Same opportunity

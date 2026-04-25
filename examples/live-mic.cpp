@@ -49,24 +49,28 @@ void data_callback(ma_device * /*device*/, void * /*output*/, const void * input
 
 void print_usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s --model <parakeet-ctc.gguf> [options]\n"
+        "usage: %s --model <parakeet.gguf | sortformer.gguf> [options]\n"
         "\n"
-        "Captures the default input device at 16 kHz mono and transcribes live.\n"
+        "Captures the default input device at 16 kHz mono. If --model is a\n"
+        "transcription (CTC/TDT) GGUF, runs live transcription. If --model is\n"
+        "a Sortformer GGUF, runs live speaker diarization (segments labeled\n"
+        "speaker_0..speaker_3).\n"
         "Press Ctrl-C to stop; the final partial chunk is flushed before exit.\n"
         "\n"
         "options:\n"
-        "  --model PATH                   path to the parakeet-ctc GGUF (required)\n"
+        "  --model PATH                   path to the GGUF (required)\n"
         "  --n-gpu-layers N               GPU offload (build with -DGGML_METAL=ON etc.)\n"
         "  --threads N                    CPU threads (0 = hardware_concurrency)\n"
-        "  --chunk-ms N                   segment stride in ms (default 1000)\n"
-        "  --left-context-ms N            left context per chunk in ms (default 5000)\n"
-        "  --right-lookahead-ms N         right lookahead per chunk in ms (default 1000)\n"
+        "  --chunk-ms N                   transcription: segment stride in ms (default 1000)\n"
+        "                                 diarization:   chunk stride in ms (default 2000)\n"
+        "  --left-context-ms N            transcription: left context per chunk (default 5000)\n"
+        "  --right-lookahead-ms N         transcription: right lookahead per chunk (default 1000)\n"
+        "  --history-ms N                 diarization: sliding history window (default 30000)\n"
         "  --list-devices                 list available capture devices and exit\n"
         "  --device N                     use device with this index (default: system default)\n"
-        "  --accumulate                   accumulate transcription on one line; emit a\n"
+        "  --accumulate                   transcription only: accumulate on one line; emit a\n"
         "                                 newline after --silence-flush-ms of silence\n"
-        "  --silence-flush-ms N           silence duration that triggers a newline in\n"
-        "                                 --accumulate mode (default 1000)\n"
+        "  --silence-flush-ms N           --accumulate flush threshold in ms (default 1000)\n"
         "  --verbose                      let ggml / Metal info logs through to stderr\n"
         "  --help                         print this help\n",
         argv0);
@@ -76,9 +80,10 @@ struct Args {
     std::string model_path;
     int  n_gpu_layers = 0;
     int  n_threads    = 0;
-    int  chunk_ms     = 1000;
+    int  chunk_ms     = -1;
     int  left_ms      = 5000;
     int  right_ms     = 1000;
+    int  history_ms   = 30000;
     bool list_devices = false;
     int  device_index = -1;
     bool verbose      = false;
@@ -96,6 +101,7 @@ bool parse_args(int argc, char ** argv, Args & a) {
         else if (s == "--chunk-ms"           && i + 1 < argc) a.chunk_ms      = std::atoi(argv[++i]);
         else if (s == "--left-context-ms"    && i + 1 < argc) a.left_ms       = std::atoi(argv[++i]);
         else if (s == "--right-lookahead-ms" && i + 1 < argc) a.right_ms      = std::atoi(argv[++i]);
+        else if (s == "--history-ms"         && i + 1 < argc) a.history_ms    = std::atoi(argv[++i]);
         else if (s == "--list-devices")                       a.list_devices  = true;
         else if (s == "--device"             && i + 1 < argc) a.device_index  = std::atoi(argv[++i]);
         else if (s == "--accumulate")                          a.accumulate    = true;
@@ -158,45 +164,66 @@ int main(int argc, char ** argv) {
 
     qvac_parakeet::ctc::Engine engine(eopts);
 
-    qvac_parakeet::ctc::StreamingOptions sopts;
-    sopts.sample_rate        = 16000;
-    sopts.chunk_ms           = args.chunk_ms;
-    sopts.left_context_ms    = args.left_ms;
-    sopts.right_lookahead_ms = args.right_ms;
+    const bool diarization_mode = engine.is_diarization_model();
+    if (args.chunk_ms < 0) args.chunk_ms = diarization_mode ? 2000 : 1000;
+
+    std::unique_ptr<qvac_parakeet::ctc::StreamSession>           tx_sess;
+    std::unique_ptr<qvac_parakeet::ctc::SortformerStreamSession> diar_sess;
 
     bool   line_open       = false;
     double last_voice_end_s = 0.0;
 
-    auto sess = engine.stream_start(sopts,
-        [&](const qvac_parakeet::ctc::StreamingSegment & seg) {
-            if (!args.accumulate) {
-                if (seg.text.empty()) return;
-                std::printf("\033[2K\r[%.2f-%.2f]%s\n", seg.start_s, seg.end_s, seg.text.c_str());
+    if (diarization_mode) {
+        qvac_parakeet::ctc::SortformerStreamingOptions sopts;
+        sopts.sample_rate    = 16000;
+        sopts.chunk_ms       = args.chunk_ms;
+        sopts.history_ms     = std::max(args.history_ms, args.chunk_ms);
+        sopts.threshold      = 0.5f;
+        sopts.min_segment_ms = 200;
+        diar_sess = engine.diarize_start(sopts,
+            [&](const qvac_parakeet::ctc::StreamingDiarizationSegment & s) {
+                std::printf("[%.2f-%.2f] speaker_%d (chunk %d%s)\n",
+                            s.start_s, s.end_s, s.speaker_id, s.chunk_index,
+                            s.is_final ? ", final" : "");
                 std::fflush(stdout);
-                return;
-            }
-
-            if (!seg.text.empty()) {
-                if (!line_open) {
-                    std::fputs(seg.text.c_str() +
-                               (seg.text.front() == ' ' ? 1 : 0),
-                               stdout);
-                    line_open = true;
-                } else {
-                    std::fputs(seg.text.c_str(), stdout);
+            });
+    } else {
+        qvac_parakeet::ctc::StreamingOptions sopts;
+        sopts.sample_rate        = 16000;
+        sopts.chunk_ms           = args.chunk_ms;
+        sopts.left_context_ms    = args.left_ms;
+        sopts.right_lookahead_ms = args.right_ms;
+        tx_sess = engine.stream_start(sopts,
+            [&](const qvac_parakeet::ctc::StreamingSegment & seg) {
+                if (!args.accumulate) {
+                    if (seg.text.empty()) return;
+                    std::printf("\033[2K\r[%.2f-%.2f]%s\n", seg.start_s, seg.end_s, seg.text.c_str());
+                    std::fflush(stdout);
+                    return;
                 }
-                std::fflush(stdout);
-                last_voice_end_s = seg.end_s;
-                return;
-            }
 
-            if (line_open &&
-                (seg.end_s - last_voice_end_s) * 1000.0 >= args.silence_flush_ms) {
-                std::fputc('\n', stdout);
-                std::fflush(stdout);
-                line_open = false;
-            }
-        });
+                if (!seg.text.empty()) {
+                    if (!line_open) {
+                        std::fputs(seg.text.c_str() +
+                                   (seg.text.front() == ' ' ? 1 : 0),
+                                   stdout);
+                        line_open = true;
+                    } else {
+                        std::fputs(seg.text.c_str(), stdout);
+                    }
+                    std::fflush(stdout);
+                    last_voice_end_s = seg.end_s;
+                    return;
+                }
+
+                if (line_open &&
+                    (seg.end_s - last_voice_end_s) * 1000.0 >= args.silence_flush_ms) {
+                    std::fputc('\n', stdout);
+                    std::fflush(stdout);
+                    line_open = false;
+                }
+            });
+    }
 
     ma_context ctx;
     if (ma_context_init(nullptr, 0, nullptr, &ctx) != MA_SUCCESS) {
@@ -252,10 +279,22 @@ int main(int argc, char ** argv) {
     std::signal(SIGINT,  on_sigint);
     std::signal(SIGTERM, on_sigint);
 
-    std::fprintf(stderr,
-        "[live-mic] listening at 16 kHz mono.  "
-        "chunk=%d ms  left=%d ms  right=%d ms. Speak, Ctrl-C to stop.\n\n",
-        args.chunk_ms, args.left_ms, args.right_ms);
+    if (diarization_mode) {
+        std::fprintf(stderr,
+            "[live-mic] listening at 16 kHz mono (diarization).  "
+            "chunk=%d ms  history=%d ms. Speak, Ctrl-C to stop.\n\n",
+            args.chunk_ms, args.history_ms);
+    } else {
+        std::fprintf(stderr,
+            "[live-mic] listening at 16 kHz mono.  "
+            "chunk=%d ms  left=%d ms  right=%d ms. Speak, Ctrl-C to stop.\n\n",
+            args.chunk_ms, args.left_ms, args.right_ms);
+    }
+
+    auto feed = [&](const float * data, int n) {
+        if (diarization_mode) diar_sess->feed_pcm_f32(data, n);
+        else                  tx_sess->feed_pcm_f32(data, n);
+    };
 
     while (!g_stop.load()) {
         std::vector<float> batch;
@@ -266,7 +305,7 @@ int main(int argc, char ** argv) {
             if (g_pending.empty()) continue;
             batch.swap(g_pending);
         }
-        sess->feed_pcm_f32(batch.data(), (int) batch.size());
+        feed(batch.data(), (int) batch.size());
     }
 
     std::fprintf(stderr, "\n[live-mic] stopping...\n");
@@ -278,10 +317,11 @@ int main(int argc, char ** argv) {
             std::lock_guard<std::mutex> lk(g_mu);
             tail.swap(g_pending);
         }
-        if (!tail.empty()) sess->feed_pcm_f32(tail.data(), (int) tail.size());
+        if (!tail.empty()) feed(tail.data(), (int) tail.size());
     }
 
-    sess->finalize();
+    if (diarization_mode) diar_sess->finalize();
+    else                  tx_sess->finalize();
 
     if (args.accumulate && line_open) {
         std::fputc('\n', stdout);

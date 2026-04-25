@@ -52,9 +52,13 @@ void print_usage(const char * argv0) {
         "  --stream-feed-bytes N         (Mode 3) feed PCM into StreamSession in N-byte\n"
         "                                blocks (default 4096 bytes = 1024 samples); exercise\n"
         "                                with smaller values to stress the session state machine\n"
+        "  --stream-history-ms N         (Sortformer streaming) sliding history window in ms\n"
+        "                                (default 30000). Larger values stabilise speaker IDs\n"
+        "                                across chunks at the cost of per-chunk encoder work.\n"
         "  --emit FMT           --stream output format: 'text' (default) prints segment text\n"
         "                       one per line; 'jsonl' prints {text,start,end,chunk,is_final}\n"
-        "                       JSON Lines, one per segment\n"
+        "                       JSON Lines, one per segment. For Sortformer streaming, prints\n"
+        "                       speaker segments instead of text.\n"
         "\n"
         "  --bench              benchmark mode: run the inference path multiple times\n"
         "                       with warmup, print aggregated stats + RTF.\n"
@@ -173,6 +177,7 @@ struct ExtraCliOpts {
     int         stream_right_ms   = -1;
     bool        stream_duplex     = false;
     int         stream_feed_bytes = 0;
+    int         stream_history_ms = 30000;
     std::string emit_format       = "text";
 
     std::string diarization_model_path;
@@ -275,6 +280,8 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             extra.stream_duplex = true;
         } else if (a == "--stream-feed-bytes" && i + 1 < argc) {
             extra.stream_feed_bytes = std::max(1, std::atoi(argv[++i]));
+        } else if (a == "--stream-history-ms" && i + 1 < argc) {
+            extra.stream_history_ms = std::max(1000, std::atoi(argv[++i]));
         } else if (a == "--emit" && i + 1 < argc) {
             extra.emit_format = argv[++i];
         } else if (a == "--diarization-model" && i + 1 < argc) {
@@ -416,11 +423,64 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         eopts.verbose         = opts.verbose;
         Engine engine(eopts);
 
+        const std::string emit_fmt = extra.emit_format;
+
+        if (extra.stream) {
+            SortformerStreamingOptions sopts;
+            sopts.sample_rate    = sr;
+            sopts.chunk_ms       = extra.stream_chunk_ms > 0 ? extra.stream_chunk_ms : 2000;
+            sopts.history_ms     = extra.stream_history_ms;
+            if (sopts.history_ms < sopts.chunk_ms) sopts.history_ms = sopts.chunk_ms;
+            sopts.threshold      = 0.5f;
+            sopts.min_segment_ms = extra.attributed_min_segment_ms > 0
+                                 ? extra.attributed_min_segment_ms : 200;
+
+            int seg_count = 0;
+            const auto t_stream_start = std::chrono::steady_clock::now();
+            auto on_seg = [&](const StreamingDiarizationSegment & s) {
+                ++seg_count;
+                if (emit_fmt == "jsonl") {
+                    std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f,"
+                                "\"chunk\":%d,\"is_final\":%s}\n",
+                                s.speaker_id, s.start_s, s.end_s, s.chunk_index,
+                                s.is_final ? "true" : "false");
+                } else {
+                    std::printf("[%.2f-%.2f] speaker_%d (chunk %d%s)\n",
+                                s.start_s, s.end_s, s.speaker_id, s.chunk_index,
+                                s.is_final ? ", final" : "");
+                }
+                std::fflush(stdout);
+            };
+
+            auto session = engine.diarize_start(sopts, on_seg);
+            const int chunk_samples = sr * sopts.chunk_ms / 1000;
+            const int feed = extra.stream_feed_bytes > 0
+                           ? std::max(1, extra.stream_feed_bytes / (int) sizeof(float))
+                           : chunk_samples;
+            for (size_t off = 0; off < samples.size(); off += feed) {
+                const int n = (int) std::min<size_t>(feed, samples.size() - off);
+                session->feed_pcm_f32(samples.data() + off, n);
+            }
+            session->finalize();
+            const double stream_ms =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t_stream_start).count() / 1000.0;
+
+            if (opts.verbose) {
+                std::fprintf(stderr,
+                    "[diarize-stream] load=%.1fms audio=%.2fs samples=%zu@%dHz\n"
+                    "[diarize-stream] chunk_ms=%d history_ms=%d segments=%d total=%.1fms RTF=%.3f\n",
+                    load_ms, audio_ms / 1000.0, samples.size(), sr,
+                    sopts.chunk_ms, sopts.history_ms,
+                    seg_count, stream_ms, stream_ms / audio_ms);
+            }
+            return 0;
+        }
+
         DiarizationOptions dopts;
         DiarizationResult diar = engine.diarize_samples(
             samples.data(), (int) samples.size(), sr, dopts);
 
-        const std::string emit_fmt = extra.emit_format;
         for (const auto & s : diar.segments) {
             if (emit_fmt == "jsonl") {
                 std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f}\n",

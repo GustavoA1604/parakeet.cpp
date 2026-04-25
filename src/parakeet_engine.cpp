@@ -347,24 +347,24 @@ DiarizationResult Engine::diarize(const std::string & wav_path,
     return diarize_samples(samples.data(), (int) samples.size(), sr, opts);
 }
 
-DiarizationResult Engine::diarize_samples(const float * samples,
-                                          int n_samples,
-                                          int sample_rate,
-                                          const DiarizationOptions & opts) {
+static DiarizationResult engine_impl_diarize_helper(Engine::Impl & impl,
+                                                    const float * samples,
+                                                    int n_samples,
+                                                    int sample_rate,
+                                                    const DiarizationOptions & opts) {
     if (!samples || n_samples <= 0) {
-        throw std::runtime_error("Engine::diarize_samples: empty input");
+        throw std::runtime_error("diarize: empty input");
     }
-    if (sample_rate != pimpl_->model.mel_cfg.sample_rate) {
-        throw std::runtime_error("Engine::diarize_samples: input is " +
+    if (sample_rate != impl.model.mel_cfg.sample_rate) {
+        throw std::runtime_error("diarize: input is " +
                                  std::to_string(sample_rate) + " Hz but model expects " +
-                                 std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
+                                 std::to_string(impl.model.mel_cfg.sample_rate) + " Hz");
     }
-    if (pimpl_->model.model_type != ParakeetModelType::SORTFORMER || !pimpl_->sortformer_ready) {
-        throw std::runtime_error("Engine::diarize: loaded GGUF is not a Sortformer "
-                                 "diarization model. Use a sortformer-* GGUF.");
+    if (impl.model.model_type != ParakeetModelType::SORTFORMER || !impl.sortformer_ready) {
+        throw std::runtime_error("diarize: loaded GGUF is not a Sortformer model");
     }
 
-    pimpl_->cancel_flag.store(false);
+    impl.cancel_flag.store(false);
 
     using clock = std::chrono::steady_clock;
     const auto t_total = clock::now();
@@ -380,18 +380,18 @@ DiarizationResult Engine::diarize_samples(const float * samples,
     const auto t_mel = clock::now();
     std::vector<float> mel;
     int n_mel_frames = 0;
-    if (int rc = compute_log_mel(work.data(), n_samples, pimpl_->model.mel_cfg,
+    if (int rc = compute_log_mel(work.data(), n_samples, impl.model.mel_cfg,
                                  mel, n_mel_frames); rc != 0) {
-        throw std::runtime_error("Engine::diarize_samples: compute_log_mel failed (rc=" +
+        throw std::runtime_error("diarize: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double preprocess_ms = ms_since(t_mel);
 
     const auto t_enc = clock::now();
     EncoderOutputs enc_out;
-    if (int rc = run_encoder(pimpl_->model, mel.data(), n_mel_frames,
-                             pimpl_->model.mel_cfg.n_mels, enc_out); rc != 0) {
-        throw std::runtime_error("Engine::diarize_samples: run_encoder failed (rc=" +
+    if (int rc = run_encoder(impl.model, mel.data(), n_mel_frames,
+                             impl.model.mel_cfg.n_mels, enc_out); rc != 0) {
+        throw std::runtime_error("diarize: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double encoder_ms = ms_since(t_enc);
@@ -399,11 +399,11 @@ DiarizationResult Engine::diarize_samples(const float * samples,
     SortformerDiarizationOptions sopts;
     sopts.threshold = opts.threshold;
     SortformerDiarizationResult dres;
-    if (int rc = sortformer_diarize(pimpl_->model, pimpl_->sortformer_rt,
+    if (int rc = sortformer_diarize(impl.model, impl.sortformer_rt,
                                     enc_out.encoder_out.data(),
                                     enc_out.n_enc_frames, enc_out.d_model,
                                     sopts, dres); rc != 0) {
-        throw std::runtime_error("Engine::diarize_samples: sortformer_diarize failed (rc=" +
+        throw std::runtime_error("diarize: sortformer_diarize failed (rc=" +
                                  std::to_string(rc) + ")");
     }
 
@@ -430,6 +430,13 @@ DiarizationResult Engine::diarize_samples(const float * samples,
     }
 
     return result;
+}
+
+DiarizationResult Engine::diarize_samples(const float * samples,
+                                          int n_samples,
+                                          int sample_rate,
+                                          const DiarizationOptions & opts) {
+    return engine_impl_diarize_helper(*pimpl_, samples, n_samples, sample_rate, opts);
 }
 
 AttributedTranscriptionResult transcribe_with_speakers(
@@ -791,6 +798,199 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     }
 
     return std::make_unique<StreamSession>(std::move(impl));
+}
+
+struct SortformerStreamSession::Impl {
+    Engine::Impl *              engine_impl = nullptr;
+    SortformerStreamingOptions  opts;
+    SortformerSegmentCallback   on_segment;
+
+    int    chunk_samples   = 0;
+    int    history_samples = 0;
+
+    std::vector<float> ring;
+    int64_t            ring_origin_sample = 0;
+
+    int64_t            emitted_samples    = 0;
+    int                chunk_index        = 0;
+
+    bool finalized = false;
+    bool cancelled = false;
+
+    std::vector<StreamingDiarizationSegment> last_pending;
+
+    void try_emit_chunks();
+    void process_chunk(int64_t window_start_sample,
+                       int64_t window_end_sample,
+                       int64_t emit_start_sample,
+                       int64_t emit_end_sample,
+                       bool    is_final_chunk);
+};
+
+void SortformerStreamSession::Impl::process_chunk(int64_t window_start_sample,
+                                                  int64_t window_end_sample,
+                                                  int64_t emit_start_sample,
+                                                  int64_t emit_end_sample,
+                                                  bool    is_final_chunk) {
+    if (cancelled) return;
+    if (window_end_sample <= window_start_sample) return;
+
+    const size_t off  = (size_t) (window_start_sample - ring_origin_sample);
+    const int    n    = (int) (window_end_sample - window_start_sample);
+
+    DiarizationOptions diopts;
+    diopts.threshold      = opts.threshold;
+    diopts.min_segment_ms = opts.min_segment_ms;
+
+    DiarizationResult diar;
+    {
+        const float * win = ring.data() + off;
+        diar = engine_impl_diarize_helper(*engine_impl, win, n, opts.sample_rate, diopts);
+    }
+
+    const double window_offset_s = (double) window_start_sample / opts.sample_rate;
+    const double emit_lo_s = (double) emit_start_sample / opts.sample_rate;
+    const double emit_hi_s = (double) emit_end_sample   / opts.sample_rate;
+
+    std::vector<StreamingDiarizationSegment> emitted;
+    emitted.reserve(diar.segments.size());
+
+    for (const auto & s : diar.segments) {
+        const double abs_start = window_offset_s + s.start_s;
+        const double abs_end   = window_offset_s + s.end_s;
+        if (abs_end <= emit_lo_s) continue;
+        if (abs_start >= emit_hi_s) continue;
+
+        StreamingDiarizationSegment out;
+        out.speaker_id  = s.speaker_id;
+        out.start_s     = std::max(abs_start, emit_lo_s);
+        out.end_s       = std::min(abs_end,   emit_hi_s);
+        out.chunk_index = chunk_index;
+        out.is_final    = is_final_chunk;
+        if (out.end_s - out.start_s < opts.min_segment_ms / 1000.0) continue;
+        emitted.push_back(out);
+    }
+
+    if (on_segment) {
+        for (const auto & seg : emitted) on_segment(seg);
+    }
+    last_pending = std::move(emitted);
+
+    emitted_samples = emit_end_sample;
+    ++chunk_index;
+}
+
+void SortformerStreamSession::Impl::try_emit_chunks() {
+    if (cancelled) return;
+    while (!cancelled) {
+        const int64_t available_end = ring_origin_sample + (int64_t) ring.size();
+        if (available_end - emitted_samples < chunk_samples) return;
+
+        const int64_t emit_end = emitted_samples + chunk_samples;
+
+        const int64_t window_end   = emit_end;
+        const int64_t window_start = std::max(ring_origin_sample,
+                                              window_end - history_samples);
+        process_chunk(window_start, window_end, emitted_samples, emit_end, /*is_final=*/false);
+
+        if (history_samples > 0) {
+            const int64_t keep_from = std::max(ring_origin_sample,
+                                               emit_end - history_samples);
+            if (keep_from > ring_origin_sample) {
+                const size_t drop = (size_t) (keep_from - ring_origin_sample);
+                ring.erase(ring.begin(), ring.begin() + drop);
+                ring_origin_sample = keep_from;
+            }
+        }
+    }
+}
+
+SortformerStreamSession::SortformerStreamSession(std::unique_ptr<Impl> impl)
+    : pimpl_(std::move(impl)) {}
+
+SortformerStreamSession::~SortformerStreamSession() {
+    if (pimpl_ && !pimpl_->finalized && !pimpl_->cancelled) {
+        try { pimpl_->cancelled = true; } catch (...) {}
+    }
+}
+SortformerStreamSession::SortformerStreamSession(SortformerStreamSession &&) noexcept = default;
+SortformerStreamSession & SortformerStreamSession::operator=(SortformerStreamSession &&) noexcept = default;
+
+const SortformerStreamingOptions & SortformerStreamSession::options() const {
+    return pimpl_->opts;
+}
+
+void SortformerStreamSession::feed_pcm_f32(const float * samples, int n_samples) {
+    if (!pimpl_) throw std::runtime_error("SortformerStreamSession: moved-from session");
+    if (pimpl_->finalized) throw std::runtime_error("feed_pcm_f32: session already finalized");
+    if (pimpl_->cancelled) return;
+    if (!samples || n_samples <= 0) return;
+    pimpl_->ring.insert(pimpl_->ring.end(), samples, samples + n_samples);
+    pimpl_->try_emit_chunks();
+}
+
+void SortformerStreamSession::feed_pcm_i16(const int16_t * samples, int n_samples) {
+    if (!pimpl_) throw std::runtime_error("SortformerStreamSession: moved-from session");
+    if (pimpl_->finalized) throw std::runtime_error("feed_pcm_i16: session already finalized");
+    if (pimpl_->cancelled) return;
+    if (!samples || n_samples <= 0) return;
+    const size_t prev = pimpl_->ring.size();
+    pimpl_->ring.resize(prev + n_samples);
+    constexpr float inv = 1.0f / 32768.0f;
+    for (int i = 0; i < n_samples; ++i) pimpl_->ring[prev + i] = (float) samples[i] * inv;
+    pimpl_->try_emit_chunks();
+}
+
+void SortformerStreamSession::finalize() {
+    if (!pimpl_) return;
+    if (pimpl_->finalized) return;
+    pimpl_->finalized = true;
+    pimpl_->try_emit_chunks();
+
+    const int64_t available_end = pimpl_->ring_origin_sample + (int64_t) pimpl_->ring.size();
+    if (available_end > pimpl_->emitted_samples) {
+        const int64_t window_end   = available_end;
+        const int64_t window_start = std::max(pimpl_->ring_origin_sample,
+                                              window_end - pimpl_->history_samples);
+        pimpl_->process_chunk(window_start, window_end,
+                              pimpl_->emitted_samples, available_end,
+                              /*is_final_chunk=*/true);
+    } else if (!pimpl_->cancelled && pimpl_->on_segment) {
+        for (auto seg : pimpl_->last_pending) {
+            seg.is_final = true;
+            pimpl_->on_segment(seg);
+        }
+    }
+}
+
+void SortformerStreamSession::cancel() {
+    if (!pimpl_) return;
+    pimpl_->cancelled = true;
+}
+
+std::unique_ptr<SortformerStreamSession> Engine::diarize_start(
+    const SortformerStreamingOptions & opts,
+    SortformerSegmentCallback on_segment) {
+    if (pimpl_->model.model_type != ParakeetModelType::SORTFORMER || !pimpl_->sortformer_ready) {
+        throw std::runtime_error("Engine::diarize_start: loaded GGUF is not a Sortformer model");
+    }
+    if (opts.sample_rate != pimpl_->model.mel_cfg.sample_rate) {
+        throw std::runtime_error("Engine::diarize_start: sample_rate mismatch");
+    }
+    if (opts.chunk_ms <= 0)   throw std::runtime_error("Engine::diarize_start: chunk_ms must be > 0");
+    if (opts.history_ms <= 0) throw std::runtime_error("Engine::diarize_start: history_ms must be > 0");
+    if (opts.history_ms < opts.chunk_ms) {
+        throw std::runtime_error("Engine::diarize_start: history_ms must be >= chunk_ms");
+    }
+
+    auto impl = std::make_unique<SortformerStreamSession::Impl>();
+    impl->engine_impl     = pimpl_.get();
+    impl->opts            = opts;
+    impl->on_segment      = std::move(on_segment);
+    impl->chunk_samples   = opts.sample_rate * opts.chunk_ms   / 1000;
+    impl->history_samples = opts.sample_rate * opts.history_ms / 1000;
+    impl->ring.reserve(impl->history_samples);
+    return std::make_unique<SortformerStreamSession>(std::move(impl));
 }
 
 }
