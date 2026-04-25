@@ -174,6 +174,10 @@ struct ExtraCliOpts {
     bool        stream_duplex     = false;
     int         stream_feed_bytes = 0;
     std::string emit_format       = "text";
+
+    std::string diarization_model_path;
+    int         attributed_min_segment_ms = 200;
+    int         attributed_pad_segment_ms = 0;
 };
 
 double ms_since(std::chrono::steady_clock::time_point a) {
@@ -273,6 +277,12 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             extra.stream_feed_bytes = std::max(1, std::atoi(argv[++i]));
         } else if (a == "--emit" && i + 1 < argc) {
             extra.emit_format = argv[++i];
+        } else if (a == "--diarization-model" && i + 1 < argc) {
+            extra.diarization_model_path = argv[++i];
+        } else if (a == "--diarization-min-segment-ms" && i + 1 < argc) {
+            extra.attributed_min_segment_ms = std::max(0, std::atoi(argv[++i]));
+        } else if (a == "--diarization-pad-segment-ms" && i + 1 < argc) {
+            extra.attributed_pad_segment_ms = std::max(0, std::atoi(argv[++i]));
         } else {
             std::fprintf(stderr, "unknown option: %s\n", a.c_str());
             print_usage(argv[0]);
@@ -327,6 +337,76 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     }
     const double wav_ms = ms_since(t_wav);
     const double audio_ms = 1000.0 * (double) samples.size() / (double) sr;
+
+    if (!extra.diarization_model_path.empty()) {
+        if (model.model_type == ParakeetModelType::SORTFORMER) {
+            std::fprintf(stderr, "error: --diarization-model expects --model to be a transcription\n"
+                                 "       (CTC/TDT) GGUF; got Sortformer at --model. Swap them.\n");
+            return 5;
+        }
+
+        EngineOptions sf_opts;
+        sf_opts.model_gguf_path = extra.diarization_model_path;
+        sf_opts.n_gpu_layers    = opts.n_gpu_layers;
+        sf_opts.n_threads       = opts.n_threads;
+        sf_opts.verbose         = opts.verbose;
+        Engine sf_engine(sf_opts);
+
+        if (!sf_engine.is_diarization_model()) {
+            std::fprintf(stderr, "error: --diarization-model %s is not a Sortformer GGUF\n",
+                         extra.diarization_model_path.c_str());
+            return 5;
+        }
+
+        EngineOptions asr_opts;
+        asr_opts.model_gguf_path = opts.model_gguf_path;
+        asr_opts.n_gpu_layers    = opts.n_gpu_layers;
+        asr_opts.n_threads       = opts.n_threads;
+        asr_opts.verbose         = opts.verbose;
+        Engine asr_engine(asr_opts);
+
+        AttributedTranscriptionOptions topts;
+        topts.min_segment_ms = extra.attributed_min_segment_ms;
+        topts.pad_segment_ms = extra.attributed_pad_segment_ms;
+
+        const auto t_attr = clock::now();
+        AttributedTranscriptionResult attr = transcribe_samples_with_speakers(
+            sf_engine, asr_engine, samples.data(), (int) samples.size(), sr, topts);
+        const double attr_ms = ms_since(t_attr);
+
+        const std::string emit_fmt = extra.emit_format;
+        for (const auto & s : attr.segments) {
+            if (emit_fmt == "jsonl") {
+                std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f,\"text\":\"",
+                            s.speaker_id, s.start_s, s.end_s);
+                for (char c : s.text) {
+                    switch (c) {
+                        case '"':  std::fputs("\\\"", stdout); break;
+                        case '\\': std::fputs("\\\\", stdout); break;
+                        case '\n': std::fputs("\\n",  stdout); break;
+                        case '\r': std::fputs("\\r",  stdout); break;
+                        case '\t': std::fputs("\\t",  stdout); break;
+                        default:
+                            if ((unsigned char) c < 0x20) std::printf("\\u%04x", c);
+                            else std::fputc(c, stdout);
+                    }
+                }
+                std::printf("\"}\n");
+            } else {
+                std::printf("[%.2f-%.2f] speaker_%d: %s\n",
+                            s.start_s, s.end_s, s.speaker_id, s.text.c_str());
+            }
+        }
+        if (opts.verbose) {
+            std::fprintf(stderr,
+                "[attributed] audio=%.2fs samples=%zu@%dHz diar.segments=%zu asr_calls=%d\n"
+                "[attributed] total=%.1fms RTF=%.3f merged.segments=%zu\n",
+                audio_ms / 1000.0, samples.size(), sr,
+                attr.diarization.segments.size(), attr.asr_calls,
+                attr_ms, attr_ms / audio_ms, attr.segments.size());
+        }
+        return 0;
+    }
 
     if (model.model_type == ParakeetModelType::SORTFORMER) {
         EngineOptions eopts;

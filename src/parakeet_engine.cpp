@@ -90,6 +90,15 @@ std::string Engine::model_type() const {
     }
 }
 
+bool Engine::is_diarization_model() const {
+    return pimpl_->model.model_type == ParakeetModelType::SORTFORMER;
+}
+
+bool Engine::is_transcription_model() const {
+    return pimpl_->model.model_type == ParakeetModelType::CTC ||
+           pimpl_->model.model_type == ParakeetModelType::TDT;
+}
+
 void Engine::cancel() {
     pimpl_->cancel_flag.store(true);
 }
@@ -421,6 +430,98 @@ DiarizationResult Engine::diarize_samples(const float * samples,
     }
 
     return result;
+}
+
+AttributedTranscriptionResult transcribe_with_speakers(
+    Engine & sortformer_engine,
+    Engine & asr_engine,
+    const std::string & wav_path,
+    const AttributedTranscriptionOptions & opts) {
+    std::vector<float> samples;
+    int sr = 0;
+    if (int rc = load_wav_mono_f32(wav_path, samples, sr); rc != 0) {
+        throw std::runtime_error("transcribe_with_speakers: failed to load wav '" +
+                                 wav_path + "' (rc=" + std::to_string(rc) + ")");
+    }
+    return transcribe_samples_with_speakers(sortformer_engine, asr_engine,
+                                            samples.data(), (int) samples.size(),
+                                            sr, opts);
+}
+
+AttributedTranscriptionResult transcribe_samples_with_speakers(
+    Engine & sortformer_engine,
+    Engine & asr_engine,
+    const float * samples,
+    int n_samples,
+    int sample_rate,
+    const AttributedTranscriptionOptions & opts) {
+    if (!samples || n_samples <= 0) {
+        throw std::runtime_error("transcribe_samples_with_speakers: empty input");
+    }
+    if (!sortformer_engine.is_diarization_model()) {
+        throw std::runtime_error("transcribe_samples_with_speakers: first engine "
+                                 "is not a Sortformer diarization model");
+    }
+    if (!asr_engine.is_transcription_model()) {
+        throw std::runtime_error("transcribe_samples_with_speakers: second engine "
+                                 "is not an ASR transcription model");
+    }
+
+    using clock = std::chrono::steady_clock;
+    const auto t_total = clock::now();
+
+    AttributedTranscriptionResult out;
+    out.audio_samples = n_samples;
+    out.sample_rate   = sample_rate;
+
+    out.diarization = sortformer_engine.diarize_samples(samples, n_samples, sample_rate, opts.diarization);
+
+    const double pad_s = opts.pad_segment_ms / 1000.0;
+    const double min_s = opts.min_segment_ms / 1000.0;
+
+    std::vector<AttributedSegment> raw;
+    raw.reserve(out.diarization.segments.size());
+    for (const auto & seg : out.diarization.segments) {
+        const double slice_start = std::max(0.0, seg.start_s - pad_s);
+        const double slice_end   = std::min((double) n_samples / sample_rate, seg.end_s + pad_s);
+        if ((slice_end - slice_start) < min_s) continue;
+
+        const int start_sample = (int) std::floor(slice_start * sample_rate);
+        const int end_sample   = std::min((int) std::ceil(slice_end * sample_rate), n_samples);
+        const int n_slice      = end_sample - start_sample;
+        if (n_slice <= 0) continue;
+
+        EngineResult er = asr_engine.transcribe_samples(
+            samples + start_sample, n_slice, sample_rate);
+        ++out.asr_calls;
+
+        AttributedSegment a;
+        a.speaker_id = seg.speaker_id;
+        a.text       = std::move(er.text);
+        a.start_s    = seg.start_s;
+        a.end_s      = seg.end_s;
+        raw.push_back(std::move(a));
+    }
+
+    if (!opts.merge_same_speaker) {
+        out.segments = std::move(raw);
+    } else {
+        for (auto & s : raw) {
+            if (!out.segments.empty() &&
+                out.segments.back().speaker_id == s.speaker_id) {
+                if (!out.segments.back().text.empty() && !s.text.empty()) {
+                    out.segments.back().text += ' ';
+                }
+                out.segments.back().text += s.text;
+                out.segments.back().end_s = s.end_s;
+            } else {
+                out.segments.push_back(std::move(s));
+            }
+        }
+    }
+
+    out.total_ms = ms_since(t_total);
+    return out;
 }
 
 struct StreamSession::Impl {
