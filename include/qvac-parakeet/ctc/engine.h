@@ -1,34 +1,49 @@
 #pragma once
 
-// Persistent Parakeet-CTC engine.
+// Persistent Parakeet engine -- CTC, TDT and Sortformer behind one umbrella.
 //
 // Loads the GGUF once and keeps the preprocessor filterbank + encoder
-// weights + CTC head + SentencePiece vocab + backend resident so that
-// subsequent calls to `transcribe()` pay only the mel extraction +
-// encoder forward + CTC decode cost.
+// weights + decoder (CTC head, TDT prediction+joint, or Sortformer
+// transformer+head) + tokenizer (when applicable) + backend resident so
+// subsequent calls pay only the mel extraction + encoder + decode cost.
+// The header path under <qvac-parakeet/ctc/...> is historical -- the
+// `Engine` class auto-detects the model type at load time and dispatches.
 //
-// Three entry points mirror the qvac/packages/sdk transcription API:
+// Transcription entry points (CTC + TDT GGUFs) mirror the
+// qvac/packages/sdk API:
 //
 //   1. transcribe()                - full audio in, full text out (one-shot).
-//   2. transcribe_stream()         - full audio in up front, segments streamed
-//                                    out via callback as they're produced.
-//                                    Runs the offline encoder once, then walks
-//                                    CTC frames in chunk_ms-sized windows.
-//                                    Zero accuracy delta vs transcribe().
+//   2. transcribe_stream()         - Mode 2: full audio in up front, segments
+//                                    streamed out via callback as they're
+//                                    produced. Zero accuracy delta vs
+//                                    transcribe().
 //   3. stream_start() -> StreamSession
-//                                  - true duplex: caller pushes PCM over time
-//                                    via feed_pcm_*, finalize() emits the tail.
-//                                    Requires a cache-aware streaming GGUF;
-//                                    errors on today's offline GGUF until the
-//                                    Phase 2 streaming pipeline lands.
+//                                  - Mode 3: true duplex push API. Caller
+//                                    pushes PCM over time via feed_pcm_*;
+//                                    each chunk runs cache-aware inference
+//                                    over [left_context + chunk +
+//                                    right_lookahead] using the existing
+//                                    offline-trained GGUF (Phase 8). No
+//                                    new model checkpoint is required.
 //
-// Usage:
+// Diarization entry points (Sortformer GGUFs):
+//
+//   4. diarize()                   - full audio in, list of {speaker, start,
+//                                    end} segments out.
+//   5. diarize_start() -> SortformerStreamSession
+//                                  - Phase 11.11.1 sliding-history live
+//                                    diarization push API.
+//
+// Combined ASR + diarization is exposed as a free function:
+//   `transcribe_with_speakers(sortformer_engine, asr_engine, ...)`.
+//
+// Usage (transcription):
 //
 //     using qvac_parakeet::ctc::Engine;
 //     using qvac_parakeet::ctc::EngineOptions;
 //
 //     EngineOptions opts;
-//     opts.model_gguf_path = "models/parakeet-ctc-0.6b.gguf";
+//     opts.model_gguf_path = "models/parakeet-tdt-0.6b-v3.q8_0.gguf";
 //     opts.n_threads       = 8;
 //
 //     Engine engine(opts);
@@ -37,9 +52,9 @@
 //         std::puts(result.text.c_str());
 //     }
 //
-// Not thread-safe for concurrent `transcribe()` calls on the same
-// instance (the encoder's graph allocator is shared state).  `cancel()`
-// is safe to call from any thread.
+// Not thread-safe for concurrent `transcribe()` / `diarize()` calls on
+// the same instance (the encoder's graph allocator is shared state).
+// `cancel()` is safe to call from any thread.
 //
 // Implementation in src/parakeet_engine.cpp.
 
@@ -49,7 +64,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 struct EngineOptions {
     std::string model_gguf_path;
@@ -96,6 +111,15 @@ struct DiarizationSegment {
     double end_s      = 0.0;
 };
 
+// One speaker span emitted by SortformerStreamSession. `is_final=true`
+// flags the LAST callback the session will fire; it is either:
+//   - a real segment from the trailing partial chunk (when audio ends
+//     mid-chunk), or
+//   - a synthetic terminator with `speaker_id = -1` and `start_s ==
+//     end_s` (when audio ended exactly on a chunk boundary, so all
+//     real segments were already delivered as `is_final=false`).
+// Consumers should treat `speaker_id < 0` as "session done, no new
+// segment" and skip any text/append logic for it.
 struct StreamingDiarizationSegment {
     int    speaker_id  = 0;
     double start_s     = 0.0;
@@ -316,5 +340,15 @@ AttributedTranscriptionResult transcribe_samples_with_speakers(
     int n_samples,
     int sample_rate,
     const AttributedTranscriptionOptions & opts = {});
+
+// Backward-compatibility shim. The library's public namespace was
+// `qvac_parakeet::ctc` through v0.1.0-pre; it is now `qvac_parakeet`
+// because the same Engine handles CTC, TDT, and Sortformer GGUFs.
+// All names in `qvac_parakeet` are visible via the legacy
+// `qvac_parakeet::ctc::` qualifier so existing consumer code keeps
+// building. New code should use `qvac_parakeet::` directly.
+namespace ctc {
+    using namespace ::qvac_parakeet;
+}
 
 }

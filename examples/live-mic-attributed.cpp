@@ -225,6 +225,7 @@ int main(int argc, char ** argv) {
     int last_spk_seen = -1;
 
     auto on_diar = [&](const StreamingDiarizationSegment & s) {
+        if (s.speaker_id < 0) return;
         diar_history.push_back({s.speaker_id, s.start_s, s.end_s});
         const double cutoff = s.end_s - speaker_history_s;
         while (!diar_history.empty() && diar_history.front().end_s < cutoff) {

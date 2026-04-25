@@ -26,7 +26,7 @@
 #include <thread>
 #include <vector>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 struct EncoderGraph {
     ggml_context * graph_ctx = nullptr;

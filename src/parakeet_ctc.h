@@ -17,7 +17,7 @@ struct ggml_context;
 struct ggml_tensor;
 struct gguf_context;
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 struct EncoderConfig {
     int d_model        = 1024;
@@ -261,5 +261,12 @@ int profile_block_substages(ParakeetCtcModel & model,
                             int warmup_runs,
                             int timed_runs,
                             BlockSubstageTimes & out);
+
+// Backward-compat: the public namespace was `qvac_parakeet::ctc` through
+// v0.1.0-pre. Make the legacy qualifier resolve to the new flat namespace
+// so existing translation units (and out-of-tree consumers) keep building.
+namespace ctc {
+    using namespace ::qvac_parakeet;
+}
 
 }

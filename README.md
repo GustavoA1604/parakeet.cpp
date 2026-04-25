@@ -45,25 +45,36 @@ that repo will find the same file structure here.
 ## Pipeline at a glance
 
 ```
-      16 kHz mono wav                                       text
-             |                                                ^
-             v                                                |
-  +------------------------------------------------------------+
-  |                        qvac-parakeet                        |
-  |                                                             |
-  |    wav  ->  80-ch log-mel  ->  FastConformer encoder        |
-  |             (STFT + CMVN)      (subsampling 8x + 24 blocks) |
-  |                                                             |
-  |                 ->  CTC head  ->  greedy decode  ->  text   |
-  +------------------------------------------------------------+
-             ^                                                |
-             |                                                v
-       dr_wav reader                              SentencePiece BPE
-                                                  (embedded in GGUF)
+   16 kHz mono wav                                                  output
+          |                                                           ^
+          v                                                           |
+  +-----------------------------------------------------------------+
+  |                            qvac-parakeet                        |
+  |                                                                 |
+  |    wav  ->  log-mel (80 or 128)  ->  FastConformer encoder      |
+  |             (STFT + CMVN)            (subsampling 8x, 17-42     |
+  |                                       conformer blocks)         |
+  |                                                                 |
+  |    decoder dispatched on GGUF metadata:                         |
+  |      CTC        head + greedy decode      -> text               |
+  |      TDT        LSTM pred + joint MLP +   -> text +             |
+  |                 transducer greedy            punctuation        |
+  |      Sortformer encoder_proj + 18L TF +   -> {speaker, t0, t1}* |
+  |                 sigmoid head                                    |
+  +-----------------------------------------------------------------+
+          ^                                                           |
+          |                                                           v
+   dr_wav / miniaudio                                  SentencePiece BPE
+                                                       (CTC/TDT only;
+                                                        embedded in GGUF)
 ```
 
-Everything is self-contained in one `.gguf` file: encoder weights,
-CTC head, precomputed mel filterbank, and the SentencePiece tokenizer.
+Each `.gguf` ships everything its decoder needs in a single file
+(encoder weights, decoder weights, precomputed mel filterbank, and the
+SentencePiece tokenizer where applicable). The same C++ `Engine`
+auto-detects the model type (CTC / TDT / Sortformer) at load time and
+dispatches to the right decoder, so the public API is single-engine
+from the consumer's perspective.
 
 ## Prerequisites
 
@@ -90,19 +101,25 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 ```
 
-For a GPU backend — Metal on Apple Silicon (**~2.5x faster than CPU**),
-CUDA on NVIDIA, Vulkan elsewhere:
+For a GPU backend pick **one** of Metal (Apple Silicon, **~2.5x faster
+than CPU**), CUDA (NVIDIA), or Vulkan (everything else) at configure
+time. The init order at runtime is `CUDA -> Metal -> Vulkan -> CPU`,
+so a single binary built with multiple backends compiled in will use
+the first available one and there is no runtime backend switch -- the
+expectation is one backend per build.
 
 ```bash
 # Apple Silicon:
 cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
     -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
-# or: -DGGML_CUDA=ON / -DGGML_VULKAN=ON
+# NVIDIA:   -DGGML_CUDA=ON
+# Generic:  -DGGML_VULKAN=ON
 cmake --build build-metal -j$(sysctl -n hw.ncpu)
 
-# Run — pass any value > 0 to --n-gpu-layers to enable GPU
-# (the whole encoder runs on one backend; the value is currently a
-# yes/no toggle, named for compat with llama.cpp / whisper.cpp convention):
+# `--n-gpu-layers` is a yes/no toggle today: any value > 0 moves the
+# whole encoder to the compiled-in GPU backend. The flag is named for
+# compatibility with llama.cpp / whisper.cpp; partial-layer offload
+# is not implemented (encoder is small enough to fit on one device).
 ./build-metal/qvac-parakeet \
     --n-gpu-layers 1 \
     --model models/parakeet-ctc-0.6b.q8_0.gguf \
@@ -111,37 +128,74 @@ cmake --build build-metal -j$(sysctl -n hw.ncpu)
 
 This produces the main binary plus per-stage validation harnesses:
 
-| Binary                  | What it does |
-|-------------------------|--------------|
-| `build/qvac-parakeet`   | End-to-end: wav / raw PCM -> text (FastConformer + CTC greedy decode + SentencePiece detokenize), with optional `--stream` Mode 2 output. |
-| `build/test-mel`        | 16 kHz 80-ch log-mel parity vs NeMo `AudioToMelSpectrogramPreprocessor`. |
-| `build/test-encoder`    | FastConformer encoder per-stage parity vs `dump-ctc-reference.py`. |
-| `build/test-ctc`        | CTC head + greedy decode parity vs NeMo `transcribe()`. |
-| `build/test-streaming`  | Mode 2 byte-equality + timestamp coverage + Mode 3 error-path assertions across chunk sizes {250, 500, 1000, 2000, 4000} ms. |
+| Binary                            | What it does |
+|-----------------------------------|--------------|
+| `build/qvac-parakeet`             | End-to-end CLI: wav / raw PCM -> text (CTC + TDT) or speaker segments (Sortformer). Auto-routes on GGUF metadata. Supports `--stream` (Mode 2/3 transcription, sliding-history Sortformer streaming), `--diarization-model PATH` (combined ASR + Sortformer attribution), `--bench`, `--profile`. |
+| `build/live-mic`                  | Live microphone session for either transcription (CTC/TDT) or diarization (Sortformer). Auto-detects from the GGUF. |
+| `build/live-mic-attributed`       | Live microphone with simultaneous ASR + Sortformer; tags each transcript segment with the speaker whose live diarization range overlaps it the most. `--accumulate` collapses output to one line per speaker. |
+| `build/test-mel`                  | 16 kHz log-mel parity vs NeMo `AudioToMelSpectrogramPreprocessor`. |
+| `build/test-encoder`              | FastConformer encoder per-stage parity vs `dump-ctc-reference.py`. |
+| `build/test-ctc`                  | CTC head + greedy decode + SentencePiece detokenize parity vs NeMo `transcribe()` (consumes `logits.npy` from `dump-ctc-reference.py`). |
+| `build/test-tdt-encoder-parity`   | TDT encoder per-stage parity vs `dump-tdt-reference.py`. |
+| `build/test-sortformer-parity`    | Sortformer mel + encoder + speaker-prob parity vs `dump-sortformer-reference.py`. |
+| `build/test-streaming`            | CTC/TDT Mode 2 byte-equality + timestamp coverage + Mode 3 WER tolerance across chunk sizes. |
+| `build/test-sortformer-streaming` | `SortformerStreamSession` push API: random-burst feed, no-duplicate, single-`is_final` assertions. |
 
 ## 2. One-time: convert weights
+
+The converter (`scripts/convert-parakeet-ctc-to-gguf.py` -- name is
+historical; it auto-detects CTC, TDT and Sortformer from the .nemo
+config and writes the right GGUF in each case) takes a `.nemo` archive
+and produces a single self-contained GGUF (encoder + decoder weights +
+embedded tokenizer where applicable + precomputed mel filterbank).
 
 ```bash
 python -m venv venv && . venv/bin/activate
 pip install "nemo_toolkit[asr]" gguf numpy soundfile librosa sentencepiece
 
+# Parakeet-CTC 0.6B / 1.1B (English, fast)
 python scripts/convert-parakeet-ctc-to-gguf.py \
   --ckpt models/parakeet-ctc-0.6b.nemo \
   --out  models/parakeet-ctc-0.6b.gguf
 
-# or the bigger 1.1B variant (same converter, same flags)
 python scripts/convert-parakeet-ctc-to-gguf.py \
   --ckpt models/parakeet-ctc-1.1b.nemo \
   --out  models/parakeet-ctc-1.1b.q8_0.gguf \
   --quant q8_0
+
+# Parakeet-TDT 0.6B-v3 / 1.1B (multilingual, punctuation, capitalisation)
+python scripts/convert-parakeet-ctc-to-gguf.py \
+  --ckpt    models/parakeet-tdt-0.6b-v3.nemo \
+  --hf-repo nvidia/parakeet-tdt-0.6b-v3 \
+  --out     models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+  --quant   q8_0
+
+python scripts/convert-parakeet-ctc-to-gguf.py \
+  --ckpt    models/parakeet-tdt-1.1b.nemo \
+  --hf-repo nvidia/parakeet-tdt-1.1b \
+  --out     models/parakeet-tdt-1.1b.q8_0.gguf \
+  --quant   q8_0
+
+# Sortformer 4-speaker diarization (offline v1, streaming-trained v2)
+python scripts/convert-parakeet-ctc-to-gguf.py \
+  --ckpt    models/diar_sortformer_4spk-v1.nemo \
+  --hf-repo nvidia/diar_sortformer_4spk-v1 \
+  --out     models/sortformer-4spk-v1.f16.gguf
+
+python scripts/convert-parakeet-ctc-to-gguf.py \
+  --ckpt    models/diar_streaming_sortformer_4spk-v2.nemo \
+  --hf-repo nvidia/diar_streaming_sortformer_4spk-v2 \
+  --out     models/sortformer-streaming-4spk-v2.f16.gguf
 ```
 
-The script downloads `nvidia/parakeet-ctc-0.6b` (or `-1.1b`) from
-Hugging Face on first run if the local path doesn't exist. The
-SentencePiece tokenizer (`tokenizer.model`) and the precomputed mel
-filterbank are embedded directly into the GGUF as standard
-`tokenizer.ggml.*` metadata and a named `preproc/mel_filterbank`
-tensor, so the C++ binary is self-contained.
+Footgun: the script's `--hf-repo` defaults to `nvidia/parakeet-ctc-0.6b`,
+so when `--ckpt` points at a non-CTC path that does not exist locally
+**you must pass `--hf-repo` explicitly** -- otherwise the script will
+download the CTC checkpoint instead of the one named in `--ckpt`.
+
+`scripts/download-all-models.sh` pre-fetches every supported `.nemo`
+(plus the corresponding ONNX bundles for the Node binding) -- handy
+when you're about to be on a flaky network.
 
 ### Quantization tiers
 
@@ -632,25 +686,59 @@ qvac-parakeet.cpp/
                                    by scripts/setup-ggml.sh, or skipped entirely
                                    when building with -DQVAC_PARAKEET_USE_SYSTEM_GGML=ON)
   src/
-    main.cpp                     CLI (wav / raw PCM -> text, + streaming) + qvac_parakeet_cli_main impl
+    main.cpp                     CLI (wav / raw PCM -> text or speaker segments,
+                                   + Mode 2/3 transcription streaming, sliding-history
+                                   diarization streaming, attribution) + qvac_parakeet_cli_main
+                                   + transcribe_wav (CTC-only one-shot helper)
     cli_main.cpp                 thin main() -> qvac_parakeet_cli_main shim
-    parakeet_ctc.{h,cpp}         FastConformer encoder + CTC head ggml graph + GGUF loader
-    parakeet_engine.cpp          Engine + StreamSession implementation (transcribe, transcribe_stream, stream_start)
+    parakeet_ctc.{h,cpp}         GGUF loader + FastConformer encoder ggml graph
+                                   + CTC head + greedy decode (shared by all engines;
+                                   model_type field selects the decoder)
+    parakeet_tdt.{h,cpp}         TDT decoder: 2-layer LSTM prediction + joint MLP
+                                   + transducer greedy decode (CPU)
+    parakeet_sortformer.{h,cpp}  Sortformer diarization: encoder_proj + 18-layer
+                                   Transformer encoder + ReLU MLP + sigmoid head + segmenter
+    parakeet_engine.cpp          Engine + StreamSession + SortformerStreamSession
+                                   (transcribe, transcribe_stream, stream_start, diarize,
+                                    diarize_start, transcribe_with_speakers)
     mel_preprocess.{h,cpp}       wav I/O + STFT + mel + CMVN
-    sentencepiece_bpe.{h,cpp}    SentencePiece BPE detokenizer
+    sentencepiece_bpe.{h,cpp}    SentencePiece BPE detokenizer (CTC + TDT)
     dr_wav.h                     vendored single-header WAV reader
     npy.h                        minimal .npy load / save + compare
-    test_*.cpp                   per-stage numerical-parity harnesses + streaming validation
+    test_*.cpp                   per-stage numerical-parity harnesses (mel, encoder,
+                                   ctc, tdt-encoder, sortformer) + streaming
+                                   validation (test-streaming, test-sortformer-streaming)
   include/qvac-parakeet/
-    qvac-parakeet.h              CLI entry (qvac_parakeet_cli_main)
-    ctc/pipeline.h               one-shot wav -> text API
-    ctc/engine.h                 persistent Engine (load once, transcribe many)
+    qvac-parakeet.h              CLI entry (qvac_parakeet_cli_main) + library overview
+    ctc/engine.h                 persistent multi-engine Engine umbrella + StreamSession +
+                                   SortformerStreamSession + transcribe_with_speakers.
+                                   The header path "ctc/" is historical -- the API now
+                                   covers CTC, TDT and Sortformer GGUFs.
+    ctc/pipeline.h               one-shot wav -> text API (CTC GGUFs only;
+                                   hard-errors on TDT/Sortformer)
+  examples/
+    live-mic.cpp                 live microphone -> transcription (CTC/TDT) or live
+                                   diarization (Sortformer); auto-detects the GGUF.
+    live-mic-attributed.cpp      live microphone -> dual-engine ASR + Sortformer
+                                   with per-segment speaker attribution.
+    miniaudio.h                  vendored single-header audio capture (MIT).
   scripts/
     setup-ggml.sh                pin + clone ggml
-    convert-parakeet-ctc-to-gguf.py   .nemo -> GGUF
-    dump-ctc-reference.py        NeMo PyTorch -> .npy reference tensors
+    convert-parakeet-ctc-to-gguf.py    .nemo -> GGUF (auto-detects CTC / TDT / Sortformer)
+    dump-ctc-reference.py        NeMo PyTorch -> .npy reference tensors (CTC stages)
+    dump-tdt-reference.py        NeMo PyTorch -> .npy reference tensors (TDT stages)
+    dump-sortformer-reference.py NeMo PyTorch -> .npy reference tensors (Sortformer stages)
+    dump-block0-substages.py     per-sub-stage timing inputs for --profile
+    ref-encoder-from-gguf.py     run the GGUF encoder in PyTorch as a parity oracle
+    streaming-reference.py       reference per-chunk outputs for streaming validation
+    verify-gguf-roundtrip.py     load a GGUF and assert all expected tensors are present
+    quantize-ctc-onnx-int8.py    int8-quantize an ONNX CTC export (for the Node binding)
+    download-all-models.sh       pre-fetch every supported .nemo (and ONNX bundle)
     transcribe.sh                wav -> text wrapper
   cmake/                         CMake package config (for vcpkg follow-up)
+  test/samples/                  fixture wavs (jfk.wav, sample-16k.wav)
+  artifacts/                     dumped reference tensors (.npy) per engine; not tracked
+  models/                        downloaded .nemo + converted .gguf checkpoints; not tracked
   PROGRESS.md                    chronological development journal
   README.md                      this file
 ```

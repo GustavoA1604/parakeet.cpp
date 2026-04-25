@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 struct MelConfig {
     int sample_rate = 16000;

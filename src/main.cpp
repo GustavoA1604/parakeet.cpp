@@ -20,17 +20,26 @@ namespace {
 
 void print_usage(const char * argv0) {
     std::fprintf(stderr,
-        "usage: %s --model <parakeet-ctc.gguf> (--wav <input.wav> | --pcm-in <input.raw>) [options]\n"
+        "usage: %s --model <gguf> (--wav <input.wav> | --pcm-in <input.raw>) [options]\n"
+        "\n"
+        "Single CLI for all four engine families. The GGUF is auto-detected:\n"
+        "  CTC        (parakeet-ctc-0.6b/1.1b)        -> transcription\n"
+        "  TDT        (parakeet-tdt-0.6b-v3, 1.1b)    -> multilingual transcription\n"
+        "  Sortformer (diar_sortformer_4spk-v1, v2)   -> 4-speaker diarization\n"
+        "Combined ASR + diarization (\"who said what\") via --diarization-model.\n"
         "\n"
         "options:\n"
-        "  --model PATH         path to the parakeet-ctc GGUF (required)\n"
+        "  --model PATH         path to a CTC, TDT, or Sortformer GGUF (required)\n"
         "  --wav PATH           path to a 16 kHz mono wav file\n"
         "  --pcm-in PATH        path to a raw PCM file (16 kHz mono, format selected by --pcm-format)\n"
         "  --pcm-format FMT     raw PCM sample format: s16le (default) or f32le\n"
         "  --threads N          number of CPU threads (0 = hardware_concurrency)\n"
-        "  --n-gpu-layers N     offload to GPU backend when > 0 (build with\n"
-        "                       -DGGML_METAL=ON / -DGGML_CUDA=ON / -DGGML_VULKAN=ON;\n"
-        "                       N just needs to be >0 — the whole encoder moves)\n"
+        "  --n-gpu-layers N     when > 0, run the encoder on the compiled-in GPU\n"
+        "                       backend (build with -DGGML_METAL=ON / -DGGML_CUDA=ON\n"
+        "                       / -DGGML_VULKAN=ON; only one is active per binary --\n"
+        "                       CUDA wins over Metal wins over Vulkan if multiple are\n"
+        "                       compiled in). N is only checked >0 today: the whole\n"
+        "                       encoder moves; partial layer offload is not implemented.\n"
         "  --verbose            print per-stage wall times and shapes to stderr\n"
         "\n"
         "  --stream             enable streaming. Without --stream-duplex this is Mode 2:\n"
@@ -59,6 +68,15 @@ void print_usage(const char * argv0) {
         "                       one per line; 'jsonl' prints {text,start,end,chunk,is_final}\n"
         "                       JSON Lines, one per segment. For Sortformer streaming, prints\n"
         "                       speaker segments instead of text.\n"
+        "\n"
+        "  --diarization-model PATH         path to a Sortformer GGUF; combined with a CTC/TDT\n"
+        "                                    --model, runs speaker-attributed transcription\n"
+        "                                    (writes [start-end] speaker_N: text per segment).\n"
+        "                                    Implies --emit text|jsonl per the same flag.\n"
+        "  --diarization-min-segment-ms N    drop diarization segments shorter than N ms\n"
+        "                                    before attributing transcripts (default 200).\n"
+        "  --diarization-pad-segment-ms N    pad each diarization segment by N ms on each\n"
+        "                                    side before slicing audio for ASR (default 0).\n"
         "\n"
         "  --bench              benchmark mode: run the inference path multiple times\n"
         "                       with warmup, print aggregated stats + RTF.\n"
@@ -438,6 +456,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             int seg_count = 0;
             const auto t_stream_start = std::chrono::steady_clock::now();
             auto on_seg = [&](const StreamingDiarizationSegment & s) {
+                if (s.speaker_id < 0) return;
                 ++seg_count;
                 if (emit_fmt == "jsonl") {
                     std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f,"
@@ -897,7 +916,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     return 0;
 }
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result) {
     using clock = std::chrono::steady_clock;
@@ -907,6 +926,18 @@ int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result) {
     if (int rc = load_from_gguf(opts.model_gguf_path, model, opts.n_threads,
                                 opts.n_gpu_layers, opts.verbose); rc != 0) {
         return rc;
+    }
+    if (model.model_type != ParakeetModelType::CTC) {
+        std::fprintf(stderr,
+            "qvac_parakeet::ctc::transcribe_wav: %s is a %s GGUF; this entry point\n"
+            "    only handles CTC. Use qvac_parakeet::ctc::Engine (see\n"
+            "    <qvac-parakeet/ctc/engine.h>) which auto-dispatches to TDT decode\n"
+            "    for parakeet-tdt-* GGUFs and to Sortformer diarize() for\n"
+            "    diar_sortformer_* GGUFs.\n",
+            opts.model_gguf_path.c_str(),
+            model.model_type == ParakeetModelType::TDT ? "TDT"
+                                                       : "Sortformer");
+        return 11;
     }
 
     std::vector<float> samples;

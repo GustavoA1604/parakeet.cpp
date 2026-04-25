@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 namespace {
 

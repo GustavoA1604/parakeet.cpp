@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 struct SortformerTransformerRuntimeBlock {
     std::vector<float> attn_q_w, attn_q_b;

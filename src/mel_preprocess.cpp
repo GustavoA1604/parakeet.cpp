@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 int load_wav_mono_f32(const std::string & wav_path,
                       std::vector<float>   & out_samples,

@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 struct TdtRuntimeLstmLayer {
     std::vector<float> w_ih;

@@ -182,6 +182,7 @@ int main(int argc, char ** argv) {
         sopts.min_segment_ms = 200;
         diar_sess = engine.diarize_start(sopts,
             [&](const qvac_parakeet::ctc::StreamingDiarizationSegment & s) {
+                if (s.speaker_id < 0) return;
                 std::printf("[%.2f-%.2f] speaker_%d (chunk %d%s)\n",
                             s.start_s, s.end_s, s.speaker_id, s.chunk_index,
                             s.is_final ? ", final" : "");

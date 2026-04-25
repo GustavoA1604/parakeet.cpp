@@ -17,11 +17,21 @@
 #include <utility>
 #include <vector>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 namespace {
 
-constexpr int ENCODER_FRAME_STRIDE_MS = 80;
+// Encoder frame stride in milliseconds, derived from the GGUF's mel hop
+// length, encoder subsampling factor and sample rate. All shipped models
+// happen to land at 80 ms (16 kHz x hop=160 x sub=8) but new GGUFs may
+// differ -- e.g. a 24 kHz checkpoint or a 4x subsampling variant.
+inline double encoder_frame_stride_ms(const ParakeetCtcModel & model) {
+    const int hop = model.mel_cfg.hop_length;
+    const int sub = model.encoder_cfg.subsampling_factor > 0
+                  ? model.encoder_cfg.subsampling_factor : 8;
+    const int sr  = model.mel_cfg.sample_rate > 0 ? model.mel_cfg.sample_rate : 16000;
+    return 1000.0 * (double) (hop * sub) / (double) sr;
+}
 
 double ms_since(std::chrono::steady_clock::time_point a) {
     using namespace std::chrono;
@@ -53,7 +63,7 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
                                   opts.n_gpu_layers,
                                   opts.verbose);
     if (rc != 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine: failed to load GGUF '" +
+        throw std::runtime_error("qvac_parakeet::Engine: failed to load GGUF '" +
                                  opts.model_gguf_path +
                                  "' (rc=" + std::to_string(rc) + ")");
     }
@@ -107,7 +117,7 @@ EngineResult Engine::transcribe(const std::string & wav_path) {
     std::vector<float> samples;
     int sr = 0;
     if (int rc = load_wav_mono_f32(wav_path, samples, sr); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe: failed to load wav '" +
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe: failed to load wav '" +
                                  wav_path + "' (rc=" + std::to_string(rc) + ")");
     }
     return transcribe_samples(samples.data(), (int) samples.size(), sr);
@@ -115,16 +125,16 @@ EngineResult Engine::transcribe(const std::string & wav_path) {
 
 EngineResult Engine::transcribe_samples(const float * samples, int n_samples, int sample_rate) {
     if (!samples || n_samples <= 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples: empty input");
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: empty input");
     }
     if (sample_rate != pimpl_->model.mel_cfg.sample_rate) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples: input is " +
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: input is " +
                                  std::to_string(sample_rate) + " Hz but model expects " +
                                  std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
     }
     if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
         throw std::runtime_error(
-            "qvac_parakeet::ctc::Engine::transcribe_samples: loaded GGUF is a Sortformer "
+            "qvac_parakeet::Engine::transcribe_samples: loaded GGUF is a Sortformer "
             "diarization model; use Engine::diarize() instead. The diarize() forward pass "
             "lands in Phase 11.4 (PROGRESS.md).");
     }
@@ -139,7 +149,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     int n_mel_frames = 0;
     if (int rc = compute_log_mel(samples, n_samples, pimpl_->model.mel_cfg,
                                  mel, n_mel_frames); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples: compute_log_mel failed (rc=" +
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double preprocess_ms = ms_since(t_mel);
@@ -148,7 +158,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     EncoderOutputs enc_out;
     if (int rc = run_encoder(pimpl_->model, mel.data(), n_mel_frames,
                              pimpl_->model.mel_cfg.n_mels, enc_out); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples: run_encoder failed (rc=" +
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double encoder_ms = ms_since(t_enc);
@@ -163,7 +173,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
                                        enc_out.encoder_out.data(),
                                        enc_out.n_enc_frames, enc_out.d_model,
                                        dopts, dres); rc != 0) {
-            throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples: tdt_greedy_decode failed (rc=" +
+            throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: tdt_greedy_decode failed (rc=" +
                                      std::to_string(rc) + ")");
         }
         ids  = std::move(dres.token_ids);
@@ -195,7 +205,7 @@ EngineResult Engine::transcribe_stream(const std::string & wav_path,
     std::vector<float> samples;
     int sr = 0;
     if (int rc = load_wav_mono_f32(wav_path, samples, sr); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_stream: failed to load wav '" +
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_stream: failed to load wav '" +
                                  wav_path + "' (rc=" + std::to_string(rc) + ")");
     }
     return transcribe_samples_stream(samples.data(), (int) samples.size(), sr,
@@ -208,19 +218,19 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
                                                const StreamingOptions & opts,
                                                StreamingCallback on_segment) {
     if (!samples || n_samples <= 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: empty input");
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: empty input");
     }
     if (sample_rate != pimpl_->model.mel_cfg.sample_rate) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: input is " +
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: input is " +
                                  std::to_string(sample_rate) + " Hz but model expects " +
                                  std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
     }
     if (opts.sample_rate != 0 && opts.sample_rate != sample_rate) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: "
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
                                  "StreamingOptions.sample_rate must match the input sample_rate");
     }
     if (opts.chunk_ms <= 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: "
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
                                  "StreamingOptions.chunk_ms must be > 0");
     }
     if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
@@ -239,7 +249,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     int n_mel_frames = 0;
     if (int rc = compute_log_mel(samples, n_samples, pimpl_->model.mel_cfg,
                                  mel, n_mel_frames); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: compute_log_mel failed (rc=" +
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double preprocess_ms = ms_since(t_mel);
@@ -248,7 +258,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     EncoderOutputs enc_out;
     if (int rc = run_encoder(pimpl_->model, mel.data(), n_mel_frames,
                              pimpl_->model.mel_cfg.n_mels, enc_out); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: run_encoder failed (rc=" +
+        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double encoder_ms = ms_since(t_enc);
@@ -257,7 +267,8 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     const int vocab = pimpl_->model.vocab_size;
     const int blank = pimpl_->model.blank_id;
 
-    int frames_per_window = opts.chunk_ms / ENCODER_FRAME_STRIDE_MS;
+    const double frame_stride_ms = encoder_frame_stride_ms(pimpl_->model);
+    int frames_per_window = (int) std::floor(opts.chunk_ms / frame_stride_ms);
     if (frames_per_window < 1) frames_per_window = 1;
 
     EngineResult result;
@@ -297,7 +308,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
                                            win_enc, end - start, enc_out.d_model,
                                            dopts, tdt_state, win_tokens, steps);
                 rc != 0) {
-                throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: "
+                throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
                                          "tdt_decode_window failed (rc=" + std::to_string(rc) + ")");
             }
         } else {
@@ -318,8 +329,8 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
             StreamingSegment seg;
             seg.text        = win_text;
             seg.token_ids   = win_tokens;
-            seg.start_s     = static_cast<double>(start) * ENCODER_FRAME_STRIDE_MS / 1000.0;
-            seg.end_s       = static_cast<double>(end)   * ENCODER_FRAME_STRIDE_MS / 1000.0;
+            seg.start_s     = static_cast<double>(start) * frame_stride_ms / 1000.0;
+            seg.end_s       = static_cast<double>(end)   * frame_stride_ms / 1000.0;
             seg.chunk_index = chunk_index;
             seg.is_final    = true;
             seg.encoder_ms  = first_segment ? encoder_ms : 0.0;
@@ -371,9 +382,13 @@ static DiarizationResult engine_impl_diarize_helper(Engine::Impl & impl,
 
     std::vector<float> work(samples, samples + n_samples);
     float peak = 0.0f;
-    for (float v : work) if (v > peak) peak = v;
-    if (peak > 0.0f) {
-        const float inv = 1.0f / (peak + 1e-8f);
+    for (float v : work) {
+        const float a = std::fabs(v);
+        if (a > peak) peak = a;
+    }
+    constexpr float NORM_FLOOR = 1e-3f;
+    if (peak > NORM_FLOOR) {
+        const float inv = 1.0f / peak;
         for (float & v : work) v *= inv;
     }
 
@@ -592,7 +607,8 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
 
     const int T_enc = enc_out.n_enc_frames;
     const int sr    = opts.sample_rate;
-    const int frame_samples = sr * ENCODER_FRAME_STRIDE_MS / 1000;
+    const double frame_stride_ms = encoder_frame_stride_ms(engine_impl->model);
+    const int frame_samples = (int) std::round(sr * frame_stride_ms / 1000.0);
 
     int left_drop_frames     = center_start_sample / frame_samples;
     int center_frame_count   = (center_end_sample - center_start_sample) / frame_samples;
@@ -955,11 +971,17 @@ void SortformerStreamSession::finalize() {
         pimpl_->process_chunk(window_start, window_end,
                               pimpl_->emitted_samples, available_end,
                               /*is_final_chunk=*/true);
-    } else if (!pimpl_->cancelled && pimpl_->on_segment) {
-        for (auto seg : pimpl_->last_pending) {
-            seg.is_final = true;
-            pimpl_->on_segment(seg);
-        }
+        return;
+    }
+
+    if (!pimpl_->cancelled && pimpl_->on_segment) {
+        StreamingDiarizationSegment terminator;
+        terminator.speaker_id  = -1;
+        terminator.start_s     = (double) pimpl_->emitted_samples / pimpl_->opts.sample_rate;
+        terminator.end_s       = terminator.start_s;
+        terminator.chunk_index = pimpl_->chunk_index;
+        terminator.is_final    = true;
+        pimpl_->on_segment(terminator);
     }
 }
 

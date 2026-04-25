@@ -87,16 +87,21 @@ int run_basic(const std::string & gguf_path, const std::string & wav_path) {
                      s.start_s, s.end_s, s.speaker_id);
     }
 
-    int n_callbacks = 0;
-    int n_finals    = 0;
-    double max_end  = 0.0;
-    int max_chunk_index = -1;
+    int n_real_callbacks = 0;
+    int n_terminators    = 0;
+    int n_finals         = 0;
+    double max_end       = 0.0;
+    int max_chunk_index  = -1;
     std::vector<StreamingDiarizationSegment> all;
 
     auto on_seg = [&](const StreamingDiarizationSegment & s) {
-        ++n_callbacks;
+        if (s.speaker_id < 0) {
+            ++n_terminators;
+        } else {
+            ++n_real_callbacks;
+            if (s.end_s > max_end) max_end = s.end_s;
+        }
         if (s.is_final) ++n_finals;
-        if (s.end_s > max_end) max_end = s.end_s;
         if (s.chunk_index > max_chunk_index) max_chunk_index = s.chunk_index;
         all.push_back(s);
     };
@@ -121,16 +126,35 @@ int run_basic(const std::string & gguf_path, const std::string & wav_path) {
     session->finalize();
 
     std::fprintf(stderr,
-        "[sf-stream-test] streaming callbacks=%d final_flags=%d max_end=%.3fs chunks=%d\n",
-        n_callbacks, n_finals, max_end, max_chunk_index + 1);
+        "[sf-stream-test] streaming real=%d terminators=%d final_flags=%d max_end=%.3fs chunks=%d\n",
+        n_real_callbacks, n_terminators, n_finals, max_end, max_chunk_index + 1);
 
-    if (n_callbacks == 0) {
-        std::fprintf(stderr, "[sf-stream-test] FAIL: no segments emitted\n");
+    if (n_real_callbacks == 0) {
+        std::fprintf(stderr, "[sf-stream-test] FAIL: no real segments emitted\n");
         return 3;
     }
-    if (n_finals == 0) {
-        std::fprintf(stderr, "[sf-stream-test] FAIL: no is_final segment after finalize()\n");
+    if (n_finals != 1) {
+        std::fprintf(stderr,
+            "[sf-stream-test] FAIL: expected exactly one is_final callback, got %d\n",
+            n_finals);
         return 4;
+    }
+    {
+        int dup = 0;
+        for (size_t i = 1; i < all.size(); ++i) {
+            const auto & a = all[i - 1];
+            const auto & b = all[i];
+            if (a.speaker_id == b.speaker_id &&
+                std::abs(a.start_s - b.start_s) < 1e-6 &&
+                std::abs(a.end_s   - b.end_s)   < 1e-6) {
+                ++dup;
+            }
+        }
+        if (dup > 0) {
+            std::fprintf(stderr,
+                "[sf-stream-test] FAIL: %d duplicate segment(s) detected\n", dup);
+            return 7;
+        }
     }
     const double audio_s = (double) samples.size() / sr;
     if (max_end > audio_s + 0.5) {
@@ -160,17 +184,33 @@ int run_basic(const std::string & gguf_path, const std::string & wav_path) {
 int main(int argc, char ** argv) {
     std::string gguf = "models/sortformer-4spk-v1.f16.gguf";
     std::string wav  = "test/samples/two-speakers-16k.wav";
+    bool gguf_user = false;
+    bool wav_user  = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--model" && i + 1 < argc) gguf = argv[++i];
-        else if (a == "--wav" && i + 1 < argc) wav = argv[++i];
+        if      (a == "--model" && i + 1 < argc) { gguf = argv[++i]; gguf_user = true; }
+        else if (a == "--wav"   && i + 1 < argc) { wav  = argv[++i]; wav_user  = true; }
+        else {
+            std::fprintf(stderr, "unknown option: %s\n", a.c_str());
+            return 2;
+        }
     }
-    if (!file_exists(gguf)) {
-        std::fprintf(stderr, "[sf-stream-test] SKIP: model not found at %s\n", gguf.c_str());
-        return 0;
+    const bool model_missing = !file_exists(gguf);
+    const bool wav_missing   = !file_exists(wav);
+
+    if ((gguf_user && model_missing) || (wav_user && wav_missing)) {
+        std::fprintf(stderr,
+            "[sf-stream-test] FAIL: explicit input missing (model=%s%s wav=%s%s)\n",
+            gguf.c_str(), model_missing ? " (missing)" : "",
+            wav.c_str(),  wav_missing   ? " (missing)" : "");
+        return 8;
     }
-    if (!file_exists(wav)) {
-        std::fprintf(stderr, "[sf-stream-test] SKIP: wav not found at %s\n", wav.c_str());
+    if (model_missing || wav_missing) {
+        std::fprintf(stderr,
+            "[sf-stream-test] SKIP: default fixture not present (model=%s%s wav=%s%s).\n"
+            "                Set --model and --wav to exercise the streaming path in CI.\n",
+            gguf.c_str(), model_missing ? " (missing)" : "",
+            wav.c_str(),  wav_missing   ? " (missing)" : "");
         return 0;
     }
     try {

@@ -2,23 +2,28 @@
 
 // Top-level QVAC Parakeet library entry points.
 //
-// The library currently ships the Parakeet-CTC English pipeline.  Additional
-// engines (TDT multilingual, Sortformer diarization, EOU streaming) will land
-// under the same umbrella and should prefer headers under <qvac-parakeet/...>
-// for the generic API and <qvac-parakeet/<engine>/...> for engine-specific
-// details.
+// The library ships four engine families behind a single `Engine` umbrella
+// in <qvac-parakeet/ctc/engine.h> (the header path is historical -- the
+// Engine accepts CTC, TDT and Sortformer GGUFs alike and auto-detects the
+// model type at load time):
 //
-// Two layers of API are exposed today:
+//   - Parakeet-CTC 0.6B / 1.1B  -- English transcription
+//   - Parakeet-TDT 0.6B-v3 / 1.1B -- multilingual transcription with
+//     punctuation and capitalisation, RNN-T (LSTM prediction + joint MLP)
+//   - Sortformer 4spk v1 / v2 -- 4-speaker diarization (offline; v2 also
+//     has Phase 11.11.1 sliding-history live streaming)
+//   - Combined ASR + Sortformer "who said what" via the free function
+//     `transcribe_with_speakers(...)`
 //
-//   1. High-level wav -> text via the CLI dispatcher.  The current
-//      implementation wraps the CLI's argv path; a proper struct-based
-//      public API will land as the code is split out of src/main.cpp.
-//      Until then, callers building against the library can invoke
-//      `qvac_parakeet_cli_main(argc, argv)` with the same flags accepted by
-//      the `qvac-parakeet` executable.
+// Three layers of API:
 //
-//   2. Lower-level per-engine APIs, e.g. the Parakeet-CTC pipeline in
-//      <qvac-parakeet/ctc/pipeline.h>.
+//   1. CLI dispatcher: `qvac_parakeet_cli_main(argc, argv)` -- same flags
+//      as the `qvac-parakeet` binary.
+//   2. Persistent `Engine` (load model once, run many): see
+//      <qvac-parakeet/ctc/engine.h>.
+//   3. One-shot wav->text helper for CTC GGUFs only:
+//      <qvac-parakeet/ctc/pipeline.h> (TDT and Sortformer GGUFs throw
+//      from this entry point; use `Engine` for those).
 
 #ifdef __cplusplus
 extern "C" {

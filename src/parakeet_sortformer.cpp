@@ -9,7 +9,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace qvac_parakeet::ctc {
+namespace qvac_parakeet {
 
 namespace {
 
