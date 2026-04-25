@@ -94,9 +94,19 @@ def ensure_ckpt(path: Path, hf_repo: str) -> Path:
     return path
 
 
+def _get_member(t: tarfile.TarFile, name: str) -> tarfile.TarInfo:
+    # NeMo ships some checkpoints with `./` prefix on members, others without.
+    for candidate in ("./" + name, name):
+        try:
+            return t.getmember(candidate)
+        except KeyError:
+            continue
+    raise KeyError(name)
+
+
 def load_nemo(ckpt: Path):
     with tarfile.open(ckpt, "r") as t:
-        cfg_m = t.getmember("./model_config.yaml")
+        cfg_m = _get_member(t, "model_config.yaml")
         cfg   = yaml.safe_load(t.extractfile(cfg_m).read().decode())
 
         tok_bytes = b""
@@ -110,7 +120,7 @@ def load_nemo(ckpt: Path):
             else:
                 raise RuntimeError(f"tokenizer.model ({tok_fname}) not found in {ckpt}")
 
-        w_m = t.getmember("./model_weights.ckpt")
+        w_m = _get_member(t, "model_weights.ckpt")
         buf = io.BytesIO(t.extractfile(w_m).read())
 
     sd = torch.load(buf, map_location="cpu", weights_only=True)
