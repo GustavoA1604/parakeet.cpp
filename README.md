@@ -223,7 +223,7 @@ the theoretical floor.
 | `q5_0`    | 453 MiB   | 1475 ms (slower)      | ~650 ms               | bit-equal        |
 | `q4_0`    | 372 MiB   | 1080 ms               | 595 ms                | bit-equal        |
 
-Measurements on an Apple M3 Ultra, 10 ggml-cpu threads, OpenMP,
+Measurements on an Apple M4 Air, 10 ggml-cpu threads, OpenMP,
 `--bench-warmup 5 --bench-runs 15`. Transcripts on both clips are
 bit-equal to NeMo PyTorch reference at every tier tested, including
 `q4_0`.
@@ -357,7 +357,7 @@ Flags:
 - `--emit jsonl` — one `{"chunk","start","end","is_final","text"}` JSON
   object per line, for easy downstream consumption.
 
-Observed on an Apple M3 Ultra (Metal Q8_0) feeding a 5.5 minute speech
+Observed on an Apple M4 Air (Metal Q8_0) feeding a 5.5 minute speech
 clip (`LastQuestion_long_EN.raw`, 16 kHz s16le):
 
 ```
@@ -408,7 +408,7 @@ Mode 3 knobs (all in `StreamingOptions` on the C++ side,
 - `right_lookahead_ms` — future audio appended before emitting the
   chunk; most impactful accuracy knob.
 
-Measured on Apple M3 Ultra, Q8_0, Metal backend:
+Measured on Apple M4 Air, Q8_0, Metal backend:
 
 | Audio | Config (chunk / left / right ms) | WER vs offline | Wall time | First-seg latency |
 |-|-|-|-|-|
@@ -646,75 +646,50 @@ state for ~6x compute reduction on long-form Mode 3 audio) and Phase
 11.11.2 (NeMo-style spkcache + encoder graph split for fully stable
 Sortformer streaming speaker IDs).
 
-- `qvac-parakeet --model ... --wav ...` produces the expected
-  transcript end-to-end, matching NeMo PyTorch bit-equivalently on
-  `jfk.wav` and `sample-16k.wav` at every quant tier (f16 through
-  Q4_0) on both CPU and Metal backends.
-- Per-stage numerical parity is at the f16 quantization floor
-  (1–2e-3 rel vs NeMo PyTorch) on every intermediate encoder tensor.
-- **CPU Q8_0**: encoder runs 22x real-time on an M3 Ultra CPU.
-  Faster than ONNX f16 by 12 %, slower than ONNX int8 by 22 %.
-- **Metal Q8_0**: encoder runs **73x real-time** on the M3 Ultra
-  GPU. **2.5x faster than onnxruntime int8** with 21x tighter
+Headline highlights (per phase, one bullet each; PROGRESS.md `§N.x`
+has the full round-by-round journal):
+
+- **Parity (Phase 4)**: `qvac-parakeet --model ... --wav ...` produces
+  the expected transcript end-to-end, matching NeMo PyTorch
+  bit-equivalently on `jfk.wav` and `sample-16k.wav` at every quant
+  tier (f16 through Q4_0) on both CPU and Metal backends. Per-stage
+  numerical parity at the f16 quantization floor (~1-2e-3 rel vs NeMo
+  PyTorch) on every intermediate encoder tensor.
+- **CPU optimisation (Phase 5)**: encoder runs 22x real-time on an
+  M4 Air CPU at Q8_0 — 12 % faster than ONNX f16, 22 % slower than
+  ONNX int8.
+- **Metal (Phase 6)**: encoder runs 73x real-time on the M4 Air GPU
+  at Q8_0 — 2.5x faster than onnxruntime int8 with 21x tighter
   variance (0.83 ms stdev).
-- **Phase 7 — Mode 2 streaming output**: `Engine::transcribe_stream()`
-  walks CTC frames in `chunk_ms` windows and emits per-segment
-  callbacks, byte-equal to the offline transcript. `--stream` CLI
-  flag + `--pcm-in` raw input + `--emit text|jsonl`.
-- **Phase 8 — Mode 3 live duplex streaming (cache-aware inference)**:
-  `Engine::stream_start()` -> `StreamSession` with `feed_pcm_f32/i16` +
-  `finalize()`. Uses the **existing offline 600M GGUF** in a
-  chunking-with-context streaming pass, so no new model is needed. On a
-  5.5 min sci-fi clip, Mode 3 transcribes at ~4 % WER vs offline with
-  ~4 s first-segment latency at default settings. `--stream-duplex`
-  CLI + `--stream-left-context-ms` + `--stream-right-lookahead-ms`.
-- See PROGRESS.md for the round-by-round journal (§5.11–5.17 for
-  Rounds 5–8, §6.x for the Metal bring-up, §7.x for Mode 2 streaming,
-  §8.x for Mode 3 cache-aware streaming).
+- **Mode 2 streaming (Phase 7)**: `Engine::transcribe_stream()` runs
+  the offline encoder once, walks the encoder frames in `chunk_ms`
+  windows, emits per-segment callbacks. Byte-equal to non-streaming
+  on CTC; WER-bounded on TDT.
+- **Mode 3 live duplex (Phase 8)**: `Engine::stream_start()` ->
+  `StreamSession` push API. Cache-aware inference on the existing
+  offline GGUF (CTC or TDT); no new checkpoint needed. ~4 % WER on a
+  5.5 min sci-fi clip with ~4 s first-segment latency at defaults.
+- **Multi-model loader (Phase 9)**: same converter + same `Engine`
+  handle the 1.1B variants alongside the 0.6B baselines.
+- **TDT decoder (Phase 10)**: `nvidia/parakeet-tdt-0.6b-v3` and
+  `parakeet-tdt-1.1b` ported -- multilingual transcription with
+  punctuation + capitalisation. 2-layer LSTM prediction + joint MLP
+  + transducer greedy decode (CPU, f32 after dequant). Mode 1, 2 and
+  3 all support TDT GGUFs.
+- **Sortformer diarization (Phase 11)**: `diar_sortformer_4spk-v1`
+  and `diar_streaming_sortformer_4spk-v2` ported -- 4-speaker
+  diarization with rel 2.0e-4 vs NeMo on speaker probabilities.
+  `Engine::diarize()` API + CLI auto-routing. §11.10 ships
+  `transcribe_with_speakers` for combined ASR + speaker attribution.
+  §11.11.1 ships `Engine::diarize_start()` ->
+  `SortformerStreamSession` for live diarization (sliding-history v1;
+  Phase 11.11.2 NeMo-style spkcache streaming pending).
 
-- **Phase 10 — TDT (Token-and-Duration Transducer)**: multilingual
-  port of `nvidia/parakeet-tdt-0.6b-v3` — 2-layer LSTM prediction
-  net + joint MLP + transducer greedy decode running on CPU in f32
-  after dequantization. Byte-identical to NeMo on jfk.wav with
-  proper capitalization + punctuation; clean multilingual output on
-  es/fr/de/it/pt/ru samples. One-shot + Mode 2 + Mode 3 streaming
-  all work with TDT GGUFs (phase 10.5), including `live-mic` for
-  native microphone capture.
-- **Phase 11 — Sortformer (4-speaker diarization)**: port of
-  `nvidia/diar_sortformer_4spk-v1` — 18-layer FastConformer encoder
-  (reused) -> Linear projection (512 -> 192) -> 18-layer post-LN
-  Transformer encoder -> ReLU MLP -> sigmoid head producing per-frame
-  speaker probabilities. New `Engine::diarize()` API + CLI
-  auto-routing. Output: per-frame probabilities and threshold-based
-  segments {speaker, start, end}. Speaker probability parity is
-  rel 2.0e-4 vs NeMo reference.
-  - **§11.10 speaker-attributed transcription** ships:
-    `transcribe_with_speakers(sortformer_engine, asr_engine, ...)`
-    plus CLI `--diarization-model PATH`. Combines Sortformer
-    segments with CTC/TDT transcripts in one C++ binary. Same
-    pipeline as the qvac binding's `quickstart-diarized.js`, but
-    native.
-  - **§11.11.1 Sortformer live streaming (pragmatic v1)** ships:
-    `Engine::diarize_start()` -> `SortformerStreamSession` with
-    `feed_pcm_f32/i16` + `finalize()` push API. Sliding-history
-    implementation: each `chunk_ms` re-runs `diarize()` over the
-    trailing `history_ms` and emits segments overlapping the new
-    chunk. Auto-routed by the CLI when `--stream` is set on a
-    Sortformer model. The `live-mic` example also auto-detects
-    Sortformer GGUFs and switches to live diarization. Trade-off:
-    speaker IDs may shift in the very first chunks until history
-    fills; stable thereafter.
-  - **§11.11.0 Sortformer v2 offline support** ships:
-    `nvidia/diar_streaming_sortformer_4spk-v2` GGUF converts and
-    runs through the same offline `diarize()` path. Live duplex
-    API (chunked attention + spkcache + FIFO state machine) is the
-    next streaming-diarization workstream.
-
-Next: Phase 8.5 (true KV cache + conv state for ~6x compute reduction on
-long-form audio without accuracy change), Accelerate BLAS for the TDT
-decoder's LSTM + joint gemvs and Sortformer's transformer attention,
-`CONV_2D_DW` on Metal (upstream ggml contribution), Metal flash-attn,
-Sortformer v2 live streaming, EOU pipelines.
+Next: Phase 8.5 (true KV cache + conv state for ~6x compute reduction
+on long-form Mode 3 audio without accuracy change), Accelerate BLAS
+for the TDT decoder's LSTM + joint gemvs and Sortformer's transformer
+attention, `CONV_2D_DW` on Metal (upstream ggml contribution), Metal
+flash-attn, Phase 11.11.2 Sortformer streaming, EOU pipelines.
 
 ## Repository layout
 

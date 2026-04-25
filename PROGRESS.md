@@ -17,7 +17,9 @@ harness asserting rel error below a documented threshold.
   and reference-tensor compare.
 - Public headers under `include/qvac-parakeet/` expose
   `qvac_parakeet_cli_main`, `qvac_parakeet::ctc::Engine`, and the
-  one-shot `transcribe_wav` API.
+  one-shot `transcribe_wav` API. _(Post-v0.1.0-pre audit, the public
+  namespace is the flat `qvac_parakeet`; `qvac_parakeet::ctc::` is a
+  backward-compat alias.)_
 - CLI + library + test harnesses build green on macOS (arm64).
 
 ## Phase 1 — converter + GGUF round-trip  _(done)_
@@ -196,7 +198,7 @@ Bit-equal to the NeMo reference transcript.  RTF ≈ 0.10 on Apple
 Silicon CPU (11 s of audio transcribed in 1.05 s, ~10× faster than
 real-time) on a single-core unoptimized build.
 
-## Phase 5 — CPU optimization pass  _(in progress)_
+## Phase 5 — CPU optimization pass  _(done; further headroom tracked in §5.18 future work)_
 
 ### 5.0 — built-in benchmark harness  _(done)_
 
@@ -210,8 +212,11 @@ stats) without shelling out to `time`.
                                   (default 2, absorbs the cold-cache +
                                   first-graph-allocator outlier)
 - `--bench-json PATH`             dump structured JSON for comparing
-                                  across runs or backends (ggml-cpu
-                                  today, ggml-metal / onnxruntime later)
+                                  across runs or backends (ggml-cpu,
+                                  ggml-metal, and onnxruntime are all
+                                  in scope; onnxruntime numbers come
+                                  from the qvac-lib-infer-parakeet
+                                  Node binding's bench harness)
 
 Per-stage stats include mean / median / min / max / stdev for mel,
 encoder, decode, and total inference; the summary line highlights
@@ -221,7 +226,7 @@ visible warning so we don't silently chase variance.
 
 ### 5.1 — baseline (pre-optimization)
 
-Machine: Apple M3 Ultra, macOS, single-core unoptimized Release build.
+Machine: Apple M4 Air, macOS, single-core unoptimized Release build.
 Model: `parakeet-ctc-0.6b.gguf` at f16 (1.16 GiB).  Threads: default
 (`std::thread::hardware_concurrency()` via ggml-cpu).  Audio:
 `test/samples/jfk.wav` — 11.00 s, 176 000 samples @ 16 kHz.
@@ -244,7 +249,7 @@ model load         = 449 ms   (one-time, excluded from RTF)
   enough to catch ≥ 2% improvements without heroics.
 
 JSON reference snapshot archived at
-`artifacts/bench/ggml-cpu-baseline-m3ultra.json`.
+`artifacts/bench/ggml-cpu-baseline-m4air.json`.
 
 ### 5.2 — round 1: thread default + release flags + gallocr cache  _(done)_
 
@@ -252,7 +257,7 @@ Three non-timing-sensitive wins landed together:
 
   1. **CLI default thread count = `std::thread::hardware_concurrency()`**
      (was 4 via ggml-cpu's internal default).  `--threads N` still
-     overrides.  On a 10-core M3 Ultra that's 10 threads by default.
+     overrides.  On a 10-core M4 Air that's 10 threads by default.
      Worth ~10-12% on the encoder path in isolated measurements.
   2. **`-O3 -ffast-math -funroll-loops`** on `libqvac-parakeet` in
      Release builds (via `CMakeLists.txt` generator expressions;
@@ -269,7 +274,7 @@ Three non-timing-sensitive wins landed together:
      first call and reused as long as `n_mel_frames` is stable
      (re-created on shape change).
 
-Post-opt numbers on an otherwise-quiet M3 Ultra (`jfk.wav`, 11 s audio,
+Post-opt numbers on an otherwise-quiet M4 Air (`jfk.wav`, 11 s audio,
 `--bench-warmup 2 --bench-runs 5`):
 
 ```
@@ -281,7 +286,7 @@ inference  ms     945.94  948.97  862.88 1062.29   82.94   (was 1056.77)
 RTF (median/best) = 0.086 / 0.078   (was 0.096 / 0.095)
 ```
 
-`artifacts/bench/ggml-cpu-round1-m3ultra.json` snapshot archived.
+`artifacts/bench/ggml-cpu-round1-m4air.json` snapshot archived.
 Mel's 2.3× speedup is clean and reproducible.  Encoder variance is
 higher than the baseline (std 83 ms vs 10 ms) — that's a
 benchmark-noise effect from system contention, not a regression; in
@@ -293,7 +298,7 @@ Two changes shipped together:
 
   1. **OpenMP on ggml-cpu.**  `brew install libomp` (one-time) then
      `-DGGML_OPENMP=ON` at configure time.  CMake auto-links it via
-     the existing `find_package(OpenMP)` block.  On a quiet M3 Ultra,
+     the existing `find_package(OpenMP)` block.  On a quiet M4 Air,
      with CPU-only backend, measured ~4% encoder speedup (median
      803 ms → 768 ms) and 42% tighter stdev (88 ms → 50 ms).  Worth
      taking for the variance reduction alone.
@@ -372,8 +377,8 @@ signal for "what the code achieves when nothing else is running";
 **median** is what a user typically observes.  `--bench` output
 reports both and warns when stdev > 20% of mean.
 
-Snapshots: `artifacts/bench/ggml-cpu-baseline-m3ultra.json`,
-`ggml-cpu-round1-m3ultra.json`, `ggml-cpu-round2-m3ultra.json`.
+Snapshots: `artifacts/bench/ggml-cpu-baseline-m4air.json`,
+`ggml-cpu-round1-m4air.json`, `ggml-cpu-round2-m4air.json`.
 
 ### 5.7 — sub-stage profiler + attribution  _(done)_
 
@@ -394,7 +399,7 @@ off the same model load:
      fixed-shape random input at `T_enc` and times each.  Also
      times the full block for consistency check.
 
-Output on `jfk.wav` (11 s, M3 Ultra, 5 timed + 2 warmup):
+Output on `jfk.wav` (11 s, M4 Air, 5 timed + 2 warmup):
 
 ```
 [profile] mel preprocess                  4.83 ms  ( 0.6% of total)
@@ -484,6 +489,9 @@ ms.  FFN + Conv are a close 3-way tie around 20% each.
 Cumulative: **40% reduction in encoder best-case** (1032 → 627 ms).
 RTF best 0.058 = **17.4× real-time** on CPU alone.
 
+_(§5.10 was an internal exploration that did not produce a shipping
+change; numbering jumps from 5.9 to 5.11 deliberately.)_
+
 ### 5.11 — round 5: attention optimisation attempts  _(investigated, shipped as dormant infrastructure)_
 
 Two attention-path experiments, both motivated by PROGRESS 5.8's
@@ -504,7 +512,7 @@ the Round 4 conv rewrite).
    (used directly as mul_mat src0) and for q_perm (materialised by the
    downstream add with pos_bias_u/v).
 
-**Result on M3 Ultra, CPU-only.**  Neither change produced a reliable
+**Result on M4 Air, CPU-only.**  Neither change produced a reliable
 win above the ~15% bench-to-bench stdev, and some configurations
 regressed.
 
@@ -530,7 +538,7 @@ Root causes (measured):
    norm_out         0.04 ms  ( 0%)
 ```
 
-Attention is no longer dominant on M3 Ultra — the conv module's
+Attention is no longer dominant on M4 Air — the conv module's
 `ggml_conv_1d_dw` (im2col+matmul) path and `pw1`/`pw2` matmuls are now
 the single biggest slice.  FFN remains the largest aggregate (43%)
 and is the right target for Round 6 (block quantization).
@@ -553,7 +561,7 @@ encoder    ms    1316.70 1245.81  1193.73  1559.76   140.71
 RTF (median/best) = 0.063 / 0.060
 ```
 
-Snapshot: `artifacts/bench/ggml-cpu-round5-m3ultra.json`.
+Snapshot: `artifacts/bench/ggml-cpu-round5-m4air.json`.
 
 ### 5.12 — round 6: block-quantized weights  _(done — biggest CPU win so far)_
 
@@ -591,7 +599,7 @@ Q4_0**.  Per-stage rel error grows as expected: f16 ~1.6e-3 → Q8_0
 ~5.5e-3 → Q4_0 ~3.3e-2.  Rel drift does NOT translate into token
 drift on clean speech in these tests.
 
-Bench results on M3 Ultra, 10 ggml-cpu threads, `--bench-warmup 3
+Bench results on M4 Air, 10 ggml-cpu threads, `--bench-warmup 3
 --bench-runs 10`:
 
 | variant | file    | enc best (20 s) | enc median (20 s) | enc best (11 s) | enc median (11 s) |
@@ -622,9 +630,9 @@ from 317 ms gap to ~55 ms (**83 % of the remaining gap closed with
 Round 6 alone**).
 
 Snapshots:
-  - `artifacts/bench/ggml-cpu-round6-q8_0-m3ultra.json`
-  - `artifacts/bench/ggml-cpu-round6-q5_0-m3ultra.json`
-  - `artifacts/bench/ggml-cpu-round6-q4_0-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round6-q8_0-m4air.json`
+  - `artifacts/bench/ggml-cpu-round6-q5_0-m4air.json`
+  - `artifacts/bench/ggml-cpu-round6-q4_0-m4air.json`
 
 ### 5.13 — round 7: flash_attn_ext experiment  _(investigated, not shipped)_
 
@@ -649,7 +657,7 @@ Parity: all 9 `test-encoder` gates pass.  `block_last` rel drifts from
 1.9e-3 → 4.2e-3 (f16 mask cast adds one quantization step), still
 under the 5e-3 threshold.
 
-**Bench result on M3 Ultra, ggml-cpu Q8_0, 3x(warmup 3 + runs 10):**
+**Bench result on M4 Air, ggml-cpu Q8_0, 3x(warmup 3 + runs 10):**
 
 | clip           | non-flash best | flash best | non-flash median | flash median |
 |----------------|---------------:|-----------:|-----------------:|-------------:|
@@ -693,7 +701,7 @@ Implementation:
 Parity: all 9 `test-encoder` stages pass.  block_last rel is
 essentially unchanged (1.73e-3 vs 1.60e-3 previously).
 
-**Bench on M3 Ultra, Q8_0, 15 timed runs, 5 warmup:**
+**Bench on M4 Air, Q8_0, 15 timed runs, 5 warmup:**
 
 | clip                   | enc best before | enc best after | delta | enc median before | enc median after |
 |------------------------|----------------:|---------------:|------:|------------------:|-----------------:|
@@ -711,7 +719,7 @@ best 839 ms vs ONNX 944 ms — **ggml-cpu is now 12 % faster than
 ONNX on best-case encoder**. Round 4's 317 ms gap is entirely
 closed.
 
-Snapshots: `artifacts/bench/ggml-cpu-round8a-q8_0-m3ultra.json`.
+Snapshots: `artifacts/bench/ggml-cpu-round8a-q8_0-m4air.json`.
 
 ### 5.15 — round 8b: subsampling mask fast-path  _(done — neutral)_
 
@@ -818,17 +826,17 @@ Model load: 179 ms vs ONNX int8's 2054 ms.
 
 Snapshots:
 
-  - `artifacts/bench/ggml-cpu-round5-m3ultra.json`
-  - `artifacts/bench/ggml-cpu-round6-{q8_0,q5_0,q4_0}-m3ultra.json`
-  - `artifacts/bench/ggml-cpu-round8a-q8_0-m3ultra.json`
-  - `artifacts/bench/ggml-cpu-round8-q8_0-m3ultra.json`
-  - `artifacts/bench/ggml-cpu-round8-q8_0-jfk-m3ultra.json`
-  - `artifacts/bench/ggml-cpu-round8-f16-m3ultra.json`
+  - `artifacts/bench/ggml-cpu-round5-m4air.json`
+  - `artifacts/bench/ggml-cpu-round6-{q8_0,q5_0,q4_0}-m4air.json`
+  - `artifacts/bench/ggml-cpu-round8a-q8_0-m4air.json`
+  - `artifacts/bench/ggml-cpu-round8-q8_0-m4air.json`
+  - `artifacts/bench/ggml-cpu-round8-q8_0-jfk-m4air.json`
+  - `artifacts/bench/ggml-cpu-round8-f16-m4air.json`
 
 ## Phase 6 — Metal backend  _(done, experimental)_
 
 Bring-up of the `ggml_backend_metal` path for GPU offload on Apple
-Silicon.  End-to-end on the M3 Ultra GPU (48-core):
+Silicon.  End-to-end on the M4 Air GPU:
 
 ### 6.1 — wire-up
 
@@ -933,31 +941,35 @@ shrink the model file and the unified-memory footprint.
 
 ---
 
-### 5.18 — still planned (CPU-only work)
+### 5.18 — Phase 5 follow-up: future CPU-only headroom
 
-Phase 5 (CPU optimization) is effectively complete: Round 8 Q8_0 is
-11 % faster than `onnxruntime` on the 20 s clip.  Remaining candidate
-work is now outside the CPU-only scope:
+Phase 5 (CPU optimization) is closed: Round 8 Q8_0 is 11 % faster than
+`onnxruntime` on the 20 s clip and ships as the default. The items
+below are remaining CPU-side ideas that did not make it into Phase 5
+itself; they're tracked here so a future "Phase 5.x CPU follow-up"
+sweep has a starting list. (Phase 6 ships the Metal backend +
+`ggml_backend_sched` work referenced in the first bullet, so that bullet
+is historical context.)
 
   - **Metal backend + `ggml_backend_sched` for GPU offload.**  The
     backend-buffer rework from Round 2 and the cached encoder graph
-    from Round 3 are what the sched will need to plumb through.
+    from Round 3 are what the sched plumbed through. (Shipped in
+    Phase 6; left here for cross-reference.)
     flash_attn_ext (dormant behind `PARAKEET_EXPERIMENTAL_FLASH_ATTN`
-    from Round 7) will almost certainly be a win on GPU where the
+    from Round 7) is almost certainly a win on GPU where the
     softmax + V-multiply fuse into one kernel pass.
   - **K-quant tiers (Q4_K_M, Q5_K_M, Q6_K).**  ggml-cpu has k-quant
     kernels too; these might extend the quality-vs-size curve beyond
     the block-quant tiers shipped in Round 6.  Would need a sweep
     against parity.
   - **Bucketed encoder graph cache.**  Round 8c landed an exact-shape
-    LRU cache (up to 3 entries). A bucketed variant — round up to the
-    next multiple of 64 or 128 mel frames — would avoid rebuilds for
-    variable-length production streams, at the cost of padding the
+    LRU cache (up to 3 entries) which proved sufficient for the Phase 8
+    cache-aware streaming workload (every chunk is a fresh encoder call,
+    but the shape set is small enough that the LRU rarely misses). A
+    bucketed variant — round up to the next multiple of 64 or 128 mel
+    frames — would avoid rebuilds for variable-length production streams
+    where chunk shapes vary chunk-to-chunk, at the cost of padding the
     mel input and masking out the tail via the `all_valid=false` path.
-    Becomes a prerequisite for Phase 8 (cache-aware streaming) where
-    every chunk is a fresh encoder call.
-  - TDT / EOU / Sortformer pipelines (new architectures, not a
-    CPU-opt task).
 
 ## Phase 7 — streaming entry points (Mode 2)  _(done)_
 
@@ -1030,7 +1042,7 @@ the full concatenated `EngineResult` so callers that want *both* the
 streaming callback *and* a final aggregate don't have to rebuild it
 themselves.
 
-### 7.4 — Mode 3 API freeze (errored)
+### 7.4 — Mode 3 API freeze (errored) _(superseded by §8.2)_
 
 `StreamSession` declares `feed_pcm_f32(const float*, int)`,
 `feed_pcm_i16(const int16_t*, int)`, `finalize()`, `cancel()`,
@@ -1047,6 +1059,12 @@ suggesting `transcribe_stream()` for full-audio cases. The
 `StreamSession` shape immediately; when Phase 8 lands the error
 branch is swapped for the real state machine without touching the
 public header.
+
+**Update**: §8.2 removed this gate entirely. `stream_start()` now
+runs cache-aware streaming inference directly on the existing offline
+GGUF and never throws on `supports_streaming`. The `(errored)` marker
+above is historical context for how the API was first frozen, not
+current behaviour.
 
 ### 7.5 — CLI wiring
 
@@ -1139,7 +1157,7 @@ Prerequisites and scope tracked for Phase 8:
    60 s clip, `chunk_ms=2000`: ~700 ms total (vs offline ~850 ms —
    linear-in-T attention wins on long-form).
 
-## Phase 8 — Mode 3 cache-aware streaming  _(in progress)_
+## Phase 8 — Mode 3 cache-aware streaming  _(done; KV-cache optimisation tracked as Phase 8.5)_
 
 ### Phase 8.0 — checkpoint landscape (done)
 
@@ -1287,7 +1305,7 @@ config asserts WER ≤ 5 % vs the Mode 1 reference (all hit 0 %).
 
 ### Phase 8.4 — end-to-end numbers
 
-`LastQuestion_long_EN.raw` (5.46 min, 16 kHz s16le, Apple M3 Ultra,
+`LastQuestion_long_EN.raw` (5.46 min, 16 kHz s16le, Apple M4 Air,
 Metal Q8_0), default config `chunk_ms=2000, left=10000, right=2000`:
 
 - C++ Mode 3 transcript: 972 words, **4.13 % WER** vs offline.
@@ -1321,7 +1339,7 @@ module, streaming attention mask with `att_context_size` plumbing
 already used by NeMo's own cache-aware export path), plus a per-stage
 parity harness vs the §8.1 Python reference. Out of scope for this PR.
 
-## Phase 9 — multi-model support _(in progress)_
+## Phase 9 — multi-model support _(done; ships parakeet-ctc-1.1b alongside 0.6B)_
 
 Phase 9 extends the Parakeet-CTC pipeline beyond the initial 0.6B
 checkpoint. Target is drop-in support for other NeMo Parakeet-CTC
@@ -1352,7 +1370,7 @@ it. The one stale hardcode was in the `--profile` CLI path
 (`layer_points = {0, 1, 12, 24}`); now scales with `n_layers` via
 `{0, 1, n_layers/2, n_layers}`.
 
-End-to-end results on Apple M3 Ultra, Metal, Q8_0:
+End-to-end results on Apple M4 Air, Metal, Q8_0:
 
 | Clip | Model | Wall time | RTF | Encoder ms |
 |-|-|-|-|-|
@@ -1385,7 +1403,7 @@ Natural follow-ups that reuse the same converter + encoder graph:
 - `nvidia/parakeet-ctc-110m`: smaller CTC-only variant if it exists;
   would land as a converter-flag change only.
 
-## Phase 10 — TDT (Token-and-Duration Transducer) support _(in progress)_
+## Phase 10 — TDT (Token-and-Duration Transducer) support _(done; covers parakeet-tdt-0.6b-v3 + parakeet-tdt-1.1b, Mode 1/2/3)_
 
 Phase 10 ports `nvidia/parakeet-tdt-0.6b-v3`, the multilingual (~25
 languages) TDT ASR model with punctuation-and-capitalization. Shares
@@ -1469,6 +1487,8 @@ Engine wiring:
 - `Engine::transcribe()` / `transcribe_samples()` branch on model
   type. Streaming entry points still reject TDT via
   `ensure_ctc_only()` — transducer streaming is a Phase 10.5 item.
+  _(Superseded by §10.5: `ensure_ctc_only()` was removed; both Mode 2
+  and Mode 3 streaming run on TDT GGUFs today.)_
 - CLI `run_once` lambda has the same branch; TDT GGUFs now transcribe
   end-to-end via `--wav` / `--pcm-in`.
 
@@ -1541,8 +1561,9 @@ Engine wiring (`src/parakeet_engine.cpp`):
 - `ensure_ctc_only()` helper is gone; the CLI gate that short-circuited
   `--stream` for TDT is gone too.
 
-Public API addition: `Engine::model_type() -> "ctc" | "tdt"`, so
-downstream callers (and the test harness) can pick per-model knobs
+Public API addition: `Engine::model_type() -> "ctc" | "tdt"` (Phase 11
+extends this to also return `"sortformer"`), so downstream callers
+(and the test harness) can pick per-model knobs
 without reaching through internal headers.
 
 Test harness (`test_streaming.cpp`):
@@ -1626,7 +1647,7 @@ bootstrapping picks it up automatically.
 - **parakeet-tdt_ctc-110m support.** Same TDT decoder, smaller
   512 × 17 FastConformer encoder; `.nemo` already cached locally.
 
-## Phase 11 — Sortformer (4-speaker diarization) _(in progress)_
+## Phase 11 — Sortformer (4-speaker diarization) _(done through §11.11.1; spkcache streaming tracked as Phase 11.11.2)_
 
 Phase 11 ports `nvidia/diar_sortformer_4spk-v1`, a speaker-diarization
 model that shares the FastConformer encoder backbone with our Parakeet
@@ -1828,7 +1849,7 @@ which subtly affects even offline forward passes).
 Converter helper `_get_member` handles both `./model_config.yaml` and
 `model_config.yaml` tarball layouts (v1 has the prefix, v2 doesn't).
 
-### Phase 11.11.x — Live streaming diarization _(design, not yet implemented)_
+### Phase 11.11 — Live streaming diarization (overview) _(11.11.1 shipped; 11.11.2 NeMo-style spkcache pending)_
 
 Real live diarization needs the v2 spkcache + FIFO state machine.
 NeMo's `forward_streaming_step` per chunk is:
@@ -1901,11 +1922,12 @@ Open design questions (need to resolve when work starts):
   chunk, way over real-time).
 
 Estimated effort: 1-2 weeks of focused work + parity validation.
-Tracked as a separate workstream rather than rushed mid-session.
+Tracked as Phase 11.11.2; the §11.11.1 sliding-history implementation
+below shipped first as the pragmatic v1.
 
 ### Phase 11.11.1 — Sortformer live streaming (pragmatic v1, sliding history)
 
-Phase 11.11.x is a multi-week effort to land the full NeMo
+Phase 11.11.2 (planned) is a multi-week effort to land the full NeMo
 `forward_streaming` algorithm (spkcache + fifo + `_compress_spkcache`
 + encoder graph split). To unblock product integration *now*, Phase
 11.11.1 ships a pragmatic streaming layer that reuses the existing
@@ -1960,9 +1982,18 @@ Algorithm (per chunk):
 4. Advance `emitted_samples = emit_end`. Trim `ring` to keep only
    `history_samples` of audio behind us (so the buffer stays bounded
    for arbitrarily long sessions).
-5. `finalize()` flushes any tail (audio shorter than `chunk_ms`); if
-   no tail exists it re-emits the last chunk's segments with
-   `is_final = true` so consumers always see a finalisation marker.
+5. `finalize()` semantics:
+   - if `>= 1` sample of new audio sits past the last emitted chunk,
+     run one final `process_chunk` over `[max(ring_origin, end -
+     history_samples), end]`, emit each overlapping segment with
+     `is_final = true`. Consumers see real segments tagged final.
+   - if the audio ended exactly on a chunk boundary (no tail), emit a
+     single synthetic terminator with `speaker_id = -1`,
+     `start_s == end_s == emitted_samples / sample_rate`,
+     `is_final = true`. Consumers should treat negative speaker IDs as
+     "session done, no new segment". This avoids the round-1 bug
+     where the last chunk's segments were re-emitted as duplicates
+     with `is_final = true` flipped on.
 6. `cancel()` short-circuits; subsequent `feed_*` calls are no-ops.
 
 Trade-offs (vs the planned full Phase 11.11.2 NeMo-style streaming):
@@ -1974,7 +2005,7 @@ Trade-offs (vs the planned full Phase 11.11.2 NeMo-style streaming):
   window contains both speakers' audio; matches offline IDs exactly
   once the history covers the full session.
 - **Con**: each chunk re-runs the full encoder over the trailing
-  `history_ms` of audio. Measured RTF ~0.25 on M3 Ultra CPU at
+  `history_ms` of audio. Measured RTF ~0.25 on M4 Air CPU at
   `chunk_ms=2000 history_ms=30000` for the 22 s `two-speakers-16k.wav`
   sample (5.5 s wall for 22 s of audio). Phase 11.11.2's `spkcache`
   approach will fix this.
@@ -2033,9 +2064,13 @@ Testing: `src/test_sortformer_streaming.cpp` (built as
 `test-sortformer-streaming` when `QVAC_PARAKEET_BUILD_TESTS=ON`) feeds
 the multi-speaker sample in random burst sizes (1-5000 samples per
 `feed_pcm_f32()` call) and asserts:
-- ≥1 callback received,
-- exactly one `is_final=true` callback after `finalize()`,
+- `>= 1` real segment callback received (`speaker_id >= 0`),
+- exactly one `is_final = true` callback received after `finalize()`
+  (real segment for the tail case, synthetic terminator with
+  `speaker_id = -1` for the chunk-aligned case),
 - `max_end` is within the audio duration,
+- no two consecutive callbacks duplicate each other's
+  `(speaker_id, start_s, end_s)`,
 - `cancel()` on a half-fed session is idempotent.
 
 Verified end-to-end on `two-speakers-16k.wav`:
@@ -2062,5 +2097,7 @@ the eventual destination; 11.11.1 is what ships today.
 - **BLAS / Accelerate for transformer attention**. Same opportunity
   as TDT's LSTM + joint gemvs; current scalar attention is the long-
   form bottleneck on Sortformer's 18-layer TF (T^2 cost dominates).
+  See §5.4 for the prior Accelerate sched-assertion investigation on
+  the f32 GGUF -- worth re-checking with the q8_0 path.
 - **Quantised (q8_0 / q4_0) Sortformer GGUFs**. Converter handles
   these via the universal dequant path; needs a sweep + parity check.
