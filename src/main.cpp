@@ -325,14 +325,43 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                      sr, model.mel_cfg.sample_rate);
         return 5;
     }
-    if (model.model_type == ParakeetModelType::SORTFORMER) {
-        std::fprintf(stderr, "error: loaded GGUF is a Sortformer diarization model. The C++\n"
-                             "       diarize() forward pass is not yet wired (PROGRESS.md Phase 11.4).\n"
-                             "       Pass a parakeet-ctc-* / parakeet-tdt-* GGUF for transcription.\n");
-        return 5;
-    }
     const double wav_ms = ms_since(t_wav);
     const double audio_ms = 1000.0 * (double) samples.size() / (double) sr;
+
+    if (model.model_type == ParakeetModelType::SORTFORMER) {
+        EngineOptions eopts;
+        eopts.model_gguf_path = opts.model_gguf_path;
+        eopts.n_gpu_layers    = opts.n_gpu_layers;
+        eopts.n_threads       = opts.n_threads;
+        eopts.verbose         = opts.verbose;
+        Engine engine(eopts);
+
+        DiarizationOptions dopts;
+        DiarizationResult diar = engine.diarize_samples(
+            samples.data(), (int) samples.size(), sr, dopts);
+
+        const std::string emit_fmt = extra.emit_format;
+        for (const auto & s : diar.segments) {
+            if (emit_fmt == "jsonl") {
+                std::printf("{\"speaker\":%d,\"start\":%.3f,\"end\":%.3f}\n",
+                            s.speaker_id, s.start_s, s.end_s);
+            } else {
+                std::printf("[%.2f-%.2f] speaker_%d\n",
+                            s.start_s, s.end_s, s.speaker_id);
+            }
+        }
+        if (opts.verbose) {
+            std::fprintf(stderr,
+                "[diarize] load=%.1fms audio=%.2fs samples=%zu@%dHz frames=%d num_spks=%d\n"
+                "[diarize] mel=%.1fms enc=%.1fms dec=%.1fms total=%.1fms RTF=%.3f segments=%zu\n",
+                load_ms, audio_ms / 1000.0, samples.size(), sr,
+                diar.n_frames, diar.num_spks,
+                diar.preprocess_ms, diar.encoder_ms, diar.decode_ms,
+                diar.total_ms, diar.total_ms / audio_ms,
+                diar.segments.size());
+        }
+        return 0;
+    }
 
     auto run_once = [&](std::string & text_out, std::vector<int32_t> & ids_out,
                         int & n_frames_out, RunTimes & times) -> int {

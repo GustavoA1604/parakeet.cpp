@@ -132,6 +132,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
         src/parakeet_tdt.cpp
+        src/parakeet_sortformer.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml)

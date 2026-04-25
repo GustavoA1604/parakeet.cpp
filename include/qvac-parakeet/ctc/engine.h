@@ -85,6 +85,32 @@ struct StreamingOptions {
     bool emit_partials = false;
 };
 
+struct DiarizationOptions {
+    float threshold      = 0.5f;
+    int   min_segment_ms = 0;
+};
+
+struct DiarizationSegment {
+    int    speaker_id = 0;
+    double start_s    = 0.0;
+    double end_s      = 0.0;
+};
+
+struct DiarizationResult {
+    std::vector<DiarizationSegment> segments;
+    std::vector<float> speaker_probs;
+    int    n_frames        = 0;
+    int    num_spks        = 0;
+    double frame_stride_s  = 0.08;
+
+    int    audio_samples   = 0;
+    int    sample_rate     = 16000;
+    double preprocess_ms   = 0.0;
+    double encoder_ms      = 0.0;
+    double decode_ms       = 0.0;
+    double total_ms        = 0.0;
+};
+
 struct StreamingSegment {
     std::string text;
     std::vector<int32_t> token_ids;
@@ -151,6 +177,16 @@ public:
 
     std::unique_ptr<StreamSession> stream_start(const StreamingOptions & opts,
                                                 StreamingCallback on_segment);
+
+    // Diarization (Sortformer models only). Throws if loaded GGUF
+    // is a transcription model.
+    DiarizationResult diarize(const std::string & wav_path,
+                              const DiarizationOptions & opts = {});
+
+    DiarizationResult diarize_samples(const float * samples,
+                                      int n_samples,
+                                      int sample_rate,
+                                      const DiarizationOptions & opts = {});
 
     void cancel();
 

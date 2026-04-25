@@ -2,6 +2,7 @@
 
 #include "parakeet_ctc.h"
 #include "parakeet_tdt.h"
+#include "parakeet_sortformer.h"
 #include "mel_preprocess.h"
 #include "sentencepiece_bpe.h"
 
@@ -37,6 +38,9 @@ struct Engine::Impl {
     TdtRuntimeWeights   tdt_rt;
     bool                tdt_ready = false;
 
+    SortformerRuntimeWeights sortformer_rt;
+    bool                     sortformer_ready = false;
+
     Impl() = default;
 };
 
@@ -59,6 +63,12 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
             throw std::runtime_error("Engine: tdt_prepare_runtime failed");
         }
         pimpl_->tdt_ready = true;
+    }
+    if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
+        if (sortformer_prepare_runtime(pimpl_->model, pimpl_->sortformer_rt) != 0) {
+            throw std::runtime_error("Engine: sortformer_prepare_runtime failed");
+        }
+        pimpl_->sortformer_ready = true;
     }
 }
 
@@ -314,6 +324,102 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
 
     result.decode_ms = ms_since(t_dec);
     result.total_ms  = ms_since(t_total);
+    return result;
+}
+
+DiarizationResult Engine::diarize(const std::string & wav_path,
+                                  const DiarizationOptions & opts) {
+    std::vector<float> samples;
+    int sr = 0;
+    if (int rc = load_wav_mono_f32(wav_path, samples, sr); rc != 0) {
+        throw std::runtime_error("Engine::diarize: failed to load wav '" + wav_path +
+                                 "' (rc=" + std::to_string(rc) + ")");
+    }
+    return diarize_samples(samples.data(), (int) samples.size(), sr, opts);
+}
+
+DiarizationResult Engine::diarize_samples(const float * samples,
+                                          int n_samples,
+                                          int sample_rate,
+                                          const DiarizationOptions & opts) {
+    if (!samples || n_samples <= 0) {
+        throw std::runtime_error("Engine::diarize_samples: empty input");
+    }
+    if (sample_rate != pimpl_->model.mel_cfg.sample_rate) {
+        throw std::runtime_error("Engine::diarize_samples: input is " +
+                                 std::to_string(sample_rate) + " Hz but model expects " +
+                                 std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
+    }
+    if (pimpl_->model.model_type != ParakeetModelType::SORTFORMER || !pimpl_->sortformer_ready) {
+        throw std::runtime_error("Engine::diarize: loaded GGUF is not a Sortformer "
+                                 "diarization model. Use a sortformer-* GGUF.");
+    }
+
+    pimpl_->cancel_flag.store(false);
+
+    using clock = std::chrono::steady_clock;
+    const auto t_total = clock::now();
+
+    std::vector<float> work(samples, samples + n_samples);
+    float peak = 0.0f;
+    for (float v : work) if (v > peak) peak = v;
+    if (peak > 0.0f) {
+        const float inv = 1.0f / (peak + 1e-8f);
+        for (float & v : work) v *= inv;
+    }
+
+    const auto t_mel = clock::now();
+    std::vector<float> mel;
+    int n_mel_frames = 0;
+    if (int rc = compute_log_mel(work.data(), n_samples, pimpl_->model.mel_cfg,
+                                 mel, n_mel_frames); rc != 0) {
+        throw std::runtime_error("Engine::diarize_samples: compute_log_mel failed (rc=" +
+                                 std::to_string(rc) + ")");
+    }
+    const double preprocess_ms = ms_since(t_mel);
+
+    const auto t_enc = clock::now();
+    EncoderOutputs enc_out;
+    if (int rc = run_encoder(pimpl_->model, mel.data(), n_mel_frames,
+                             pimpl_->model.mel_cfg.n_mels, enc_out); rc != 0) {
+        throw std::runtime_error("Engine::diarize_samples: run_encoder failed (rc=" +
+                                 std::to_string(rc) + ")");
+    }
+    const double encoder_ms = ms_since(t_enc);
+
+    SortformerDiarizationOptions sopts;
+    sopts.threshold = opts.threshold;
+    SortformerDiarizationResult dres;
+    if (int rc = sortformer_diarize(pimpl_->model, pimpl_->sortformer_rt,
+                                    enc_out.encoder_out.data(),
+                                    enc_out.n_enc_frames, enc_out.d_model,
+                                    sopts, dres); rc != 0) {
+        throw std::runtime_error("Engine::diarize_samples: sortformer_diarize failed (rc=" +
+                                 std::to_string(rc) + ")");
+    }
+
+    DiarizationResult result;
+    result.n_frames       = dres.n_frames;
+    result.num_spks       = dres.num_spks;
+    result.frame_stride_s = dres.frame_stride_s;
+    result.speaker_probs  = std::move(dres.speaker_probs);
+    result.audio_samples  = n_samples;
+    result.sample_rate    = sample_rate;
+    result.preprocess_ms  = preprocess_ms;
+    result.encoder_ms     = encoder_ms;
+    result.decode_ms      = dres.decode_ms;
+    result.total_ms       = ms_since(t_total);
+
+    const double min_dur = opts.min_segment_ms / 1000.0;
+    for (const auto & s : dres.segments) {
+        if ((s.end_s - s.start_s) < min_dur) continue;
+        DiarizationSegment d;
+        d.speaker_id = s.speaker_id;
+        d.start_s    = s.start_s;
+        d.end_s      = s.end_s;
+        result.segments.push_back(d);
+    }
+
     return result;
 }
 
