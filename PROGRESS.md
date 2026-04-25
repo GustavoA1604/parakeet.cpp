@@ -1726,17 +1726,187 @@ has O(T^2) attention with no chunking. At T=4099 (5.5 min) that's
 ~16.8 M attention pairs per layer x 18 layers — Phase 11.11
 (streaming v2) brings chunked attention.
 
-### Phase 11.x — pending follow-ups
+### Phase 11.10 — speaker-attributed transcription _(done)_
 
-- **Phase 11.10**: speaker-attributed transcription (Parakeet ASR +
-  Sortformer combined). Run both models on the same audio, align
-  Parakeet word/segment boundaries with Sortformer speaker frames,
-  emit `[{speaker, text, start, end}]`. Mirrors the qvac binding's
-  quickstart-diarized.js pattern.
-- **Phase 11.11**: `nvidia/diar_streaming_sortformer_4spk-v2`
-  streaming variant. Adds chunked attention + speaker cache + FIFO
-  buffer (the 384-wide hidden_to_spks layer is for this path). Big
-  win on long-form decode time.
+Combines Sortformer (Phase 11) with a Parakeet ASR Engine to produce
+"who said what" output natively in C++. Mirrors the qvac binding's
+`quickstart-diarized.js` pattern, but in one binary and one CLI call.
+
+Public API (`include/qvac-parakeet/ctc/engine.h`):
+
+    struct AttributedSegment { speaker_id; text; start_s; end_s; };
+    struct AttributedTranscriptionOptions { diarization;
+                                            merge_same_speaker = true;
+                                            min_segment_ms = 200;
+                                            pad_segment_ms = 0; };
+    struct AttributedTranscriptionResult { segments; diarization;
+                                           asr_calls; total_ms;
+                                           audio_samples; sample_rate; };
+
+    transcribe_with_speakers(sf_engine, asr_engine, wav_path, opts);
+    transcribe_samples_with_speakers(sf_engine, asr_engine,
+                                     samples, n, sr, opts);
+
+Plus tiny `Engine::is_diarization_model()` /
+`is_transcription_model()` helpers so downstream callers (CLI, unit
+tests, future bindings) can route based on what each loaded GGUF is.
+
+Pipeline (in `src/parakeet_engine.cpp`):
+
+  1. sortformer_engine.diarize_samples() -> per-frame speaker probs +
+     segments via threshold + per-speaker grouping.
+  2. For each diarization segment, slice samples[start:end] (with
+     optional pad_segment_ms padding on each side, skipping segments
+     shorter than min_segment_ms) and feed the slice through
+     asr_engine.transcribe_samples().
+  3. If merge_same_speaker (default), collapse consecutive same-speaker
+     entries by appending text and extending end_s. This turns the
+     ~10 micro-segments Sortformer emits per speaker turn into the
+     handful of natural turn boundaries a downstream UI cares about.
+
+CLI:
+
+  ./qvac-parakeet --model <asr.gguf> --diarization-model <sf.gguf> \
+    --wav <multi-speaker.wav>
+
+Output formats:
+
+  text  : [start-end] speaker_<id>: <text>
+  jsonl : {"speaker":N,"start":S,"end":E,"text":"..."}
+
+End-to-end on diarization-sample-16k.wav (27.3 s, 2 speakers, Apple
+M4 Metal):
+
+  TDT-0.6b-v3.f16 + Sortformer-v1.f16:
+    diar.segments=11 -> merged=4, asr_calls=11
+    total=1514ms RTF=0.055 (18x real-time)
+    [0.40-4.24]  speaker_0: So Aaron, in your email you said you wanted
+                            to talk about the exam.
+    [4.96-15.60] speaker_1: Yeah, um I've just never taken a class with
+                            so many different readings...
+    [16.24-18.16] speaker_0: Yeah.
+    [18.48-27.36] speaker_1: Yeah. There's usually just one book to
+                            review, not two. Three different books, plus
+                            all those other text excerpts and videos.
+
+  CTC-0.6b.q8_0 + Sortformer-v1.f16:
+    Same speaker boundaries, faster decode, English lowercase no-PnC.
+
+CTC + TDT + sortformer-only paths all unchanged (regressions verified).
+
+### Phase 11.11.0 — Sortformer v2 offline support _(done)_
+
+`nvidia/diar_streaming_sortformer_4spk-v2` is the streaming-trained
+sibling of v1. Architecture diff for offline-mode usage:
+
+  encoder    : 512 d_model x 17 layers (was 18) + 128 mel bins (was 80)
+  transformer: 18 layers x 192 d_model (same)
+  head       : encoder_proj + first_hidden_to_hidden + single_hidden_to_spks
+               + extra hidden_to_spks (4, 384) for streaming-only path
+
+All four read-paths flow from existing GGUF metadata
+(n_layers / feat_in / tf_n_layers / use_bias / xscaling), so converting
+v2 and running it through our offline diarize() pipeline works with
+no code changes:
+
+  python scripts/convert-parakeet-ctc-to-gguf.py \
+      --ckpt models/diar_streaming_sortformer_4spk-v2.nemo \
+      --out  models/sortformer-streaming-4spk-v2.f16.gguf --quant f16
+  -> 250.9 MiB f16
+
+The 384-wide hidden_to_spks tensor is the streaming-mode-only output
+head (concat of spkcache + chunk hidden states); the converter
+currently skips it since v1's 192-wide head reproduces NeMo's
+forward_speaker_sigmoids() bit-for-bit in offline mode. v2 GGUFs run
+through the same single_hidden_to_spks (192-wide) path as v1.
+
+Verified on diarization-sample-16k.wav (2 speakers): v2 produces 9
+segments vs v1's 11 — same conversation structure, slightly different
+boundary placement (v2 was trained with chunked-attention masking
+which subtly affects even offline forward passes).
+
+Converter helper `_get_member` handles both `./model_config.yaml` and
+`model_config.yaml` tarball layouts (v1 has the prefix, v2 doesn't).
+
+### Phase 11.11.x — Live streaming diarization _(design, not yet implemented)_
+
+Real live diarization needs the v2 spkcache + FIFO state machine.
+NeMo's `forward_streaming_step` per chunk is:
+
+  1. encoder.pre_encode(chunk)  -> chunk_pre_encode_embs
+       (only the dw_striding subsampling stage; output is in 512-dim
+        post-subsampling space)
+  2. concat([spkcache, fifo, chunk_pre_encode_embs]) -> concat_embs
+       (spkcache_len + fifo_len + chunk_subs frames)
+  3. frontend_encoder(concat_embs, bypass_pre_encode=True) ->
+     full FastConformer encoder + encoder_proj on the concatenated
+     buffer  -> (T_total, 192)
+  4. forward_infer(...) -> 18-layer transformer + speaker head ->
+     (T_total, 4) speaker probabilities
+  5. streaming_update(state, chunk_pre_encode_embs, all_preds, lc, rc):
+     - Extract chunk_preds = preds[spkcache_len + fifo_len + lc :
+                                    spkcache_len + fifo_len + chunk_len + lc]
+     - Append (chunk, chunk_preds) to FIFO
+     - If FIFO overflows, pop front frames into spkcache and update the
+       silence profile (mean_sil_emb + n_sil_frames) so the next
+       compress_spkcache call can identify silence frames to keep.
+     - If spkcache overflows, _compress_spkcache reduces it back to
+       spkcache_len via per-speaker top-k frame selection (using the
+       speaker probabilities) plus silence-anchor frames. This step is
+       what keeps speaker IDs consistent across chunks: it constructs a
+       persistent per-speaker memory and a permutation.
+
+Default v2 hyperparameters from the .nemo config:
+
+  spkcache_len: 188     fifo_len: 188     chunk_len: 188
+  chunk_left_context: 1 chunk_right_context: 1   subsampling_factor: 8
+  spkcache_update_period: 188   spkcache_sil_frames_per_spk: 3
+  causal_attn_rate: 0.5  (training-only)
+
+Implementation plan when this lands:
+
+1. Expose `pre_encode_only` from `run_encoder` (or a sibling): given mel,
+   run only the dw_striding subsampling + out projection so we get the
+   512-dim post-subsampling tensor without running the conformer
+   blocks.
+2. New `SortformerStreamingState` struct (mirrors NeMo's
+   `StreamingSortformerState`): `spkcache (T_max, 512)`,
+   `spkcache_preds (T_max, 4)`, `fifo (T_max, 512)`,
+   `fifo_preds (T_max, 4)`, `mean_sil_emb (512)`, `n_sil_frames (int)`,
+   `spk_perm (4)`.
+3. `SortformerStreamSession` (mirrors `StreamSession` in shape but with
+   `feed_pcm_*()` -> `chunk_callback` semantics emitting per-chunk
+   speaker probabilities + segment events).
+4. Per-chunk forward: pre_encode the new audio chunk only, concat with
+   spkcache + fifo, run full encoder + transformer + head on the
+   concatenation, slice out chunk_preds, run `streaming_update` which
+   updates state including the silence profile + (eventually)
+   compresses spkcache via per-speaker top-k.
+5. Wire CLI `--stream-duplex` to route through SortformerStreamSession
+   when the model is Sortformer.
+6. Per-stage parity vs NeMo's `forward_streaming` (dump
+   spkcache/fifo/chunk_preds at each chunk boundary, compare).
+
+Open design questions (need to resolve when work starts):
+
+- `_compress_spkcache` is the most complex component (~150 lines of
+  PyTorch). Probably re-implementable in pure C++ since it's mostly
+  index gather + softmax + top-k.
+- What's the right surface for `chunk_callback`? Per-chunk probability
+  matrix? Per-chunk newly-formed segments? Both?
+- `pad_segment_ms` from §11.10 should also work in streaming mode.
+- BLAS/Accelerate for the transformer attention will be needed to keep
+  per-chunk RTF reasonable (today's offline scalar implementation
+  spends 22 s on a 5.5 min clip; per chunk that's ~0.7 s per 100 ms
+  chunk, way over real-time).
+
+Estimated effort: 1-2 weeks of focused work + parity validation.
+Tracked as a separate workstream rather than rushed mid-session.
+
+### Phase 11.x — pending optimisations
+
 - **BLAS / Accelerate for transformer attention**. Same opportunity
   as TDT's LSTM + joint gemvs; current scalar attention is the long-
-  form bottleneck.
+  form bottleneck on Sortformer's 18-layer TF (T^2 cost dominates).
+- **Quantised (q8_0 / q4_0) Sortformer GGUFs**. Converter handles
+  these via the universal dequant path; needs a sweep + parity check.

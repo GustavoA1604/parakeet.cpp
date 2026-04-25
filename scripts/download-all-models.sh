@@ -99,6 +99,11 @@ if (( want_nemo )); then
     echo "== nemo: diar_sortformer_4spk-v1 (4-speaker diarization, offline, ~490 MiB)"
     fetch "https://huggingface.co/nvidia/diar_sortformer_4spk-v1/resolve/main/diar_sortformer_4spk-v1.nemo" \
           "$NEMO_DIR/diar_sortformer_4spk-v1.nemo"
+
+    hr
+    echo "== nemo: diar_streaming_sortformer_4spk-v2 (4-speaker, streaming-trained, ~470 MiB)"
+    fetch "https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2/resolve/main/diar_streaming_sortformer_4spk-v2.nemo" \
+          "$NEMO_DIR/diar_streaming_sortformer_4spk-v2.nemo"
   fi
 fi
 

@@ -15,6 +15,7 @@ Supported checkpoints:
 | `nvidia/parakeet-tdt-0.6b-v3` | TDT  | 128 | 1024 × 24 | 8192 | 600 M  | 715 MiB q8_0 / 1.34 GiB f16 | 0.024-0.050 | ~25 languages + PnC |
 | `nvidia/parakeet-tdt-1.1b`    | TDT  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1225 MiB q8_0               | 0.027-0.079 | English only, lowest WER (no PnC) |
 | `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
+| `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline pipeline supported today; live duplex API coming in Phase 11.11) |
 
 Same converter, same encoder graph (biases go through an optional
 path when the checkpoint sets `use_bias=False`), same GGUF schema.
@@ -463,14 +464,24 @@ Phases 0 through 7 are complete:
   speaker probabilities. New `Engine::diarize()` API + CLI
   auto-routing. Output: per-frame probabilities and threshold-based
   segments {speaker, start, end}. Speaker probability parity is
-  rel 2.0e-4 vs NeMo reference. Streaming (v2) is the next follow-up.
+  rel 2.0e-4 vs NeMo reference.
+  - **§11.10 speaker-attributed transcription** ships:
+    `transcribe_with_speakers(sortformer_engine, asr_engine, ...)`
+    plus CLI `--diarization-model PATH`. Combines Sortformer
+    segments with CTC/TDT transcripts in one C++ binary. Same
+    pipeline as the qvac binding's `quickstart-diarized.js`, but
+    native.
+  - **§11.11.0 Sortformer v2 offline support** ships:
+    `nvidia/diar_streaming_sortformer_4spk-v2` GGUF converts and
+    runs through the same offline `diarize()` path. Live duplex
+    API (chunked attention + spkcache + FIFO state machine) is the
+    next streaming-diarization workstream.
 
 Next: Phase 8.5 (true KV cache + conv state for ~6x compute reduction on
 long-form audio without accuracy change), Accelerate BLAS for the TDT
 decoder's LSTM + joint gemvs and Sortformer's transformer attention,
 `CONV_2D_DW` on Metal (upstream ggml contribution), Metal flash-attn,
-Sortformer v2 streaming, speaker-attributed transcription (Parakeet +
-Sortformer combined), EOU pipelines.
+Sortformer v2 live streaming, EOU pipelines.
 
 ## Repository layout
 
