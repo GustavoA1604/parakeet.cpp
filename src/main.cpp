@@ -58,7 +58,10 @@ void print_usage(const char * argv0) {
         "                       speech, ~4 %% on long sci-fi narration at the default\n"
         "                       context budget. Requires --stream.\n"
         "  --stream-chunk-ms N  segment window stride in ms (default 1000 Mode 2 /\n"
-        "                       2000 Mode 3 recommended; snaps to 80 ms frame stride)\n"
+        "                       2000 Mode 3 recommended; snaps to the encoder frame\n"
+        "                       stride, which is 80 ms on every shipped GGUF -- a\n"
+        "                       different mel hop or subsampling factor would change\n"
+        "                       this. Hard floor of 80 ms enforced at parse time.)\n"
         "  --stream-left-context-ms N    (Mode 3) left-context audio per chunk (default 10000)\n"
         "  --stream-right-lookahead-ms N (Mode 3) right-lookahead audio per chunk (default 2000)\n"
         "  --stream-feed-bytes N         (Mode 3) feed PCM into StreamSession in N-byte\n"
@@ -150,7 +153,7 @@ int load_raw_pcm(const std::string & path,
     return 5;
 }
 
-void emit_segment(const qvac_parakeet::ctc::StreamingSegment & seg,
+void emit_segment(const qvac_parakeet::StreamingSegment & seg,
                   const std::string & format) {
     if (format == "jsonl") {
         std::printf("{\"chunk\":%d,\"start\":%.3f,\"end\":%.3f,\"is_final\":%s,\"text\":\"",
@@ -249,7 +252,7 @@ AggStats aggregate(std::vector<double> v) {
 }
 
 extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
-    qvac_parakeet::ctc::TranscribeOptions opts;
+    qvac_parakeet::TranscribeOptions opts;
     ExtraCliOpts extra;
 
     for (int i = 1; i < argc; ++i) {
@@ -295,6 +298,10 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         } else if (a == "--stream") {
             extra.stream = true;
         } else if (a == "--stream-chunk-ms" && i + 1 < argc) {
+            // 80 ms is the encoder frame stride of every shipped GGUF
+            // (16 kHz x hop=160 x sub=8). A future GGUF with a smaller
+            // stride would silently round up here; revisit when we
+            // actually ship one.
             extra.stream_chunk_ms = std::max(80, std::atoi(argv[++i]));
         } else if (a == "--stream-left-context-ms" && i + 1 < argc) {
             extra.stream_left_ms = std::max(0, std::atoi(argv[++i]));
@@ -336,7 +343,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         return 2;
     }
 
-    using namespace qvac_parakeet::ctc;
+    using namespace qvac_parakeet;
     using clock = std::chrono::steady_clock;
 
     const auto t_load = clock::now();
@@ -686,8 +693,8 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
         const int T_enc = n_frames_tmp / 8;
         std::fprintf(stderr, "\n[profile] sub-stage breakdown of a single conformer block (T_enc=%d)\n", T_enc);
-        qvac_parakeet::ctc::BlockSubstageTimes sub;
-        if (qvac_parakeet::ctc::profile_block_substages(model, T_enc,
+        qvac_parakeet::BlockSubstageTimes sub;
+        if (qvac_parakeet::profile_block_substages(model, T_enc,
                 extra.profile_warmup, extra.profile_runs, sub) == 0) {
             const double sum = sub.ff1_ms + sub.attn_ms + sub.conv_ms + sub.ff2_ms + sub.norm_out_ms;
             auto row = [&](const char * label, double ms) {
@@ -944,8 +951,8 @@ int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result) {
     }
     if (model.model_type != ParakeetModelType::CTC) {
         std::fprintf(stderr,
-            "qvac_parakeet::ctc::transcribe_wav: %s is a %s GGUF; this entry point\n"
-            "    only handles CTC. Use qvac_parakeet::ctc::Engine (see\n"
+            "qvac_parakeet::transcribe_wav: %s is a %s GGUF; this entry point\n"
+            "    only handles CTC. Use qvac_parakeet::Engine (see\n"
             "    <qvac-parakeet/ctc/engine.h>) which auto-dispatches to TDT decode\n"
             "    for parakeet-tdt-* GGUFs and to Sortformer diarize() for\n"
             "    diar_sortformer_* GGUFs.\n",

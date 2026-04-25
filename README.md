@@ -1,10 +1,10 @@
 # qvac-parakeet.cpp
 
-**Parakeet-CTC** (NVIDIA, CC-BY-4.0 FastConformer ASR family) ported to
+**Parakeet** (NVIDIA, CC-BY-4.0 FastConformer ASR family) ported to
 [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference on CPU
 and GPU (Metal / CUDA / Vulkan), with no runtime dependency on Python,
-PyTorch, or onnxruntime. TDT / EOU / Sortformer pipelines land as
-follow-ups.
+PyTorch, or onnxruntime. Ships CTC, TDT, and Sortformer engines today
+under one `Engine` umbrella; EOU pipelines are the next workstream.
 
 Supported checkpoints:
 
@@ -94,7 +94,9 @@ See `scripts/` for one-shot helpers.
 git clone <this-repo> qvac-parakeet.cpp
 cd qvac-parakeet.cpp
 
-# Clone ggml at the pinned commit (CPU-only; no GPU patches in phase 1).
+# Clone ggml at the pinned commit. The same pin is used for every
+# backend (CPU, Metal, CUDA, Vulkan); no engine- or backend-specific
+# ggml patches are applied today.
 ./scripts/setup-ggml.sh
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -348,7 +350,9 @@ Flags:
 
 - `--stream` — enable Mode 2.
 - `--stream-chunk-ms N` — segment window stride (default 1000; snaps
-  down to multiples of the 80 ms encoder frame stride).
+  down to multiples of the encoder frame stride, which is 80 ms on
+  every shipped GGUF; the implementation derives it from the model's
+  mel hop length and subsampling factor).
 - `--emit text` — one `[start-end] text` line per segment (default).
 - `--emit jsonl` — one `{"chunk","start","end","is_final","text"}` JSON
   object per line, for easy downstream consumption.
@@ -374,10 +378,11 @@ that chunk is processed. First segment lands at
 `chunk_ms + right_lookahead_ms + encoder_time`, not after the full
 utterance.
 
-Key point: **no new model needed**. Mode 3 runs the existing
-offline-trained 600M Parakeet-CTC-0.6B weights in cache-aware inference
-mode. Accuracy is preserved within a few percent of offline WER when
-the `left_context_ms` and `right_lookahead_ms` budgets are reasonable
+Key point: **no new model needed**. Mode 3 runs whichever
+offline-trained Parakeet GGUF you have loaded (CTC or TDT) in
+cache-aware inference mode. Accuracy is preserved within a few percent
+of offline WER when the `left_context_ms` and `right_lookahead_ms`
+budgets are reasonable
 (the conv module uses symmetric `kernel=9` padding, so denying future
 context at chunk boundaries hurts more than denying past context).
 
@@ -635,7 +640,11 @@ to ~25x, but the transcript stays bit-equal on clean speech. See
 
 ## Current status
 
-Phases 0 through 7 are complete:
+Phases 0 through 11 have shipped (see `PROGRESS.md` for the full
+journal). Outstanding workstreams are Phase 8.5 (true KV cache + conv
+state for ~6x compute reduction on long-form Mode 3 audio) and Phase
+11.11.2 (NeMo-style spkcache + encoder graph split for fully stable
+Sortformer streaming speaker IDs).
 
 - `qvac-parakeet --model ... --wav ...` produces the expected
   transcript end-to-end, matching NeMo PyTorch bit-equivalently on

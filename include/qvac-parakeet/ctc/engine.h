@@ -74,6 +74,14 @@
 //     undefined behaviour. Call `cancel()` and join the working thread
 //     before destruction.
 //
+//   - `~StreamSession()` and `~SortformerStreamSession()` cancel the
+//     session; they do NOT call `finalize()`. If you let a session
+//     destruct without an explicit `finalize()` call, any audio that
+//     hadn't yet rolled into a chunk is dropped, the synthetic
+//     `is_final=true` terminator is not emitted (Sortformer), and the
+//     final partial-chunk tail segment is not emitted (CTC/TDT
+//     Mode 3). Always call `finalize()` if you care about those.
+//
 // Implementation in src/parakeet_engine.cpp.
 
 #include <cstdint>
@@ -329,7 +337,8 @@ public:
 
     const EngineOptions & options() const;
 
-    // "ctc" or "tdt", reflecting parakeet.model.type metadata of the loaded GGUF.
+    // "ctc", "tdt", or "sortformer", reflecting the parakeet.model.type
+    // metadata of the loaded GGUF.
     std::string model_type() const;
 
     struct Impl;

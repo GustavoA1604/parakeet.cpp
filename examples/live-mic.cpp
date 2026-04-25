@@ -159,31 +159,31 @@ int main(int argc, char ** argv) {
     if (args.list_devices) return list_devices_and_exit();
 
     std::fprintf(stderr, "[live-mic] loading %s\n", args.model_path.c_str());
-    qvac_parakeet::ctc::EngineOptions eopts;
+    qvac_parakeet::EngineOptions eopts;
     eopts.model_gguf_path = args.model_path;
     eopts.n_gpu_layers    = args.n_gpu_layers;
     eopts.n_threads       = args.n_threads;
 
-    qvac_parakeet::ctc::Engine engine(eopts);
+    qvac_parakeet::Engine engine(eopts);
 
     const bool diarization_mode = engine.is_diarization_model();
     if (args.chunk_ms < 0) args.chunk_ms = diarization_mode ? 2000 : 1000;
 
-    std::unique_ptr<qvac_parakeet::ctc::StreamSession>           tx_sess;
-    std::unique_ptr<qvac_parakeet::ctc::SortformerStreamSession> diar_sess;
+    std::unique_ptr<qvac_parakeet::StreamSession>           tx_sess;
+    std::unique_ptr<qvac_parakeet::SortformerStreamSession> diar_sess;
 
     bool   line_open       = false;
     double last_voice_end_s = 0.0;
 
     if (diarization_mode) {
-        qvac_parakeet::ctc::SortformerStreamingOptions sopts;
+        qvac_parakeet::SortformerStreamingOptions sopts;
         sopts.sample_rate    = 16000;
         sopts.chunk_ms       = args.chunk_ms;
         sopts.history_ms     = std::max(args.history_ms, args.chunk_ms);
         sopts.threshold      = 0.5f;
         sopts.min_segment_ms = 200;
         diar_sess = engine.diarize_start(sopts,
-            [&](const qvac_parakeet::ctc::StreamingDiarizationSegment & s) {
+            [&](const qvac_parakeet::StreamingDiarizationSegment & s) {
                 if (s.speaker_id < 0) return;
                 std::printf("[%.2f-%.2f] speaker_%d (chunk %d%s)\n",
                             s.start_s, s.end_s, s.speaker_id, s.chunk_index,
@@ -191,13 +191,13 @@ int main(int argc, char ** argv) {
                 std::fflush(stdout);
             });
     } else {
-        qvac_parakeet::ctc::StreamingOptions sopts;
+        qvac_parakeet::StreamingOptions sopts;
         sopts.sample_rate        = 16000;
         sopts.chunk_ms           = args.chunk_ms;
         sopts.left_context_ms    = args.left_ms;
         sopts.right_lookahead_ms = args.right_ms;
         tx_sess = engine.stream_start(sopts,
-            [&](const qvac_parakeet::ctc::StreamingSegment & seg) {
+            [&](const qvac_parakeet::StreamingSegment & seg) {
                 if (!args.accumulate) {
                     if (seg.text.empty()) return;
                     std::printf("\033[2K\r[%.2f-%.2f]%s\n", seg.start_s, seg.end_s, seg.text.c_str());

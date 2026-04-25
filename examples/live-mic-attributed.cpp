@@ -194,7 +194,7 @@ int main(int argc, char ** argv) {
 
     if (args.list_devices) return list_devices_and_exit();
 
-    using namespace qvac_parakeet::ctc;
+    using namespace qvac_parakeet;
 
     std::fprintf(stderr, "[live-mic-attributed] loading ASR  %s\n", args.asr_model_path.c_str());
     EngineOptions asr_eopts;
