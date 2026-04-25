@@ -19,10 +19,22 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NEMO_DIR="$REPO_ROOT/models"
-BINDING_DIR="${BINDING_DIR:-$REPO_ROOT/../qvac/packages/qvac-lib-infer-parakeet/models}"
+BINDING_DIR_DEFAULT="$REPO_ROOT/../qvac/packages/qvac-lib-infer-parakeet/models"
+BINDING_DIR="${BINDING_DIR:-$BINDING_DIR_DEFAULT}"
 
 mkdir -p "$NEMO_DIR"
-mkdir -p "$BINDING_DIR"
+
+# Only create the ONNX binding directory if it already exists or the user
+# explicitly opted in via BINDING_DIR. A fresh checkout of qvac-parakeet.cpp/
+# without a sibling qvac/ tree will skip the ONNX section instead of
+# creating a stray directory next door.
+binding_available=0
+if [[ -n "${BINDING_DIR:-}" ]] && [[ "$BINDING_DIR" != "$BINDING_DIR_DEFAULT" ]]; then
+  mkdir -p "$BINDING_DIR"
+  binding_available=1
+elif [[ -d "$BINDING_DIR" ]]; then
+  binding_available=1
+fi
 
 want_nemo=1
 want_onnx=1
@@ -62,7 +74,10 @@ hr() { printf '%.0s=' {1..70}; echo; }
 
 # -------------------- .nemo (native ggml port targets) --------------------
 if (( want_nemo )); then
-  if [[ "${1:-all}" == "tdt" ]] || [[ "${1:-all}" != "tdt" ]]; then
+  # The TDT block always runs when --nemo or no filter is selected.
+  # (When the filter is "tdt", only the TDT-related blocks elsewhere are
+  # gated off via `[[ "${1:-all}" != "tdt" ]]`; this block fires either way.)
+  if true; then
     hr
     echo "== nemo: parakeet-tdt-0.6b-v3 (multilingual, 25 langs, +PnC, ~2.4 GiB)"
     fetch "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/resolve/main/parakeet-tdt-0.6b-v3.nemo" \
@@ -87,11 +102,15 @@ if (( want_nemo )); then
 
     hr
     echo "== nemo: parakeet-tdt_ctc-110m (small TDT+CTC hybrid, ~440 MiB)"
+    echo "         (forward-looking: not yet wired into the C++ Engine; cached"
+    echo "          for the planned hybrid TDT+CTC port.)"
     fetch "https://huggingface.co/nvidia/parakeet-tdt_ctc-110m/resolve/main/parakeet-tdt_ctc-110m.nemo" \
           "$NEMO_DIR/parakeet-tdt_ctc-110m.nemo"
 
     hr
     echo "== nemo: stt_en_fastconformer_hybrid_large_streaming_multi (EOU/streaming, ~440 MiB)"
+    echo "         (forward-looking: cached for the planned EOU streaming port,"
+    echo "          tracked in PROGRESS.md as a future workstream.)"
     fetch "https://huggingface.co/nvidia/stt_en_fastconformer_hybrid_large_streaming_multi/resolve/main/stt_en_fastconformer_hybrid_large_streaming_multi.nemo" \
           "$NEMO_DIR/stt_en_fastconformer_hybrid_large_streaming_multi.nemo"
 
@@ -108,7 +127,14 @@ if (( want_nemo )); then
 fi
 
 # -------------------- ONNX bundles (Node binding targets) --------------------
-if (( want_onnx )); then
+if (( want_onnx )) && (( ! binding_available )); then
+  hr
+  echo "== onnx: skipping (BINDING_DIR=$BINDING_DIR not present)."
+  echo "         Set BINDING_DIR=/path/to/qvac-lib-infer-parakeet/models to opt in,"
+  echo "         or run with the 'nemo' filter to silence this section."
+fi
+
+if (( want_onnx )) && (( binding_available )); then
   hr
   echo "== onnx: parakeet-tdt-0.6b-v3 (binding 'tdt' slot, ~2.5 GiB)"
   TDT_DIR="$BINDING_DIR/parakeet-tdt-0.6b-v3-onnx"

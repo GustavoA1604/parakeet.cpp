@@ -52,9 +52,27 @@
 //         std::puts(result.text.c_str());
 //     }
 //
-// Not thread-safe for concurrent `transcribe()` / `diarize()` calls on
-// the same instance (the encoder's graph allocator is shared state).
-// `cancel()` is safe to call from any thread.
+// Threading model:
+//
+//   - Concurrent `transcribe()` / `diarize()` / `transcribe_stream()`
+//     calls on the same instance are not supported (the encoder's graph
+//     allocator is shared mutable state). Wrap an Engine in your own
+//     mutex if you need that, or hold one Engine per worker.
+//
+//   - `cancel()` is safe to call from any thread while another thread
+//     is inside `transcribe*` / `diarize*`. It causes the running call
+//     to bail out at the next chunk boundary and return.
+//
+//   - Each new call to `transcribe*` / `diarize*` resets the cancel
+//     flag at entry, so a `cancel()` racing with a subsequent
+//     `transcribe()` from the *same* thread will be lost. If you need
+//     to hard-stop and not start a new call, gate the next entry on
+//     your own application-level flag.
+//
+//   - `~Engine()` does NOT wait for in-flight calls; destroying an
+//     Engine while another thread is inside a `transcribe*` call is
+//     undefined behaviour. Call `cancel()` and join the working thread
+//     before destruction.
 //
 // Implementation in src/parakeet_engine.cpp.
 

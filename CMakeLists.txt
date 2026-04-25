@@ -159,12 +159,16 @@ if (QVAC_PARAKEET_BUILD_EXAMPLES)
         message(FATAL_ERROR "QVAC_PARAKEET_BUILD_EXAMPLES requires QVAC_PARAKEET_BUILD_LIBRARY=ON")
     endif()
 
-    add_executable(live-mic examples/live-mic.cpp)
+    add_executable(live-mic
+        examples/live-mic.cpp
+        examples/miniaudio_impl.cpp)
     target_link_libraries(live-mic PRIVATE qvac-parakeet)
     target_include_directories(live-mic PRIVATE include examples)
     target_compile_options(live-mic PRIVATE -Wno-deprecated-declarations)
 
-    add_executable(live-mic-attributed examples/live-mic-attributed.cpp)
+    add_executable(live-mic-attributed
+        examples/live-mic-attributed.cpp
+        examples/miniaudio_impl.cpp)
     target_link_libraries(live-mic-attributed PRIVATE qvac-parakeet)
     target_include_directories(live-mic-attributed PRIVATE include examples)
     target_compile_options(live-mic-attributed PRIVATE -Wno-deprecated-declarations)

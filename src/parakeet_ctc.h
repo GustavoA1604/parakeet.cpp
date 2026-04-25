@@ -19,34 +19,55 @@ struct gguf_context;
 
 namespace qvac_parakeet {
 
+// Encoder + per-engine head hyperparameters loaded from GGUF metadata.
+//
+// Field naming convention:
+//   - encoder fields (no prefix): apply to the FastConformer encoder
+//     shared by every engine.
+//   - tdt_*: TDT decoder-only fields (LSTM prediction net + joint MLP +
+//     duration head). Ignored for CTC and Sortformer GGUFs.
+//   - sortformer_*: Sortformer head-only fields. The `sortformer_fc_*`
+//     prefix refers to the FastConformer encoder dimensions as seen by
+//     the Sortformer head (`fc_d_model` is the encoder output dim, fed
+//     into the encoder_proj down to `tf_d_model` for the transformer).
+//     The `sortformer_tf_*` prefix refers to the post-projection
+//     transformer block stack. (Runtime weight structs in
+//     parakeet_sortformer.h use shorter names `D_enc` / `tf_d` for the
+//     same two dimensions; treat them as synonyms for `sortformer_fc_d_model`
+//     and `sortformer_tf_d_model` respectively.)
+//
+// A planned follow-up will split this into `EncoderConfig`,
+// `TdtConfig`, and `SortformerConfig` so that the encoder struct
+// stops carrying decoder-specific fields. See parakeet_ctc.h note on
+// `ParakeetModel`.
 struct EncoderConfig {
-    int d_model        = 1024;
-    int n_layers       = 24;
-    int n_heads        = 8;
-    int head_dim       = 128;
-    int ff_dim         = 4096;
-    int conv_kernel    = 9;
-    int subsampling_factor     = 8;
-    int subsampling_channels   = 256;
-    int subsampling_freq_bins  = 10;
-    int pos_emb_max_len        = 5000;
-    bool xscaling              = true;
-    bool untie_biases          = true;
-    bool use_bias              = true;
-    float layer_norm_eps       = 1.0e-5f;
+    int  d_model                  = 1024;
+    int  n_layers                 = 24;
+    int  n_heads                  = 8;
+    int  head_dim                 = 128;
+    int  ff_dim                   = 4096;
+    int  conv_kernel              = 9;
+    int  subsampling_factor       = 8;
+    int  subsampling_channels     = 256;
+    int  subsampling_freq_bins    = 10;
+    int  pos_emb_max_len          = 5000;
+    bool xscaling                 = true;
+    bool untie_biases             = true;
+    bool use_bias                 = true;
+    float layer_norm_eps          = 1.0e-5f;
 
-    int tdt_pred_hidden        = 640;
-    int tdt_pred_rnn_layers    = 2;
-    int tdt_joint_hidden       = 640;
-    int tdt_num_durations      = 5;
+    int  tdt_pred_hidden          = 640;
+    int  tdt_pred_rnn_layers      = 2;
+    int  tdt_joint_hidden         = 640;
+    int  tdt_num_durations        = 5;
 
-    int  sortformer_num_spks   = 4;
-    int  sortformer_fc_d_model = 512;
-    int  sortformer_tf_d_model = 192;
+    int  sortformer_num_spks      = 4;
+    int  sortformer_fc_d_model    = 512;
+    int  sortformer_tf_d_model    = 192;
     int  sortformer_tf_n_layers   = 18;
     int  sortformer_tf_n_heads    = 8;
     int  sortformer_tf_inner_size = 768;
-    bool sortformer_tf_pre_ln  = false;
+    bool sortformer_tf_pre_ln     = false;
 };
 
 struct SubsamplingWeights {
@@ -169,6 +190,12 @@ struct SortformerWeights {
     ggml_tensor * head_h2s_b = nullptr;
 };
 
+// Universal Parakeet model object. Carries the encoder + decoder
+// weights for whichever engine the GGUF declares (CTC, TDT, or
+// Sortformer); `model_type` selects which decoder fields are populated.
+// Named `ParakeetCtcModel` for historical reasons (the CTC pipeline
+// landed first); `ParakeetModel` is the recommended new name and is
+// provided as a typedef alias below.
 struct ParakeetCtcModel {
     ParakeetModelType model_type = ParakeetModelType::CTC;
 
@@ -195,6 +222,14 @@ struct ParakeetCtcModel {
     struct Impl;
     std::shared_ptr<Impl> impl;
 };
+
+// Forward-looking name. New code should use `ParakeetModel`. The
+// `ParakeetCtcModel` name is retained for backward compatibility and
+// will be removed once internal call sites are migrated. A future
+// pass should also split `EncoderConfig` (currently carrying both
+// TDT- and Sortformer-specific fields) into `EncoderConfig` +
+// `TdtConfig` + `SortformerConfig`.
+using ParakeetModel = ParakeetCtcModel;
 
 int load_from_gguf(const std::string & gguf_path,
                    ParakeetCtcModel  & out_model,

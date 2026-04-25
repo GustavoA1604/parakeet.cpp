@@ -204,6 +204,15 @@ matrices (FFN, attention q/k/v/out/pos/qkv, conv pointwise, subsampling
 output, CTC head). Small tensors (biases, norms, fused BN, mel
 filterbank, depthwise/ small 2D convs) always stay at f32/f16.
 
+The block-quantised formats (`q8_0`, `q5_0`, `q4_0`) require the
+last-dim of each tensor to be a multiple of the block size (32 for
+all three). Tensors whose `shape[-1] % 32 != 0` are silently kept at
+f16 by the converter; this is why a `q4_0` GGUF lands at 372 MiB
+rather than the theoretical 4-bit minimum -- the un-quantisable
+fragments stay at f16. Practically every "fat" 2D matrix in the
+shipped models meets the alignment, so the headline size is close to
+the theoretical floor.
+
 | `--quant` | File size | enc best on 20 s clip | enc best on 11 s clip | Transcript parity |
 |-----------|-----------|----------------------:|----------------------:|-------------------|
 | `f32`     | 2.4 GiB   | n/a (debug only)      | n/a                   | exact            |
@@ -313,11 +322,17 @@ SDK's `transcribe` / `transcribeStream` API:
 | `Engine::transcribe_stream()` | full audio + callback | segments via callback | **ships (Mode 2)** |
 | `Engine::stream_start()` -> `StreamSession` | push PCM via `feed_pcm_*()` | segments via callback | **ships (Mode 3, cache-aware inference)** |
 
-Mode 2 runs the offline encoder once, then walks CTC frames in
-`chunk_ms`-sized windows and emits one `StreamingSegment` per window via
-the callback. Transcript is **byte-equal** to the non-streaming path —
-`test-streaming` asserts this across chunk sizes {250, 500, 1000, 2000,
-4000} ms on every run.
+Mode 2 runs the offline encoder once, then walks the encoder frames in
+`chunk_ms`-sized windows. For CTC GGUFs it runs `ctc_greedy_decode_window`
+per window and the concatenated transcript is **byte-equal** to the
+non-streaming path -- `test-streaming` asserts this across chunk sizes
+{250, 500, 1000, 2000, 4000, 11000} ms on every run. For TDT GGUFs it
+carries `TdtDecodeState` (LSTM hidden + last token) across windows; the
+non-streaming WER is preserved within `test-streaming`'s tolerance band
+(40% at the most aggressive `chunk=1000 left=2000 right=500` config,
+~0% at typical settings) but byte-equality with the non-streaming path
+is **not** guaranteed because the joint network's emission timing can
+shift slightly when the encoder context window changes.
 
 From the CLI:
 
@@ -406,9 +421,12 @@ drop-in swap.
 
 The Node binding at
 [qvac-lib-infer-parakeet](https://github.com/qvac/qvac-lib-infer-parakeet)
-drives `StreamSession` directly from its existing `append({type:'audio',
-data})` flow — each incoming `Buffer` maps to `feed_pcm_i16`, and
-`{type:'end of job'}` maps to `finalize()`.
+is the intended consumer for `StreamSession` -- the push API is
+designed so each incoming `Buffer` from the binding's existing
+`append({type:'audio', data})` flow maps to `feed_pcm_i16` and
+`{type:'end of job'}` maps to `finalize()`. Cross-check the binding's
+README for which version of `qvac-parakeet.cpp` it currently links
+against.
 
 ### Live microphone example
 
@@ -418,9 +436,11 @@ data})` flow — each incoming `Buffer` maps to `feed_pcm_i16`, and
 capture device on macOS / Linux / Windows. Terminal output only, no GUI.
 
 ```bash
-# Built as part of the default CLI target set; gated on
-# -DQVAC_PARAKEET_BUILD_EXAMPLES=ON (on by default when the project
-# is the top-level CMake).
+# Built as part of the default CLI target set when the project is the
+# top-level CMake (`QVAC_PARAKEET_BUILD_EXAMPLES` defaults to
+# `QVAC_PARAKEET_STANDALONE_DEFAULT`, i.e. ON for `cmake -S . -B build`
+# but OFF for sub-projects). Pass `-DQVAC_PARAKEET_BUILD_EXAMPLES=ON`
+# explicitly when consuming this repo as a sub-project.
 
 # List capture devices:
 ./build-metal/live-mic --list-devices
@@ -430,6 +450,14 @@ capture device on macOS / Linux / Windows. Terminal output only, no GUI.
     --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --n-gpu-layers 1 \
     --chunk-ms 1000 --left-context-ms 5000 --right-lookahead-ms 1000
+
+# Same, but accumulate transcript on a single line and only emit a
+# newline after 1 s of silence (hands-free dictation feel):
+./build-metal/live-mic \
+    --model models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+    --n-gpu-layers 1 \
+    --chunk-ms 1000 --left-context-ms 5000 --right-lookahead-ms 1000 \
+    --accumulate --silence-flush-ms 1000
 ```
 
 First time you run it macOS will prompt for microphone access. The
@@ -441,8 +469,9 @@ tail buffer is flushed, `finalize()` emits the last segment, and the
 binary exits cleanly.
 
 Defaults chosen for an interactive feel: first segment lands ~2 s
-after you start speaking (`chunk_ms + right_lookahead_ms`), segments
-afterward at the `chunk_ms` cadence.
+after you start speaking
+(`chunk_ms + right_lookahead_ms + encoder_time`); segments afterward
+at the `chunk_ms` cadence.
 
 When `--model` points at a Sortformer GGUF (e.g.
 `models/sortformer-4spk-v1.f16.gguf`) `live-mic` automatically switches

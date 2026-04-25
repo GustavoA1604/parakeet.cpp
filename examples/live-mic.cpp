@@ -1,4 +1,6 @@
-#define MINIAUDIO_IMPLEMENTATION
+// miniaudio implementation lives in examples/miniaudio_impl.cpp so
+// multiple example targets can include the header without colliding
+// on the single-translation-unit MINIAUDIO_IMPLEMENTATION macro.
 #include "miniaudio.h"
 
 #include "qvac-parakeet/ctc/engine.h"

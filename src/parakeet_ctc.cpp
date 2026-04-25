@@ -297,13 +297,13 @@ int load_from_gguf(const std::string & gguf_path,
     }
 
     if (out_model.model_type == ParakeetModelType::SORTFORMER) {
-        out_model.encoder_cfg.sortformer_num_spks    = get_u32(g, "parakeet.sortformer.num_spks",      4);
-        out_model.encoder_cfg.sortformer_fc_d_model  = get_u32(g, "parakeet.sortformer.fc_d_model",    512);
-        out_model.encoder_cfg.sortformer_tf_d_model  = get_u32(g, "parakeet.sortformer.tf_d_model",    192);
-        out_model.encoder_cfg.sortformer_tf_n_layers   = get_u32(g, "parakeet.sortformer.tf_n_layers",   18);
-        out_model.encoder_cfg.sortformer_tf_n_heads    = get_u32(g, "parakeet.sortformer.tf_n_heads",    8);
-        out_model.encoder_cfg.sortformer_tf_inner_size = get_u32(g, "parakeet.sortformer.tf_inner_size", 768);
-        out_model.encoder_cfg.sortformer_tf_pre_ln   = get_bool(g, "parakeet.sortformer.tf_pre_ln", false);
+        out_model.encoder_cfg.sortformer_num_spks      = get_u32 (g, "parakeet.sortformer.num_spks",      4);
+        out_model.encoder_cfg.sortformer_fc_d_model    = get_u32 (g, "parakeet.sortformer.fc_d_model",    512);
+        out_model.encoder_cfg.sortformer_tf_d_model    = get_u32 (g, "parakeet.sortformer.tf_d_model",    192);
+        out_model.encoder_cfg.sortformer_tf_n_layers   = get_u32 (g, "parakeet.sortformer.tf_n_layers",   18);
+        out_model.encoder_cfg.sortformer_tf_n_heads    = get_u32 (g, "parakeet.sortformer.tf_n_heads",    8);
+        out_model.encoder_cfg.sortformer_tf_inner_size = get_u32 (g, "parakeet.sortformer.tf_inner_size", 768);
+        out_model.encoder_cfg.sortformer_tf_pre_ln     = get_bool(g, "parakeet.sortformer.tf_pre_ln",     false);
     }
 
     out_model.mel_cfg.sample_rate = get_u32(g, "parakeet.preproc.sample_rate", 16000);
@@ -313,7 +313,7 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.mel_cfg.n_mels      = get_u32(g, "parakeet.preproc.n_mels",      80);
     out_model.mel_cfg.preemph     = get_f32(g, "parakeet.preproc.preemph",     0.97f);
     out_model.mel_cfg.log_zero_guard_value =
-        get_f32(g, "parakeet.preproc.log_zero_guard_value", 5.96046448e-08f);
+        get_f32(g, "parakeet.preproc.log_zero_guard_value", kDefaultLogZeroGuard);
 
     if (out_model.model_type == ParakeetModelType::CTC) {
         out_model.vocab_size = get_u32(g, "parakeet.ctc.vocab_size", 1025);

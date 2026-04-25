@@ -135,8 +135,8 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
         throw std::runtime_error(
             "qvac_parakeet::Engine::transcribe_samples: loaded GGUF is a Sortformer "
-            "diarization model; use Engine::diarize() instead. The diarize() forward pass "
-            "lands in Phase 11.4 (PROGRESS.md).");
+            "diarization model; call Engine::diarize() (or transcribe_with_speakers "
+            "with a separate ASR engine) instead.");
     }
 
     pimpl_->cancel_flag.store(false);

@@ -31,8 +31,11 @@ void print_usage(const char * argv0) {
         "options:\n"
         "  --model PATH         path to a CTC, TDT, or Sortformer GGUF (required)\n"
         "  --wav PATH           path to a 16 kHz mono wav file\n"
-        "  --pcm-in PATH        path to a raw PCM file (16 kHz mono, format selected by --pcm-format)\n"
+        "  --pcm-in PATH        path to a raw PCM file (mono, format selected by --pcm-format)\n"
         "  --pcm-format FMT     raw PCM sample format: s16le (default) or f32le\n"
+        "  --pcm-rate HZ        sample rate of the raw PCM file. Required to match the\n"
+        "                       model's sample rate exactly (resampling is not yet wired).\n"
+        "                       If omitted, falls back to the model's rate with a warning.\n"
         "  --threads N          number of CPU threads (0 = hardware_concurrency)\n"
         "  --n-gpu-layers N     when > 0, run the encoder on the compiled-in GPU\n"
         "                       backend (build with -DGGML_METAL=ON / -DGGML_CUDA=ON\n"
@@ -188,6 +191,7 @@ struct ExtraCliOpts {
 
     std::string pcm_in_path;
     std::string pcm_format   = "s16le";
+    int         pcm_rate     = 0;
 
     bool        stream            = false;
     int         stream_chunk_ms   = 1000;
@@ -286,6 +290,8 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             extra.pcm_in_path = argv[++i];
         } else if (a == "--pcm-format" && i + 1 < argc) {
             extra.pcm_format = argv[++i];
+        } else if (a == "--pcm-rate" && i + 1 < argc) {
+            extra.pcm_rate = std::atoi(argv[++i]);
         } else if (a == "--stream") {
             extra.stream = true;
         } else if (a == "--stream-chunk-ms" && i + 1 < argc) {
@@ -353,10 +359,19 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         if (int rc = load_raw_pcm(extra.pcm_in_path, extra.pcm_format, samples); rc != 0) {
             return 4;
         }
-        sr = model.mel_cfg.sample_rate;
+        if (extra.pcm_rate > 0) {
+            sr = extra.pcm_rate;
+        } else {
+            std::fprintf(stderr,
+                "warning: --pcm-in without --pcm-rate; assuming %d Hz to match the model.\n"
+                "         Pass --pcm-rate explicitly to silence this warning and to fail-fast\n"
+                "         on a mismatched raw PCM rate (resampling is not yet wired).\n",
+                model.mel_cfg.sample_rate);
+            sr = model.mel_cfg.sample_rate;
+        }
     }
     if (sr != model.mel_cfg.sample_rate) {
-        std::fprintf(stderr, "error: wav is %d Hz but model expects %d Hz (resampling not yet wired)\n",
+        std::fprintf(stderr, "error: input is %d Hz but model expects %d Hz (resampling not yet wired)\n",
                      sr, model.mel_cfg.sample_rate);
         return 5;
     }

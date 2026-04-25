@@ -1,4 +1,4 @@
-#define MINIAUDIO_IMPLEMENTATION
+// miniaudio implementation lives in examples/miniaudio_impl.cpp.
 #include "miniaudio.h"
 
 #include "qvac-parakeet/ctc/engine.h"

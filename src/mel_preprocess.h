@@ -15,6 +15,13 @@
 
 namespace qvac_parakeet {
 
+// Default log-zero guard used when the GGUF metadata key
+// `parakeet.preproc.log_zero_guard_value` is absent. This is exactly
+// 2**-24 (~5.96e-08) and matches NeMo's default and the value baked
+// into the converter (scripts/convert-parakeet-ctc-to-gguf.py). Use
+// this constant from any code path that needs the same fallback.
+inline constexpr float kDefaultLogZeroGuard = 5.960464477539063e-08f;
+
 struct MelConfig {
     int sample_rate = 16000;
     int n_fft       = 512;
@@ -23,7 +30,7 @@ struct MelConfig {
     int n_mels      = 80;
 
     float preemph              = 0.97f;
-    float log_zero_guard_value = 5.960464477539063e-08f;
+    float log_zero_guard_value = kDefaultLogZeroGuard;
 
     std::vector<float> filterbank;
     std::vector<float> window;
