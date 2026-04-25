@@ -22,59 +22,46 @@ path when the checkpoint sets `use_bias=False`), same GGUF schema.
 Model identity lives entirely in `parakeet.model.type` + the encoder
 hyperparameters.
 
-The TDT decoder (prediction net + joint net + transducer greedy) runs
-on CPU in pure float32 after dequantizing its ~70 MiB of weights once
-at Engine construction. All three entry points work for both model
-families:
+All five public entry points sit on a single `qvac_parakeet::Engine`
+that auto-dispatches on `parakeet.model.type`:
 
-- `Engine::transcribe()` (one-shot) — CTC or TDT.
-- `Engine::transcribe_stream()` (Mode 2, offline encoder + streamed
-  segments) — CTC or TDT.
-- `Engine::stream_start()` -> `StreamSession` (Mode 3, live duplex
-  cache-aware) — CTC or TDT; TDT needs slightly more context than CTC
-  at the same chunk size (TDT's transducer is more sensitive to
-  missing right-lookahead at chunk boundaries; typical WER delta
-  vs offline is +5-10 %).
+- `Engine::transcribe()` -- one-shot wav -> text. CTC or TDT.
+- `Engine::transcribe_stream()` -- Mode 2, offline encoder + streamed
+  segments. CTC or TDT.
+- `Engine::stream_start()` -> `StreamSession` -- Mode 3, live duplex
+  cache-aware push API. CTC or TDT. TDT needs slightly more context
+  at the same chunk size (transducer is more sensitive to missing
+  right-lookahead; typical WER delta vs offline is +5-10 %).
+- `Engine::diarize()` -- one-shot wav -> [{speaker, start, end}].
+  Sortformer.
+- `Engine::diarize_start()` -> `SortformerStreamSession` -- live
+  diarization push API (sliding-history v1; Phase 11.11.2 spkcache
+  pending). Sortformer.
 
-Mirrors [`chatterbox.cpp`](https://github.com/GustavoA1604/chatterbox.cpp)'s
-layout and staged-validation methodology, so contributors familiar with
-that repo will find the same file structure here.
+Plus a free function `transcribe_with_speakers(sortformer_engine,
+asr_engine, ...)` for combined "who said what" attribution.
 
 ---
 
 ## Pipeline at a glance
 
 ```
-   16 kHz mono wav                                                  output
-          |                                                           ^
-          v                                                           |
-  +-----------------------------------------------------------------+
-  |                            qvac-parakeet                        |
-  |                                                                 |
-  |    wav  ->  log-mel (80 or 128)  ->  FastConformer encoder      |
-  |             (STFT + CMVN)            (subsampling 8x, 17-42     |
-  |                                       conformer blocks)         |
-  |                                                                 |
-  |    decoder dispatched on GGUF metadata:                         |
-  |      CTC        head + greedy decode      -> text               |
-  |      TDT        LSTM pred + joint MLP +   -> text +             |
-  |                 transducer greedy            punctuation        |
-  |      Sortformer encoder_proj + 18L TF +   -> {speaker, t0, t1}* |
-  |                 sigmoid head                                    |
-  +-----------------------------------------------------------------+
-          ^                                                           |
-          |                                                           v
-   dr_wav / miniaudio                                  SentencePiece BPE
-                                                       (CTC/TDT only;
-                                                        embedded in GGUF)
+  wav -> log-mel (80/128) -> FastConformer encoder (sub 8x, 17-42 blocks)
+                                    |
+        +---------------------------+---------------------------+
+        v                           v                           v
+   CTC head + greedy           TDT LSTM + joint MLP +     Sortformer encoder_proj +
+        + SP detok               transducer greedy        18L TF + sigmoid head
+        |                           |                           |
+       text                  text + PnC                {speaker, t0, t1}*
 ```
 
 Each `.gguf` ships everything its decoder needs in a single file
-(encoder weights, decoder weights, precomputed mel filterbank, and the
-SentencePiece tokenizer where applicable). The same C++ `Engine`
-auto-detects the model type (CTC / TDT / Sortformer) at load time and
-dispatches to the right decoder, so the public API is single-engine
-from the consumer's perspective.
+(encoder weights, decoder weights, precomputed mel filterbank, and
+the SentencePiece tokenizer where applicable). The C++ `Engine`
+auto-detects the model type at load time and dispatches to the right
+decoder, so the public API stays single-engine from the consumer's
+perspective.
 
 ## Prerequisites
 
@@ -124,9 +111,14 @@ cmake --build build-metal -j$(sysctl -n hw.ncpu)
 # is not implemented (encoder is small enough to fit on one device).
 ./build-metal/qvac-parakeet \
     --n-gpu-layers 1 \
-    --model models/parakeet-ctc-0.6b.q8_0.gguf \
+    --model models/parakeet-ctc-0.6b.gguf \
     --wav   test/samples/jfk.wav
 ```
+
+(Use a quantised GGUF -- e.g. `parakeet-ctc-0.6b.q8_0.gguf` --
+produced via `--quant q8_0` in the converter snippet under §2 if you
+want the smaller / faster file. The bare `.gguf` is f16 and works
+the same.)
 
 This produces the main binary plus per-stage validation harnesses:
 
@@ -142,6 +134,18 @@ This produces the main binary plus per-stage validation harnesses:
 | `build/test-sortformer-parity`    | Sortformer mel + encoder + speaker-prob parity vs `dump-sortformer-reference.py`. |
 | `build/test-streaming`            | CTC/TDT Mode 2 byte-equality + timestamp coverage + Mode 3 WER tolerance across chunk sizes. |
 | `build/test-sortformer-streaming` | `SortformerStreamSession` push API: random-burst feed, no-duplicate, single-`is_final` assertions. |
+
+### Build options worth knowing
+
+- `-DQVAC_PARAKEET_BUILD_TESTS=ON` (default ON in standalone): builds
+  the `test-*` parity + streaming harnesses listed above.
+- `-DQVAC_PARAKEET_BUILD_EXAMPLES=ON` (default `QVAC_PARAKEET_STANDALONE_DEFAULT`,
+  i.e. ON for top-level `cmake -S . -B build` but OFF when consumed as
+  a sub-project): builds `live-mic` + `live-mic-attributed`.
+- `-DQVAC_PARAKEET_USE_SYSTEM_GGML=ON`: link against an installed
+  ggml instead of the pinned clone in `ggml/`.
+- `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON`: pick
+  exactly one GPU backend at configure time (see GPU note above).
 
 ## 2. One-time: convert weights
 
@@ -204,16 +208,10 @@ when you're about to be on a flaky network.
 `--quant` selects the storage format for the ~150 large 2D weight
 matrices (FFN, attention q/k/v/out/pos/qkv, conv pointwise, subsampling
 output, CTC head). Small tensors (biases, norms, fused BN, mel
-filterbank, depthwise/ small 2D convs) always stay at f32/f16.
-
-The block-quantised formats (`q8_0`, `q5_0`, `q4_0`) require the
-last-dim of each tensor to be a multiple of the block size (32 for
-all three). Tensors whose `shape[-1] % 32 != 0` are silently kept at
-f16 by the converter; this is why a `q4_0` GGUF lands at 372 MiB
-rather than the theoretical 4-bit minimum -- the un-quantisable
-fragments stay at f16. Practically every "fat" 2D matrix in the
-shipped models meets the alignment, so the headline size is close to
-the theoretical floor.
+filterbank, depthwise/ small 2D convs) always stay at f32/f16. Tensors
+whose `shape[-1] % 32 != 0` also stay at f16 (the block-quantised
+formats need a multiple-of-32 last dim); see `PROGRESS.md §5.12` for
+the full sweep + tier-by-tier accuracy.
 
 | `--quant` | File size | enc best on 20 s clip | enc best on 11 s clip | Transcript parity |
 |-----------|-----------|----------------------:|----------------------:|-------------------|
@@ -226,18 +224,30 @@ the theoretical floor.
 Measurements on an Apple M4 Air, 10 ggml-cpu threads, OpenMP,
 `--bench-warmup 5 --bench-runs 15`. Transcripts on both clips are
 bit-equal to NeMo PyTorch reference at every tier tested, including
-`q4_0`.
+`q4_0`. To reproduce / compare across GGUF tiers and backends:
 
-**Recommended defaults** on current CPU hardware:
-- `q8_0` — the speed + accuracy sweet spot. 11 % faster than
-  onnxruntime on 20 s audio best-case encoder, 23 % faster on 11 s.
-  Model 2x smaller than f16.
-- `q4_0` — smallest runnable variant (3.5x smaller than f16), still
-  bit-equal transcripts on clean speech.
+```bash
+./build/qvac-parakeet --model models/parakeet-ctc-0.6b.q8_0.gguf \
+    --wav test/samples/sample-16k.wav \
+    --bench --bench-runs 15 --bench-warmup 5 \
+    --bench-json artifacts/bench/my-q8_0.json
+```
 
-`q5_0` ships as well but the ggml-cpu `q5_0` mul_mat kernel is slower
-than either `q8_0` or `q4_0` on Apple Silicon, so it's only useful if
-you want the `q5_0` size tier specifically.
+For per-sub-stage encoder profiling (subsampling / CTC head / per-block
+times across `n_layers = {0, 1, N/2, N}`):
+
+```bash
+./build/qvac-parakeet --model models/parakeet-ctc-0.6b.q8_0.gguf \
+    --wav test/samples/sample-16k.wav \
+    --profile --profile-runs 5 --profile-warmup 2
+```
+
+**Defaults**: `q8_0` is the speed/accuracy sweet spot (2x smaller
+than f16, bit-equal transcripts, 11-23 % faster than onnxruntime on
+typical clips). `q4_0` is 3.5x smaller still and also bit-equal on
+clean speech. `q5_0` ships but its mul_mat kernel is slower than both
+on Apple Silicon, so it's only useful if you want the `q5_0` size
+tier specifically.
 
 ### Reference comparison vs onnxruntime (20 s clip, sample-16k.wav, 5 warmup + 15 timed runs)
 
@@ -271,7 +281,8 @@ you want the `q5_0` size tier specifically.
   Transcripts            match           match
 ```
 
-**GPU Metal** — same GGUF, Metal backend (`-DGGML_METAL=ON`, `PARAKEET_BACKEND=metal`):
+**GPU Metal** — same GGUF, Metal backend (build with `-DGGML_METAL=ON`,
+run with `--n-gpu-layers 1`):
 
 ```
                    onnxruntime-int8    ggml-metal-q8_0
@@ -283,17 +294,19 @@ you want the `q5_0` size tier specifically.
   inf stdev ms             18             0.83      (21x tighter)
   RTF best               0.034           0.014
   RTF median             0.035           0.014
-  Transcripts            match           match      (73x real-time!)
+  Transcripts            match           match
 ```
 
-On CPU, onnxruntime uses AMX-accelerated kernels and is 12–25 %
-faster on raw throughput. On Metal (Apple Silicon GPU), ggml is
-**2.4–2.5× faster** than onnxruntime int8 with 21× tighter run-to-run
-variance (0.83 ms stdev vs 18 ms). Metal inference is compute-bound
-on shader units, so the choice of quant tier (f16 / Q8_0 / Q4_0) only
-affects file size — all three land at ~272 ms encoder on a 20 s clip.
+Summary: on CPU, onnxruntime's AMX-accelerated kernels are 12-25 %
+faster than ggml-cpu. On Metal, ggml is **2.4-2.5x faster** than
+onnxruntime int8 with 21x tighter variance, landing the 20 s clip's
+encoder at **~73x real-time**; quant tier (f16 / Q8_0 / Q4_0) only
+affects file size, not throughput, because the Metal path is
+compute-bound on shader units.
 
-## 3. Run - wav -> text
+## 3. Usage
+
+### Quickstart: wav -> text
 
 ```bash
 ./build/qvac-parakeet \
@@ -301,16 +314,25 @@ affects file size — all three land at ~272 ms encoder on a 20 s clip.
     --wav   test/samples/jfk.wav
 ```
 
+Auto-routing on the model type means the same command also works on
+TDT GGUFs (you get cased + punctuated text) and on Sortformer GGUFs
+(you get `[start-end] speaker_N` lines instead of text). See `--help`
+for the full flag set.
+
 ### Raw PCM input
 
 For headless pipelines (ffmpeg / sox upstream, or the QVAC bindings), the
-CLI also accepts raw 16 kHz mono PCM via `--pcm-in`:
+CLI also accepts raw mono PCM via `--pcm-in`. The raw stream carries no
+header, so you must pass `--pcm-rate HZ` to match the model's expected
+sample rate -- omitting it falls back to the model's rate with a
+warning, and a mismatched rate fails fast (resampling is not yet wired):
 
 ```bash
 ./build/qvac-parakeet \
     --model models/parakeet-ctc-0.6b.gguf \
     --pcm-in recording.raw \
-    --pcm-format s16le        # or f32le; defaults to s16le
+    --pcm-format s16le \   # or f32le; defaults to s16le
+    --pcm-rate   16000     # required for fail-fast; warning + fallback if omitted
 ```
 
 ### Streaming — Mode 2 (full audio in, segments streamed out)
@@ -357,17 +379,11 @@ Flags:
 - `--emit jsonl` — one `{"chunk","start","end","is_final","text"}` JSON
   object per line, for easy downstream consumption.
 
-Observed on an Apple M4 Air (Metal Q8_0) feeding a 5.5 minute speech
-clip (`LastQuestion_long_EN.raw`, 16 kHz s16le):
-
-```
-audio=327.91s samples=5246635@16000Hz mel_frames=32792 enc_frames=4099
-mel=152ms enc=14941ms dec=5ms total=15099ms RTF=0.046 tokens=1710
-```
-
-Segments are emitted to stdout at the `--stream-chunk-ms` cadence once
-the offline encoder finishes. Mode 2 is *cosmetic streaming*: first
-segment lands after the full encoder pass.
+On a 5.5 minute speech clip (`LastQuestion_long_EN.raw`, 16 kHz
+s16le) Mode 2 lands at **RTF 0.046** (~22x real-time) on M4 Air with
+Metal Q8_0. Segments are emitted at the `--stream-chunk-ms` cadence
+once the offline encoder finishes -- Mode 2 is *cosmetic streaming*:
+first segment lands after the full encoder pass.
 
 ### Streaming — Mode 3 (live duplex, cache-aware inference)
 
@@ -399,14 +415,10 @@ From the CLI (simulates a live producer feeding the same wav in blocks):
     --emit text         # or jsonl
 ```
 
-Mode 3 knobs (all in `StreamingOptions` on the C++ side,
-`--stream-*-ms` on the CLI):
-
-- `chunk_ms` — audio stride at which segments are emitted.
-- `left_context_ms` — past audio prepended to the encoder input each
-  chunk. 10 s is a solid default; diminishing returns past 5 s.
-- `right_lookahead_ms` — future audio appended before emitting the
-  chunk; most impactful accuracy knob.
+`--stream-left-context-ms` is the audio context per chunk (10 s is
+the default; diminishing returns past 5 s); `--stream-right-lookahead-ms`
+is the most impactful accuracy knob (future audio appended before
+emitting). Both have `StreamingOptions` mirrors on the C++ side.
 
 Measured on Apple M4 Air, Q8_0, Metal backend:
 
@@ -424,135 +436,9 @@ window. A KV-cache + conv-state optimisation (Phase 8.5) will roughly
 accuracy; the `StreamSession` public API already supports it as a
 drop-in swap.
 
-The Node binding at
-[qvac-lib-infer-parakeet](https://github.com/qvac/qvac-lib-infer-parakeet)
-is the intended consumer for `StreamSession` -- the push API is
-designed so each incoming `Buffer` from the binding's existing
-`append({type:'audio', data})` flow maps to `feed_pcm_i16` and
-`{type:'end of job'}` maps to `finalize()`. Cross-check the binding's
-README for which version of `qvac-parakeet.cpp` it currently links
-against.
-
-### Live microphone example
-
-`examples/live-mic.cpp` wraps `StreamSession` around
-[`miniaudio`](https://miniaud.io/) (single-header, MIT, vendored under
-`examples/miniaudio.h`) for real-time transcription from the default
-capture device on macOS / Linux / Windows. Terminal output only, no GUI.
-
-```bash
-# Built as part of the default CLI target set when the project is the
-# top-level CMake (`QVAC_PARAKEET_BUILD_EXAMPLES` defaults to
-# `QVAC_PARAKEET_STANDALONE_DEFAULT`, i.e. ON for `cmake -S . -B build`
-# but OFF for sub-projects). Pass `-DQVAC_PARAKEET_BUILD_EXAMPLES=ON`
-# explicitly when consuming this repo as a sub-project.
-
-# List capture devices:
-./build-metal/live-mic --list-devices
-
-# Transcribe live (Ctrl-C to stop, Metal backend recommended):
-./build-metal/live-mic \
-    --model models/parakeet-ctc-0.6b.q8_0.gguf \
-    --n-gpu-layers 1 \
-    --chunk-ms 1000 --left-context-ms 5000 --right-lookahead-ms 1000
-
-# Same, but accumulate transcript on a single line and only emit a
-# newline after 1 s of silence (hands-free dictation feel):
-./build-metal/live-mic \
-    --model models/parakeet-tdt-0.6b-v3.q8_0.gguf \
-    --n-gpu-layers 1 \
-    --chunk-ms 1000 --left-context-ms 5000 --right-lookahead-ms 1000 \
-    --accumulate --silence-flush-ms 1000
-```
-
-First time you run it macOS will prompt for microphone access. The
-capture thread pushes f32 samples into a mutex-guarded queue; the main
-thread drains the queue and calls `StreamSession::feed_pcm_f32`, so
-the encoder runs off the audio callback thread (no capture-buffer
-stalls). Ctrl-C sets a stop flag, the capture device is stopped, the
-tail buffer is flushed, `finalize()` emits the last segment, and the
-binary exits cleanly.
-
-Defaults chosen for an interactive feel: first segment lands ~2 s
-after you start speaking
-(`chunk_ms + right_lookahead_ms + encoder_time`); segments afterward
-at the `chunk_ms` cadence.
-
-When `--model` points at a Sortformer GGUF (e.g.
-`models/sortformer-4spk-v1.f16.gguf`) `live-mic` automatically switches
-to live diarization mode: instead of transcript segments it prints
-`[start-end] speaker_N` per chunk via the same push API
-(`SortformerStreamSession`). See "Streaming — Sortformer (live
-diarization)" below.
-
-### Live microphone with speaker attribution (`live-mic-attributed`)
-
-`examples/live-mic-attributed.cpp` runs a transcription engine
-(CTC/TDT) and a Sortformer engine on the **same** mic feed and tags
-each transcript segment with the speaker whose live diarization range
-overlaps it the most. Output:
-
-```
-[2.10-3.00] speaker_0: hello there how are you
-[3.00-4.00] speaker_0: doing today
-[4.00-5.20] speaker_1: I am fine thanks
-```
-
-```bash
-./build/live-mic-attributed \
-    --asr-model  models/parakeet-tdt-0.6b-v3.q8_0.gguf \
-    --diar-model models/sortformer-4spk-v1.f16.gguf \
-    --asr-chunk-ms 1000  --asr-left-context-ms 5000 --asr-right-lookahead-ms 1000 \
-    --diar-chunk-ms 2000 --diar-history-ms 30000
-```
-
-Each captured audio batch is forwarded to both `StreamSession`
-(transcription) and `SortformerStreamSession` (diarization). The
-diarization callback maintains a sliding deque of recent
-`[start, end, speaker]` spans; the transcription callback looks up the
-most-overlapping span at the segment's time range and tags the line.
-A short stderr log line `[diar] active speaker_N at t.ts` fires on
-speaker switches.
-
-Knobs:
-
-- `--asr-chunk-ms / --asr-left-context-ms / --asr-right-lookahead-ms`:
-  same as `live-mic` for transcription.
-- `--diar-chunk-ms / --diar-history-ms`: same as `Engine::diarize_start`.
-- `--speaker-history-ms` (default 60000): how much diarization history
-  to retain for the attribution lookup. Increase for very long
-  conversations; decrease if memory is tight.
-- `--asr-n-gpu-layers / --diar-n-gpu-layers`: independent GPU offload
-  knobs so you can run e.g. ASR on Metal and diarization on CPU (or
-  vice versa) on machines with a single GPU.
-- `--accumulate`: instead of one line per transcription chunk,
-  accumulate text on a single line per speaker and emit a newline on
-  speaker change or after `--silence-flush-ms` of silence (default
-  1000). Same UX as `live-mic --accumulate`, but each line is
-  prefixed with `speaker_N:`. Output looks like:
-
-  ```
-  speaker_0: hello there how are you doing today
-  speaker_1: I am fine thanks how about yourself
-  speaker_0: pretty good thanks for asking
-  ```
-
-Metal-backed binary lives under `build-metal/live-mic-attributed`
-once the project has been configured with `-DGGML_METAL=ON` (the
-existing `build-metal/` directory in this repo is already configured
-for that):
-
-```bash
-./build-metal/live-mic-attributed \
-    --asr-model  models/parakeet-tdt-0.6b-v3.q8_0.gguf  --asr-n-gpu-layers 1 \
-    --diar-model models/sortformer-4spk-v1.f16.gguf    --diar-n-gpu-layers 1 \
-    --accumulate
-```
-
-Caveat (Phase 11.11.1): the underlying `SortformerStreamSession` uses
-sliding-history streaming, so speaker IDs may shift in the very first
-chunks before the history fills. Phase 11.11.2 will fix this with
-spkcache compression.
+The Node binding at [qvac-lib-infer-parakeet](https://github.com/qvac/qvac-lib-infer-parakeet)
+is the intended consumer for `StreamSession`; check its README for
+the `qvac-parakeet.cpp` version it currently links against.
 
 ### Streaming — Sortformer (live diarization)
 
@@ -596,8 +482,8 @@ CLI:
 Trade-offs of the Phase 11.11.1 pragmatic implementation:
 
 - **Pro**: works with both v1 and v2 Sortformer GGUFs out of the box,
-  no encoder graph split, no spkcache state. ~RTF 0.25 on M3 with
-  `chunk_ms=2000 history_ms=30000` (each chunk re-runs the full
+  no encoder graph split, no spkcache state. ~RTF 0.25 on M4 Air CPU
+  with `chunk_ms=2000 history_ms=30000` (each chunk re-runs the full
   encoder over the trailing 30 s).
 - **Pro**: speaker IDs stabilise within a few chunks once the history
   window contains both speakers' audio.
@@ -609,18 +495,166 @@ Phase 11.11.2 (planned) implements true NeMo-style streaming with
 `spkcache` compression + encoder graph split for fully stable
 cross-chunk speaker identity at lower per-chunk compute.
 
-## 4. Optional: validate against NeMo PyTorch
+### Live microphone
+
+Three example binaries take audio from the system default mic via
+[`miniaudio`](https://miniaud.io/) (single-header, MIT, vendored
+under `examples/miniaudio.h`) and drive the streaming push API.
+Terminal output only, no GUI. First run on macOS will prompt for
+microphone access. Across all three examples: capture happens on the
+audio callback thread into a mutex-guarded queue; the main thread
+drains and feeds the engine, so the encoder never blocks the
+capture buffer. Ctrl-C stops the device, flushes the tail, and
+`finalize()`s cleanly.
+
+#### `live-mic` -- transcription **or** diarization
+
+`examples/live-mic.cpp` auto-detects the GGUF: a CTC/TDT model drives
+`StreamSession` and prints transcript segments; a Sortformer model
+drives `SortformerStreamSession` and prints `[start-end] speaker_N`
+lines.
 
 ```bash
-# One-time: dump NeMo reference tensors from the same wav.
+# List capture devices:
+./build-metal/live-mic --list-devices
+
+# Live transcription (Ctrl-C to stop, Metal recommended):
+./build-metal/live-mic \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf \
+    --n-gpu-layers 1 \
+    --chunk-ms 1000 --left-context-ms 5000 --right-lookahead-ms 1000
+
+# Same, but accumulate transcript on a single line and emit a newline
+# after 1 s of silence (hands-free dictation feel):
+./build-metal/live-mic \
+    --model models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+    --n-gpu-layers 1 \
+    --chunk-ms 1000 --left-context-ms 5000 --right-lookahead-ms 1000 \
+    --accumulate --silence-flush-ms 1000
+
+# Live diarization (same binary, Sortformer GGUF auto-detected):
+./build-metal/live-mic \
+    --model models/sortformer-4spk-v1.f16.gguf \
+    --chunk-ms 2000 --history-ms 30000
+```
+
+Defaults are tuned for an interactive feel: first transcription
+segment lands ~2 s after you start speaking
+(`chunk_ms + right_lookahead_ms + encoder_time`), then at the
+`chunk_ms` cadence.
+
+#### `live-mic-attributed` -- ASR + diarization in one binary
+
+`examples/live-mic-attributed.cpp` loads a CTC/TDT engine and a
+Sortformer engine, forwards each captured batch to both, and tags
+each transcript segment with the speaker whose live diarization
+range overlaps it the most:
+
+```
+[2.10-3.00] speaker_0: hello there how are you
+[3.00-4.00] speaker_0: doing today
+[4.00-5.20] speaker_1: I am fine thanks
+```
+
+```bash
+./build/live-mic-attributed \
+    --asr-model  models/parakeet-tdt-0.6b-v3.q8_0.gguf \
+    --diar-model models/sortformer-4spk-v1.f16.gguf \
+    --asr-chunk-ms 1000  --asr-left-context-ms 5000 --asr-right-lookahead-ms 1000 \
+    --diar-chunk-ms 2000 --diar-history-ms 30000
+```
+
+Each captured audio batch is forwarded to both `StreamSession`
+(transcription) and `SortformerStreamSession` (diarization). The
+diarization callback maintains a sliding deque of recent
+`[start, end, speaker]` spans; the transcription callback looks up
+the most-overlapping span at the segment's time range and tags the
+line. `[diar] active speaker_N at t.ts` fires on stderr at speaker
+switches.
+
+Knobs:
+
+- `--asr-chunk-ms / --asr-left-context-ms / --asr-right-lookahead-ms`:
+  same as `live-mic` for transcription.
+- `--diar-chunk-ms / --diar-history-ms`: same as `Engine::diarize_start`.
+- `--speaker-history-ms` (default 60000): how much diarization history
+  to retain for the attribution lookup. Increase for very long
+  conversations; decrease if memory is tight.
+- `--asr-n-gpu-layers / --diar-n-gpu-layers`: independent GPU offload
+  knobs so you can run e.g. ASR on Metal and diarization on CPU (or
+  vice versa) on machines with a single GPU.
+- `--accumulate`: collapse output to one line per speaker and emit
+  a newline on speaker change or after `--silence-flush-ms` of
+  silence (default 1000). Same UX as `live-mic --accumulate`, but
+  each line is prefixed with `speaker_N:`. Output looks like:
+
+  ```
+  speaker_0: hello there how are you doing today
+  speaker_1: I am fine thanks how about yourself
+  speaker_0: pretty good thanks for asking
+  ```
+
+With `-DGGML_METAL=ON`, the same example runs both engines on the
+GPU (use independent `--asr-n-gpu-layers` / `--diar-n-gpu-layers`
+to mix CPU and GPU on a single-GPU machine):
+
+```bash
+./build-metal/live-mic-attributed \
+    --asr-model  models/parakeet-tdt-0.6b-v3.q8_0.gguf  --asr-n-gpu-layers 1 \
+    --diar-model models/sortformer-4spk-v1.f16.gguf    --diar-n-gpu-layers 1 \
+    --accumulate
+```
+
+The same Phase 11.11.1 sliding-history caveat from "Streaming --
+Sortformer" applies to the speaker IDs the attribution layer sees.
+
+## 4. Optional: validate against NeMo PyTorch
+
+CTC parity (mel + encoder + greedy decode):
+
+```bash
 python scripts/dump-ctc-reference.py \
     --wav test/samples/jfk.wav \
     --out artifacts/ctc-ref
 
-# C++ parity harnesses.
-./build/test-mel     test/samples/jfk.wav artifacts/ctc-ref/mel.npy
+./build/test-mel     models/parakeet-ctc-0.6b.gguf test/samples/jfk.wav artifacts/ctc-ref/mel.npy
 ./build/test-encoder models/parakeet-ctc-0.6b.gguf artifacts/ctc-ref
 ./build/test-ctc     models/parakeet-ctc-0.6b.gguf artifacts/ctc-ref/logits.npy
+```
+
+TDT parity (encoder per-stage; the decoder is checked end-to-end via
+the CLI transcript byte-equality check on `jfk.wav`):
+
+```bash
+python scripts/dump-tdt-reference.py \
+    --wav test/samples/jfk.wav \
+    --out artifacts/tdt-ref
+
+./build/test-tdt-encoder-parity \
+    models/parakeet-tdt-0.6b-v3.q8_0.gguf test/samples/jfk.wav artifacts/tdt-ref
+```
+
+Sortformer parity (mel + encoder + speaker-prob head):
+
+```bash
+python scripts/dump-sortformer-reference.py \
+    --wav  test/samples/two-speakers-16k.wav \
+    --out  artifacts/sortformer-ref
+
+./build/test-sortformer-parity \
+    models/sortformer-4spk-v1.f16.gguf test/samples/two-speakers-16k.wav artifacts/sortformer-ref
+```
+
+Streaming smoke tests (Mode 1/2/3 byte-equality + WER tolerance for
+CTC/TDT; sliding-history push API + no-duplicate + single-`is_final`
+for Sortformer):
+
+```bash
+./build/test-streaming \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf --wav test/samples/jfk.wav
+
+./build/test-sortformer-streaming \
+    --model models/sortformer-4spk-v1.f16.gguf --wav test/samples/two-speakers-16k.wav
 ```
 
 Expected per-stage rel error (NeMo PyTorch vs C++ at `--quant f16`):
@@ -629,14 +663,16 @@ Expected per-stage rel error (NeMo PyTorch vs C++ at `--quant f16`):
 Stage A  log_mel               ~ 1e-4 inner / ~ 2e-3 boundary (f32 FFT)
 Stage B  subsampling_out       rel ~ 1e-3 (f16 quantization floor)
 Stage C  block_0_out           rel ~ 1e-3
-Stage D  block_23_out          rel ~ 2e-3
-Stage E  ctc_logits            rel ~ 1e-3
+Stage D  block_last_out        rel ~ 2e-3
+Stage E  ctc_logits            rel ~ 1e-3   (CTC head only)
 Stage F  decoded transcript    edit distance = 0 on clean speech
+Stage S  speaker_probs         rel ~ 2e-4   (Sortformer head)
 ```
 
 At `--quant q8_0` through `q4_0` the per-stage rel inflates by ~3x
-to ~25x, but the transcript stays bit-equal on clean speech. See
-`PROGRESS.md` 5.12 for the sweep results.
+to ~25x, but the CTC transcript stays bit-equal on clean speech. See
+`PROGRESS.md` §5.12 for the CTC quant sweep, §10.x for TDT, and §11.x
+for Sortformer.
 
 ## Current status
 
@@ -760,9 +796,11 @@ qvac-parakeet.cpp/
 
 Released under the [Apache License 2.0](LICENSE).
 
-**Model license**: the Parakeet-CTC-0.6B weights are licensed
-[CC-BY-4.0 by NVIDIA](https://huggingface.co/nvidia/parakeet-ctc-0.6b).
+**Model licenses**: every NVIDIA Parakeet (CTC, TDT) and Sortformer
+checkpoint listed in the model table at the top of this README ships
+under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) on
+Hugging Face -- check each model card for the canonical attribution.
 This repository only ships the inference code; model weights are
-downloaded on demand.
+downloaded on demand by the converter / `download-all-models.sh`.
 
 The bundled `ggml/` is MIT-licensed (see `ggml/LICENSE`).
