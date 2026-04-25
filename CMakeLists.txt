@@ -37,6 +37,7 @@ set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
     src/parakeet_engine.cpp
     src/parakeet_tdt.cpp
+    src/parakeet_sortformer.cpp
     src/mel_preprocess.cpp
     src/sentencepiece_bpe.cpp
 )
@@ -135,6 +136,17 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml)
     target_include_directories(test-tdt-encoder-parity PRIVATE include src ggml/include)
+
+    add_executable(test-sortformer-parity
+        src/test_sortformer_parity.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp)
+    target_link_libraries(test-sortformer-parity PRIVATE ggml)
+    target_include_directories(test-sortformer-parity PRIVATE include src ggml/include)
 endif()
 
 if (QVAC_PARAKEET_BUILD_EXAMPLES)
