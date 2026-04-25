@@ -39,6 +39,14 @@ struct EncoderConfig {
     int tdt_pred_rnn_layers    = 2;
     int tdt_joint_hidden       = 640;
     int tdt_num_durations      = 5;
+
+    int  sortformer_num_spks   = 4;
+    int  sortformer_fc_d_model = 512;
+    int  sortformer_tf_d_model = 192;
+    int  sortformer_tf_n_layers   = 18;
+    int  sortformer_tf_n_heads    = 8;
+    int  sortformer_tf_inner_size = 768;
+    bool sortformer_tf_pre_ln  = false;
 };
 
 struct SubsamplingWeights {
@@ -129,6 +137,36 @@ struct TdtWeights {
 enum class ParakeetModelType {
     CTC,
     TDT,
+    SORTFORMER,
+};
+
+struct SortformerTransformerBlock {
+    ggml_tensor * attn_q_w  = nullptr;
+    ggml_tensor * attn_q_b  = nullptr;
+    ggml_tensor * attn_k_w  = nullptr;
+    ggml_tensor * attn_k_b  = nullptr;
+    ggml_tensor * attn_v_w  = nullptr;
+    ggml_tensor * attn_v_b  = nullptr;
+    ggml_tensor * attn_o_w  = nullptr;
+    ggml_tensor * attn_o_b  = nullptr;
+    ggml_tensor * ln1_w     = nullptr;
+    ggml_tensor * ln1_b     = nullptr;
+    ggml_tensor * ffn_in_w  = nullptr;
+    ggml_tensor * ffn_in_b  = nullptr;
+    ggml_tensor * ffn_out_w = nullptr;
+    ggml_tensor * ffn_out_b = nullptr;
+    ggml_tensor * ln2_w     = nullptr;
+    ggml_tensor * ln2_b     = nullptr;
+};
+
+struct SortformerWeights {
+    ggml_tensor * encoder_proj_w = nullptr;
+    ggml_tensor * encoder_proj_b = nullptr;
+    std::vector<SortformerTransformerBlock> transformer;
+    ggml_tensor * head_h2h_w = nullptr;
+    ggml_tensor * head_h2h_b = nullptr;
+    ggml_tensor * head_h2s_w = nullptr;
+    ggml_tensor * head_h2s_b = nullptr;
 };
 
 struct ParakeetCtcModel {
@@ -149,6 +187,7 @@ struct ParakeetCtcModel {
     std::vector<BlockWeights> blocks;
     CtcHeadWeights            ctc;
     TdtWeights                tdt;
+    SortformerWeights         sortformer;
 
     ggml_tensor * mel_filterbank = nullptr;
     ggml_tensor * window         = nullptr;

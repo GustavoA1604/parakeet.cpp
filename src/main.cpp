@@ -325,6 +325,12 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                      sr, model.mel_cfg.sample_rate);
         return 5;
     }
+    if (model.model_type == ParakeetModelType::SORTFORMER) {
+        std::fprintf(stderr, "error: loaded GGUF is a Sortformer diarization model. The C++\n"
+                             "       diarize() forward pass is not yet wired (PROGRESS.md Phase 11.4).\n"
+                             "       Pass a parakeet-ctc-* / parakeet-tdt-* GGUF for transcription.\n");
+        return 5;
+    }
     const double wav_ms = ms_since(t_wav);
     const double audio_ms = 1000.0 * (double) samples.size() / (double) sr;
 

@@ -72,7 +72,12 @@ const EngineOptions & Engine::options() const {
 }
 
 std::string Engine::model_type() const {
-    return pimpl_->model.model_type == ParakeetModelType::TDT ? "tdt" : "ctc";
+    switch (pimpl_->model.model_type) {
+        case ParakeetModelType::TDT:        return "tdt";
+        case ParakeetModelType::SORTFORMER: return "sortformer";
+        case ParakeetModelType::CTC:
+        default:                            return "ctc";
+    }
 }
 
 void Engine::cancel() {
@@ -97,6 +102,12 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
         throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples: input is " +
                                  std::to_string(sample_rate) + " Hz but model expects " +
                                  std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
+    }
+    if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
+        throw std::runtime_error(
+            "qvac_parakeet::ctc::Engine::transcribe_samples: loaded GGUF is a Sortformer "
+            "diarization model; use Engine::diarize() instead. The diarize() forward pass "
+            "lands in Phase 11.4 (PROGRESS.md).");
     }
 
     pimpl_->cancel_flag.store(false);
@@ -192,6 +203,11 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     if (opts.chunk_ms <= 0) {
         throw std::runtime_error("qvac_parakeet::ctc::Engine::transcribe_samples_stream: "
                                  "StreamingOptions.chunk_ms must be > 0");
+    }
+    if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
+        throw std::runtime_error(
+            "transcribe_samples_stream: streaming is for transcription models only; "
+            "Sortformer is a diarization model. Use Engine::diarize().");
     }
 
     pimpl_->cancel_flag.store(false);
@@ -543,6 +559,11 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     }
     if (opts.left_context_ms < 0 || opts.right_lookahead_ms < 0) {
         throw std::runtime_error("Engine::stream_start: left_context_ms and right_lookahead_ms must be >= 0");
+    }
+    if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
+        throw std::runtime_error(
+            "Engine::stream_start: streaming is for transcription models only; "
+            "Sortformer is a diarization model. Use Engine::diarize().");
     }
 
     auto impl = std::make_unique<StreamSession::Impl>();

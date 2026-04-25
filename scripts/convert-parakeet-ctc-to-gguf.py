@@ -99,13 +99,16 @@ def load_nemo(ckpt: Path):
         cfg_m = t.getmember("./model_config.yaml")
         cfg   = yaml.safe_load(t.extractfile(cfg_m).read().decode())
 
-        tok_fname = Path(cfg["tokenizer"]["model_path"].split("nemo:", 1)[1]).name
-        for m in t.getmembers():
-            if m.name.endswith("/" + tok_fname) or m.name.endswith(tok_fname):
-                tok_bytes = t.extractfile(m).read()
-                break
-        else:
-            raise RuntimeError(f"tokenizer.model ({tok_fname}) not found in {ckpt}")
+        tok_bytes = b""
+        tok_cfg   = cfg.get("tokenizer")
+        if tok_cfg and tok_cfg.get("model_path"):
+            tok_fname = Path(tok_cfg["model_path"].split("nemo:", 1)[1]).name
+            for m in t.getmembers():
+                if m.name.endswith("/" + tok_fname) or m.name.endswith(tok_fname):
+                    tok_bytes = t.extractfile(m).read()
+                    break
+            else:
+                raise RuntimeError(f"tokenizer.model ({tok_fname}) not found in {ckpt}")
 
         w_m = t.getmember("./model_weights.ckpt")
         buf = io.BytesIO(t.extractfile(w_m).read())
@@ -116,6 +119,8 @@ def load_nemo(ckpt: Path):
 
 def detect_model_type(cfg: dict) -> str:
     target = cfg.get("target", "")
+    if "Sortformer" in target or "sortformer_modules" in cfg:
+        return "sortformer"
     if "RNNT" in target or "tdt" in cfg.get("loss", {}).get("loss_name", "").lower():
         return "tdt"
     return "ctc"
@@ -139,7 +144,7 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
 
     enc = cfg["encoder"]
     pre = cfg["preprocessor"]
-    dec = cfg["decoder"]
+    dec = cfg.get("decoder", {})
 
     d_model       = int(enc["d_model"])
     n_layers      = int(enc["n_layers"])
@@ -168,8 +173,9 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     writer = gguf.GGUFWriter(str(out), arch=ARCH)
 
     model_name = {
-        "ctc": f"parakeet-ctc-{d_model}-{n_layers}l",
-        "tdt": f"parakeet-tdt-{d_model}-{n_layers}l",
+        "ctc":         f"parakeet-ctc-{d_model}-{n_layers}l",
+        "tdt":         f"parakeet-tdt-{d_model}-{n_layers}l",
+        "sortformer":  f"sortformer-{d_model}-{n_layers}l",
     }[model_type]
     writer.add_name(model_name)
     writer.add_description(f"NVIDIA Parakeet-{model_type.upper()} FastConformer ASR (CC-BY-4.0)")
@@ -204,6 +210,17 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         blank_id   = vocab_size - 1
         writer.add_uint32("parakeet.ctc.vocab_size", vocab_size)
         writer.add_uint32("parakeet.ctc.blank_id",   blank_id)
+    elif model_type == "sortformer":
+        sf  = cfg["sortformer_modules"]
+        tfe = cfg["transformer_encoder"]
+        writer.add_uint32("parakeet.sortformer.num_spks",        int(sf["num_spks"]))
+        writer.add_uint32("parakeet.sortformer.fc_d_model",      int(sf["fc_d_model"]))
+        writer.add_uint32("parakeet.sortformer.tf_d_model",      int(sf["tf_d_model"]))
+        writer.add_uint32("parakeet.sortformer.tf_n_layers",     int(tfe["num_layers"]))
+        writer.add_uint32("parakeet.sortformer.tf_inner_size",   int(tfe["inner_size"]))
+        writer.add_uint32("parakeet.sortformer.tf_n_heads",      int(tfe["num_attention_heads"]))
+        writer.add_bool  ("parakeet.sortformer.tf_pre_ln",       bool(tfe.get("pre_ln", False)))
+        writer.add_string("parakeet.sortformer.tf_hidden_act",   str(tfe.get("hidden_act", "relu")))
     else:
         pred_hidden      = int(dec["prednet"]["pred_hidden"])
         pred_rnn_layers  = int(dec["prednet"]["pred_rnn_layers"])
@@ -224,11 +241,14 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         writer.add_uint32("parakeet.tdt.num_durations",    num_durations)
         writer.add_array ("parakeet.tdt.durations",        durations)
 
-    writer.add_string("tokenizer.ggml.model", "sentencepiece")
-    writer.add_array ("tokenizer.ggml.sentencepiece_model",
-                      list(tok_bytes))
+    if tok_bytes:
+        writer.add_string("tokenizer.ggml.model", "sentencepiece")
+        writer.add_array ("tokenizer.ggml.sentencepiece_model",
+                          list(tok_bytes))
 
     try:
+        if not tok_bytes:
+            raise RuntimeError("no tokenizer in checkpoint (e.g. Sortformer)")
         import sentencepiece as spm
         sp = spm.SentencePieceProcessor()
         sp.load_from_serialized_proto(tok_bytes)
@@ -367,6 +387,43 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         dec_b = sd["decoder.decoder_layers.0.bias"]
         add_2d ("ctc.decoder.weight", dec_w)
         add_f32("ctc.decoder.bias",   dec_b)
+    elif model_type == "sortformer":
+        add_2d ("sortformer.encoder_proj.weight", sd["sortformer_modules.encoder_proj.weight"])
+        add_f32("sortformer.encoder_proj.bias",   sd["sortformer_modules.encoder_proj.bias"])
+
+        tf_n_layers = int(cfg["transformer_encoder"]["num_layers"])
+        for i in range(tf_n_layers):
+            k = f"transformer_encoder.layers.{i}"
+            p = f"sortformer.transformer.blk.{i}"
+
+            add_2d (f"{p}.attn.q.weight",   sd[f"{k}.first_sub_layer.query_net.weight"])
+            add_f32(f"{p}.attn.q.bias",     sd[f"{k}.first_sub_layer.query_net.bias"])
+            add_2d (f"{p}.attn.k.weight",   sd[f"{k}.first_sub_layer.key_net.weight"])
+            add_f32(f"{p}.attn.k.bias",     sd[f"{k}.first_sub_layer.key_net.bias"])
+            add_2d (f"{p}.attn.v.weight",   sd[f"{k}.first_sub_layer.value_net.weight"])
+            add_f32(f"{p}.attn.v.bias",     sd[f"{k}.first_sub_layer.value_net.bias"])
+            add_2d (f"{p}.attn.out.weight", sd[f"{k}.first_sub_layer.out_projection.weight"])
+            add_f32(f"{p}.attn.out.bias",   sd[f"{k}.first_sub_layer.out_projection.bias"])
+
+            add_f32(f"{p}.ln1.weight",      sd[f"{k}.layer_norm_1.weight"])
+            add_f32(f"{p}.ln1.bias",        sd[f"{k}.layer_norm_1.bias"])
+
+            add_2d (f"{p}.ffn.in.weight",   sd[f"{k}.second_sub_layer.dense_in.weight"])
+            add_f32(f"{p}.ffn.in.bias",     sd[f"{k}.second_sub_layer.dense_in.bias"])
+            add_2d (f"{p}.ffn.out.weight",  sd[f"{k}.second_sub_layer.dense_out.weight"])
+            add_f32(f"{p}.ffn.out.bias",    sd[f"{k}.second_sub_layer.dense_out.bias"])
+
+            add_f32(f"{p}.ln2.weight",      sd[f"{k}.layer_norm_2.weight"])
+            add_f32(f"{p}.ln2.bias",        sd[f"{k}.layer_norm_2.bias"])
+
+        add_2d ("sortformer.head.first_hidden_to_hidden.weight",
+                sd["sortformer_modules.first_hidden_to_hidden.weight"])
+        add_f32("sortformer.head.first_hidden_to_hidden.bias",
+                sd["sortformer_modules.first_hidden_to_hidden.bias"])
+        add_2d ("sortformer.head.single_hidden_to_spks.weight",
+                sd["sortformer_modules.single_hidden_to_spks.weight"])
+        add_f32("sortformer.head.single_hidden_to_spks.bias",
+                sd["sortformer_modules.single_hidden_to_spks.bias"])
     else:
         add_2d ("tdt.predict.embed.weight", sd["decoder.prediction.embed.weight"])
 
@@ -396,6 +453,10 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     size_mb = out.stat().st_size / (1024 * 1024)
     if model_type == "ctc":
         vocab_note = f"ctc_vocab={int(cfg['decoder']['num_classes'])+1}"
+    elif model_type == "sortformer":
+        vocab_note = (f"num_spks={cfg['sortformer_modules']['num_spks']} "
+                      f"tf_layers={cfg['transformer_encoder']['num_layers']} "
+                      f"tf_d_model={cfg['transformer_encoder']['hidden_size']}")
     else:
         vocab_note = f"tdt_vocab={int(cfg['decoder']['vocab_size'])} durations={cfg['model_defaults']['tdt_durations']}"
     print(f"[convert] wrote {out} ({size_mb:.1f} MiB, type={model_type}, quant={quant}, {vocab_note}, layers={n_layers}, use_bias={use_bias})", file=sys.stderr)

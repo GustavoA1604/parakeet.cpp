@@ -274,8 +274,9 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.supports_streaming = get_bool(g, "parakeet.encoder.streaming.enabled", false);
 
     const std::string mtype_str = get_str(g, "parakeet.model.type", "ctc");
-    out_model.model_type =
-        (mtype_str == "tdt") ? ParakeetModelType::TDT : ParakeetModelType::CTC;
+    if      (mtype_str == "tdt")        out_model.model_type = ParakeetModelType::TDT;
+    else if (mtype_str == "sortformer") out_model.model_type = ParakeetModelType::SORTFORMER;
+    else                                out_model.model_type = ParakeetModelType::CTC;
 
     if (out_model.model_type == ParakeetModelType::TDT) {
         out_model.encoder_cfg.tdt_pred_hidden     = get_u32(g, "parakeet.tdt.pred_hidden",     640);
@@ -293,6 +294,16 @@ int load_from_gguf(const std::string & gguf_path,
         } else {
             out_model.tdt_durations = {0, 1, 2, 3, 4};
         }
+    }
+
+    if (out_model.model_type == ParakeetModelType::SORTFORMER) {
+        out_model.encoder_cfg.sortformer_num_spks    = get_u32(g, "parakeet.sortformer.num_spks",      4);
+        out_model.encoder_cfg.sortformer_fc_d_model  = get_u32(g, "parakeet.sortformer.fc_d_model",    512);
+        out_model.encoder_cfg.sortformer_tf_d_model  = get_u32(g, "parakeet.sortformer.tf_d_model",    192);
+        out_model.encoder_cfg.sortformer_tf_n_layers   = get_u32(g, "parakeet.sortformer.tf_n_layers",   18);
+        out_model.encoder_cfg.sortformer_tf_n_heads    = get_u32(g, "parakeet.sortformer.tf_n_heads",    8);
+        out_model.encoder_cfg.sortformer_tf_inner_size = get_u32(g, "parakeet.sortformer.tf_inner_size", 768);
+        out_model.encoder_cfg.sortformer_tf_pre_ln   = get_bool(g, "parakeet.sortformer.tf_pre_ln", false);
     }
 
     out_model.mel_cfg.sample_rate = get_u32(g, "parakeet.preproc.sample_rate", 16000);
@@ -408,6 +419,34 @@ int load_from_gguf(const std::string & gguf_path,
     if (out_model.model_type == ParakeetModelType::CTC) {
         out_model.ctc.w = require_tensor(impl->ctx, "ctc.decoder.weight");
         out_model.ctc.b = require_tensor(impl->ctx, "ctc.decoder.bias");
+    } else if (out_model.model_type == ParakeetModelType::SORTFORMER) {
+        out_model.sortformer.encoder_proj_w = require_tensor(impl->ctx, "sortformer.encoder_proj.weight");
+        out_model.sortformer.encoder_proj_b = require_tensor(impl->ctx, "sortformer.encoder_proj.bias");
+        out_model.sortformer.transformer.resize(out_model.encoder_cfg.sortformer_tf_n_layers);
+        for (int i = 0; i < out_model.encoder_cfg.sortformer_tf_n_layers; ++i) {
+            const std::string p = "sortformer.transformer.blk." + std::to_string(i) + ".";
+            SortformerTransformerBlock & b = out_model.sortformer.transformer[i];
+            b.attn_q_w  = require_tensor(impl->ctx, p + "attn.q.weight");
+            b.attn_q_b  = require_tensor(impl->ctx, p + "attn.q.bias");
+            b.attn_k_w  = require_tensor(impl->ctx, p + "attn.k.weight");
+            b.attn_k_b  = require_tensor(impl->ctx, p + "attn.k.bias");
+            b.attn_v_w  = require_tensor(impl->ctx, p + "attn.v.weight");
+            b.attn_v_b  = require_tensor(impl->ctx, p + "attn.v.bias");
+            b.attn_o_w  = require_tensor(impl->ctx, p + "attn.out.weight");
+            b.attn_o_b  = require_tensor(impl->ctx, p + "attn.out.bias");
+            b.ln1_w     = require_tensor(impl->ctx, p + "ln1.weight");
+            b.ln1_b     = require_tensor(impl->ctx, p + "ln1.bias");
+            b.ffn_in_w  = require_tensor(impl->ctx, p + "ffn.in.weight");
+            b.ffn_in_b  = require_tensor(impl->ctx, p + "ffn.in.bias");
+            b.ffn_out_w = require_tensor(impl->ctx, p + "ffn.out.weight");
+            b.ffn_out_b = require_tensor(impl->ctx, p + "ffn.out.bias");
+            b.ln2_w     = require_tensor(impl->ctx, p + "ln2.weight");
+            b.ln2_b     = require_tensor(impl->ctx, p + "ln2.bias");
+        }
+        out_model.sortformer.head_h2h_w = require_tensor(impl->ctx, "sortformer.head.first_hidden_to_hidden.weight");
+        out_model.sortformer.head_h2h_b = require_tensor(impl->ctx, "sortformer.head.first_hidden_to_hidden.bias");
+        out_model.sortformer.head_h2s_w = require_tensor(impl->ctx, "sortformer.head.single_hidden_to_spks.weight");
+        out_model.sortformer.head_h2s_b = require_tensor(impl->ctx, "sortformer.head.single_hidden_to_spks.bias");
     } else {
         out_model.tdt.predict_embed = require_tensor(impl->ctx, "tdt.predict.embed.weight");
         for (int l = 0; l < out_model.encoder_cfg.tdt_pred_rnn_layers; ++l) {
@@ -445,7 +484,9 @@ int load_from_gguf(const std::string & gguf_path,
 }
 
 void print_model_summary(const ParakeetCtcModel & m) {
-    const char * mt = m.model_type == ParakeetModelType::TDT ? "tdt" : "ctc";
+    const char * mt = "ctc";
+    if (m.model_type == ParakeetModelType::TDT)        mt = "tdt";
+    else if (m.model_type == ParakeetModelType::SORTFORMER) mt = "sortformer";
     std::fprintf(stderr, "parakeet-%s loaded:\n", mt);
     std::fprintf(stderr, "  encoder: d_model=%d n_layers=%d n_heads=%d head_dim=%d ff_dim=%d conv_k=%d sub=%dx xscaling=%d untie=%d use_bias=%d\n",
                  m.encoder_cfg.d_model, m.encoder_cfg.n_layers, m.encoder_cfg.n_heads,
@@ -459,6 +500,15 @@ void print_model_summary(const ParakeetCtcModel & m) {
                  (double) m.mel_cfg.log_zero_guard_value);
     if (m.model_type == ParakeetModelType::CTC) {
         std::fprintf(stderr, "  ctc:     vocab=%d blank=%d\n", m.vocab_size, m.blank_id);
+    } else if (m.model_type == ParakeetModelType::SORTFORMER) {
+        std::fprintf(stderr, "  sortformer: num_spks=%d  fc_d_model=%d  tf=%dlx%dh d_model=%d inner=%d pre_ln=%d\n",
+                     m.encoder_cfg.sortformer_num_spks,
+                     m.encoder_cfg.sortformer_fc_d_model,
+                     m.encoder_cfg.sortformer_tf_n_layers,
+                     m.encoder_cfg.sortformer_tf_n_heads,
+                     m.encoder_cfg.sortformer_tf_d_model,
+                     m.encoder_cfg.sortformer_tf_inner_size,
+                     (int) m.encoder_cfg.sortformer_tf_pre_ln);
     } else {
         std::fprintf(stderr, "  tdt:     vocab=%d blank=%d pred_hidden=%d pred_layers=%d joint_hidden=%d durations=[",
                      m.vocab_size, m.blank_id,
