@@ -40,6 +40,15 @@
 
 namespace qvac_parakeet {
 
+// Per-layer LSTM weights, dequantised to host f32. Local to the EOU
+// runtime which still uses the scalar-CPU decode path.
+struct EouRuntimeLstmLayer {
+    std::vector<float> w_ih;
+    std::vector<float> w_hh;
+    std::vector<float> b_ih;
+    std::vector<float> b_hh;
+};
+
 struct EouRuntimeWeights {
     int H_pred  = 640;
     int H_joint = 640;
@@ -52,7 +61,7 @@ struct EouRuntimeWeights {
     int eob_id   = 1025;
 
     std::vector<float> embed;
-    std::vector<TdtRuntimeLstmLayer> lstm;
+    std::vector<EouRuntimeLstmLayer> lstm;
 
     std::vector<float> joint_enc_w;
     std::vector<float> joint_enc_b;

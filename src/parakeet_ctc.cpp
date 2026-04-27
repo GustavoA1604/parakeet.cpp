@@ -98,6 +98,14 @@ struct ParakeetCtcModel::Impl {
     }
 };
 
+ggml_backend_t ParakeetCtcModel::backend_active() const {
+    return impl ? impl->backend_active : nullptr;
+}
+
+ggml_context * ParakeetCtcModel::weights_ctx() const {
+    return impl ? impl->ctx : nullptr;
+}
+
 
 namespace {
 
