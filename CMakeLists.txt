@@ -148,6 +148,18 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml)
     target_include_directories(test-tdt-encoder-parity PRIVATE include src ggml/include)
 
+    add_executable(test-tdt-decoder-parity
+        src/test_tdt_decoder_parity.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp)
+    target_link_libraries(test-tdt-decoder-parity PRIVATE ggml)
+    target_include_directories(test-tdt-decoder-parity PRIVATE include src ggml/include)
+
     add_executable(test-sortformer-parity
         src/test_sortformer_parity.cpp
         src/parakeet_ctc.cpp

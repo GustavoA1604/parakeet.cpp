@@ -2550,7 +2550,7 @@ slots and within a per-tier rel gate for the quant slots
   under §11.x).
 - **Cross-engine VadState + EndOfTurn events.** The
   `is_eou_boundary` + `eot_confidence` slots in `StreamingSegment`
-  were specifically shaped for this: Phase 13 will land a
+  were specifically shaped for this: a follow-up phase will land a
   `StreamEvent` umbrella across qvac-parakeet.cpp + whisper.cpp
   with `OnVadState` / `OnEndOfTurn` callbacks, sourcing from
   whichever engines are loaded (EOU's `<EOU>` -> `OnEndOfTurn`,
@@ -2558,3 +2558,177 @@ slots and within a per-tier rel gate for the quant slots
   fallback otherwise). No new model port needed, no Silero
   dependency -- per the design discussion before Phase 12.0
   started.
+
+## Phase 13 — TDT decoder Metal port  _(done)_
+
+Phase 10 brought up TDT (Token-and-Duration Transducer) end-to-end on
+CPU with the encoder also offloadable to Metal, but the **decoder
+itself bypassed ggml entirely**: at load time the LSTM prediction net
++ joint MLP were dequantised to host `std::vector<float>` and the
+greedy emission loop ran scalar `gemv_f32` per emission step. Even
+with a Metal-accelerated encoder, the decoder owned ~48 % of total
+inference time on the M4 Air (76 ms of 159 ms on a 20 s clip). Phase
+13 ports the decoder to ggml graphs on `backend_active` so it runs
+end-to-end on Metal alongside the encoder.
+
+### 13.1 — graph design
+
+Two fixed-shape per-step graphs plus one window-shape graph, all
+allocated against `model.backend_active()` (Metal / CUDA / Vulkan
+when compiled and `--n-gpu-layers > 0`, else CPU):
+
+  - **`g_lstm_step`** — embedding lookup (`ggml_get_rows` against the
+    native quantised `predict_embed` tensor) + L-layer LSTM unroll
+    expressed as `mul_mat` + `add` + `sigmoid`/`tanh` + element-wise
+    products. Inputs `token_in[1, i32]`, `h_in[H, L]`, `c_in[H, L]`;
+    outputs `h_out[H, L]`, `c_out[H, L]`, `pred_out[H]` (alias for
+    last-layer `h_new`). Built once, reused via
+    `ggml_gallocr_alloc_graph` per emission step.
+  - **`g_joint_step`** — `pred_proj = joint_pred @ pred + b`,
+    `hidden = relu(pred_proj + enc_proj_row)`,
+    `logits = joint_out @ hidden + b`. Inputs `pred_out[H_pred]` and
+    `enc_proj_row[H_joint]`; output `logits[V_out]`.
+  - **`g_enc_proj`** — full-window `enc_proj = joint_enc @ enc + b`
+    matmul (size `[T_enc, D_enc] -> [T_enc, H_joint]`). One per
+    distinct `T_enc` seen (LRU-cached in `enc_proj_cache`). Hoisting
+    this matmul out of the per-step joint graph cuts ~250 small
+    `gemv(640, 1024)` calls per window down to one large `gemm` —
+    cheap on Metal where matmul kernels are compute-bound, expensive
+    on CPU where it loses cache locality (see §13.2 fallback).
+  - All three graphs use `ggml_set_input` / `ggml_set_output` and
+    upload host inputs each step via `ggml_backend_tensor_set`,
+    pulling outputs back via `ggml_backend_tensor_get`. The
+    `argmax` over token + duration logits stays on host (~32 KB
+    `tensor_get` per step is cheap on unified memory; see §13.5
+    Phase 4 gate decision).
+
+`TdtRuntimeWeights` carries both the GPU-graph scaffolding
+(`ggml_context * gctx`, `ggml_cgraph * g_lstm / g_joint`, gallocrs,
+`ggml_tensor *` inputs/outputs, and an `enc_proj_cache` LRU) and a
+parallel set of host f32 vectors (`embed`, `host_lstm[L]`,
+`host_joint_*`) for the CPU fallback. Move semantics + a destructor
+free the gallocrs, contexts, and any cached enc_proj graphs on
+runtime teardown; the backend pointer itself is owned by
+`ParakeetCtcModel::Impl`.
+
+### 13.2 — CPU fallback
+
+The straightforward "all paths through ggml" design regressed CPU
+decode by **~6x** (76 ms -> 480 ms median) because per-step graph
+dispatch on the synchronous CPU backend pays thread-pool wakeup
+latency on every one of ~250 emission steps. The fix is a runtime
+branch: `tdt_prepare_runtime` checks `ggml_backend_is_cpu(backend)`
+and either builds the graphs (GPU) or dequantises weights to host
+f32 (CPU). The decode loop then routes every per-step op
+(`tdt_init_state`, `host_lstm_step`, `host_joint_step`) through the
+proven scalar implementation when `!use_graphs`.
+
+The CPU path also keeps the original **per-step** `joint_enc` gemv
+inside `host_joint_step` rather than the full-window precompute used
+on GPU: profiling showed the precompute regresses CPU by ~8 % for
+20 s windows because it streams ~1 MB through L1 once per window
+without reuse, while the per-step gemv keeps the encoder-frame
+slice in cache through both `joint_enc` and the surrounding
+`joint_pred` / `joint_out` calls.
+
+### 13.3 — parity gate
+
+`test-tdt-decoder-parity` (`src/test_tdt_decoder_parity.cpp`,
+linked under `QVAC_PARAKEET_BUILD_TESTS`) runs the same WAV through
+`tdt_greedy_decode` twice — once with `n_gpu_layers=0` (scalar CPU
+fallback) and once with `n_gpu_layers=1` (ggml graph path on the
+compiled backend). Greedy TDT is fully deterministic, so the
+invariant is exact integer equality of the token-ID stream (and
+hence byte-equal transcript text). On `sample-16k.wav` (20.13 s,
+M4 Air, Metal build):
+
+```
+[tdt-decode-parity] CPU: tokens=95 text=Alice was beginning to get very tired of sitting by her sister...
+[tdt-decode-parity] GPU: tokens=95 text=Alice was beginning to get very tired of sitting by her sister...
+[tdt-decode-parity] PASS: CPU vs graph token IDs match (95 tokens)
+```
+
+A `<ref-dir>` argument optionally also compares against the NeMo
+reference token-ID stream from `scripts/dump-tdt-reference.py`
+(extended in this phase to write `token_ids.npy` alongside the
+existing `transcript.txt`).
+
+### 13.4 — bench
+
+`sample-16k.wav` (20.13 s of audio), `--bench-warmup 5
+--bench-runs 15`, M4 Air, q8_0:
+
+| backend       | enc median | dec best | dec median | inf median | RTF best | RTF median | real-time multiple |
+|---------------|-----------:|---------:|-----------:|-----------:|---------:|-----------:|-------------------:|
+| CPU baseline  |    911     |    72.8  |    76.6    |   1003     |   0.041  |   0.050    |          24x       |
+| **CPU after** |   1102 *   |  **72.3**|  **76.95** |   1190 *   |   0.043  |   0.059    |          23x       |
+| Metal baseline|     68.5   |    72.7  |    76.4    |    159.5   |   0.008  |   0.008    |         132x       |
+| **Metal after** |    68.9   |  **58.5**|  **59.32** |  **143.2** | **0.007**| **0.007**  |       **142x**     |
+
+`*` CPU "after" `inf median` includes encoder-side wall-time noise
+(thermal throttling on a passive-cooled Air during the 15-run sweep
+shows up in the encoder, not the decoder); the **decoder** numbers
+are within 0.5 ms of baseline on CPU.
+
+Net Metal effect on the 20 s clip:
+
+  - decoder: **76.4 ms -> 59.3 ms median (-22.4 %)**
+  - inference total: **159.5 ms -> 143.2 ms median (-10.2 %)**
+  - real-time multiple: **132x -> 142x**
+
+CPU stays neutral by design (the fallback path is the same scalar
+implementation that shipped in Phase 10); the new graph path is
+only exercised on Metal / CUDA / Vulkan builds where
+`backend_active` is non-CPU.
+
+### 13.5 — encoder→decoder handoff (gated, not landed)
+
+The original plan considered keeping `encoder_out` resident on the
+backend so the TDT decoder could run directly off the GPU tensor
+instead of going through the existing host `std::vector<float>` in
+`EncoderOutputs::encoder_out`. Empirical profiling on the M4 Air:
+
+```
+[probe] encoder_out tensor_get: 87 us (258048 floats)
+[probe] enc_proj   tensor_set: 17 us (258048 floats)
+```
+
+Total host roundtrip for the encoder→decoder boundary is **~104 us
+per call**, i.e. **0.07 % of total inference time** on a 20 s clip.
+The gate for this work was a >5 % RTF improvement; the data
+disqualifies it (Apple Silicon's unified-memory `tensor_get/set` is
+essentially memcpy at ~50 GB/s and cannot deliver the threshold).
+Skipped, with the engine-side API kept simple — `EncoderOutputs`
+stays host-side, matching CTC + EOU + Sortformer.
+
+### 13.6 — bench-JSON backend label
+
+Pre-existing bug surfaced by this phase: `main.cpp`'s
+`--bench-json` writer hardcoded `"backend": "ggml-cpu"` regardless
+of the active backend, which silently mis-tagged every Metal /
+CUDA / Vulkan bench captured into `artifacts/bench/`. Fixed to
+derive from `GGML_USE_METAL` / `GGML_USE_CUDA` / `GGML_USE_VULKAN`
+plus the runtime `n_gpu_layers` flag, and an `n_gpu_layers` field
+was added to the JSON so post-hoc sweeps can disambiguate same-
+binary CPU vs GPU runs.
+
+### 13.7 — remaining work
+
+  - **CUDA / Vulkan validation.** The graph code path is generic
+    over `backend_active`; both backends should "just work" because
+    every op used (`get_rows`, `mul_mat`, `add`, `sigmoid`, `tanh`,
+    `mul`, `concat`, `cont`) is supported on CUDA and Vulkan in
+    the pinned ggml. Not validated on hardware in Phase 13 — needs
+    a follow-up bench run.
+  - **Mode 3 streaming bench.** Phase 13 measured Mode 1 (one-shot
+    `tdt_greedy_decode` over the full window) only. The streaming
+    `StreamSession::process_window` calls into the same
+    `tdt_decode_window` so the per-step Metal speed-up should
+    carry over, but the per-chunk cost mix is different (smaller
+    `T_enc` per call -> the `g_enc_proj` cache will see more
+    distinct shapes; the LRU is currently unbounded). Tracked as a
+    follow-up: cap the cache or switch to a bucketed shape.
+  - **TDT 1.1B sweep.** Numbers above are for `parakeet-tdt-0.6b-v3`
+    only; rerun on `parakeet-tdt-1.1b` to populate the
+    "RTF (Metal)" column for that row in the README's Supported
+    checkpoints table.
