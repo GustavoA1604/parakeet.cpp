@@ -127,6 +127,17 @@ int main(int argc, char ** argv) {
         std::string mode2_text;
         int seg_count       = 0;
         int eou_boundary_seg = -1;
+        int eou_events       = 0;
+
+        sopts.on_event = [&](const StreamEvent & ev) {
+            if (ev.type == StreamEventType::EndOfTurn) {
+                ++eou_events;
+                if (opts.verbose) {
+                    std::fprintf(stderr, "  [mode2 EVT EndOfTurn] @ %.2fs chunk=%d eot_conf=%.2f\n",
+                                 ev.timestamp_s, ev.chunk_index, ev.eot_confidence);
+                }
+            }
+        };
 
         engine.transcribe_stream(opts.wav_path, sopts,
             [&](const StreamingSegment & s) {
@@ -155,10 +166,17 @@ int main(int argc, char ** argv) {
                                  "no segment had is_eou_boundary=true (jfk.wav should "
                                  "produce a terminal <EOU>)\n", chunk_ms);
             ++failures;
+        } else if (eou_events == 0) {
+            std::fprintf(stderr, "[test-eou-streaming] FAIL Mode 2 chunk_ms=%d: "
+                                 "is_eou_boundary fired on chunk %d but no "
+                                 "StreamEventType::EndOfTurn event was emitted\n",
+                         chunk_ms, eou_boundary_seg);
+            ++failures;
         } else {
             std::fprintf(stderr, "[test-eou-streaming] PASS Mode 2 chunk_ms=%d: "
-                                 "%d segments, EOU on chunk %d, text byte-equal\n",
-                         chunk_ms, seg_count, eou_boundary_seg);
+                                 "%d segments, EOU on chunk %d, %d EndOfTurn event(s), "
+                                 "text byte-equal\n",
+                         chunk_ms, seg_count, eou_boundary_seg, eou_events);
         }
     }
 

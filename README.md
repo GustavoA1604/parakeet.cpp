@@ -51,6 +51,24 @@ that auto-dispatches on `parakeet.model.type`:
 Plus a free function `transcribe_with_speakers(sortformer_engine,
 asr_engine, ...)` for combined "who said what" attribution.
 
+Both `StreamSession` and `SortformerStreamSession` also support a
+small cross-engine event surface (Phase 13) via
+`StreamingOptions::on_event` / `SortformerStreamingOptions::on_event`:
+
+- `StreamEventType::EndOfTurn` fires when an EOU session detects
+  the `<EOU>` token (Mode 2 + Mode 3); `eot_confidence = 1.0` when
+  the model emitted the boundary.
+- `StreamEventType::VadStateChanged` fires on Sortformer chunks
+  whose any-speaker probability crosses `threshold` (with
+  `speaker_id = argmax` on entering Speaking), and on CTC / TDT
+  sessions when the opt-in energy-VAD fallback
+  (`enable_energy_vad = true`) crosses its dB threshold with
+  hangover.
+
+Defaults to `nullptr`; consumers that ignore events keep the same
+behaviour as before. Designed to be the same shape whisper.cpp will
+emit so engine-agnostic event handling can be written once.
+
 ---
 
 ## Pipeline at a glance
@@ -842,9 +860,16 @@ quality cliff was documented two years earlier in Phase 8.0 on the
 predecessor `streaming_multi` checkpoint family. The exploration
 branch was reverted before landing; PROGRESS.md §8.5 captures the
 detailed rationale so future contributors don't re-run the same
-loop. The outstanding active workstream is Phase 11.11.2 (NeMo-
-style spkcache + encoder graph split for fully stable Sortformer
-streaming speaker IDs).
+loop.
+
+Phase 11.12 (quantised Sortformer GGUFs) and Phase 13 (cross-engine
+`StreamEvent` API for `OnVadState` / `OnEndOfTurn`) shipped on top
+of Phase 12; both Sortformer checkpoints now have q8_0 / q4_0
+tiers with quant-aware parity gates, and all four engines (CTC,
+TDT, EOU, Sortformer) can opt into per-event callbacks alongside
+the existing per-segment callbacks. The remaining active workstream
+is Phase 11.11.2 (NeMo-style spkcache + encoder graph split for
+fully stable Sortformer streaming speaker IDs).
 
 Headline highlights (per phase, one bullet each; PROGRESS.md `§N.x`
 has the full round-by-round journal):
@@ -906,13 +931,12 @@ has the full round-by-round journal):
   `cache_aware_stream_step` was prototyped + rejected on quality
   grounds (PROGRESS.md §8.5 case (A)).
 
-Next: Phase 13 (cross-engine VadState / EndOfTurn events on top of
-the existing `is_eou_boundary` / `eot_confidence` slots, sourcing
-from whichever engines are loaded; energy-VAD fallback otherwise),
-Accelerate BLAS for the TDT/EOU decoder's LSTM + joint gemvs and
-Sortformer's transformer attention, `CONV_2D_DW` on Metal (upstream
-ggml contribution), Metal flash-attn, Phase 11.11.2 Sortformer
-streaming.
+Next: vcpkg port for `qvac-parakeet.cpp` + the
+`qvac-lib-infer-parakeet` binding swap to consume this library
+instead of onnxruntime; Accelerate BLAS for the TDT/EOU decoder's
+LSTM + joint gemvs and Sortformer's transformer attention;
+`CONV_2D_DW` on Metal (upstream ggml contribution); Metal
+flash-attn; Phase 11.11.2 Sortformer streaming (NeMo-style spkcache).
 
 ## Repository layout
 

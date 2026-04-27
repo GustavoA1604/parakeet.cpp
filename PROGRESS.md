@@ -2713,13 +2713,134 @@ slots and within a per-tier rel gate for the quant slots
 
 #### Pending (no current owner)
 
-- **Cross-engine VadState + EndOfTurn events.** The
-  `is_eou_boundary` + `eot_confidence` slots in `StreamingSegment`
-  were specifically shaped for this: Phase 13 will land a
-  `StreamEvent` umbrella across qvac-parakeet.cpp + whisper.cpp
-  with `OnVadState` / `OnEndOfTurn` callbacks, sourcing from
-  whichever engines are loaded (EOU's `<EOU>` -> `OnEndOfTurn`,
-  Sortformer's any-speaker prob -> `OnVadState`, energy-VAD
-  fallback otherwise). No new model port needed, no Silero
-  dependency -- per the design discussion before Phase 12.0
-  started.
+(All Phase 12.x follow-ups have either shipped or been formally
+rejected; see Phase 13 below for the cross-engine event API.)
+
+## Phase 13 -- cross-engine StreamEvent API (VadState / EndOfTurn)  _(done)_
+
+Voice-agent UX (turn detection, barge-in, hold-the-mic-open) needs
+two signals we already had hooks for but no API on top of: VAD
+state transitions and end-of-turn boundaries. Phase 13 lands a
+small public `StreamEvent` surface that streaming sessions can
+emit alongside the existing per-segment callbacks. The shape is
+explicitly designed to be the same as what whisper.cpp's
+streaming API will eventually emit, so consumers (notably the
+`qvac-lib-infer-parakeet` binding) can write engine-agnostic event
+handling once.
+
+### Public types
+
+```cpp
+enum class VadState { Unknown, Speaking, Silent };
+enum class StreamEventType { VadStateChanged, EndOfTurn };
+
+struct StreamEvent {
+    StreamEventType type;
+    double  timestamp_s;
+    int     chunk_index;
+
+    // VadStateChanged
+    VadState vad_state;
+    int      speaker_id;     // argmax on entering Speaking; -1 otherwise
+    float    vad_score;      // 0..1; provenance-specific
+
+    // EndOfTurn
+    float    eot_confidence;
+    int      speaker_id_at_turn;
+};
+
+using StreamEventCallback = std::function<void(const StreamEvent&)>;
+```
+
+`StreamingOptions::on_event` and `SortformerStreamingOptions::on_event`
+default to `nullptr` (back-compat: existing consumers unaffected).
+`StreamingOptions` also gains `enable_energy_vad` (default off) plus
+`energy_vad_threshold_db = -35.0f`, `energy_vad_window_ms = 30`,
+`energy_vad_hangover_ms = 200` knobs for the CTC/TDT fallback.
+
+### Event sources
+
+| Engine     | Event                  | Trigger                                                                                              |
+|------------|------------------------|------------------------------------------------------------------------------------------------------|
+| EOU        | `EndOfTurn`            | `<EOU>` token decoded in this chunk; `eot_confidence = 1.0`. Mode 2 + Mode 3.                        |
+| Sortformer | `VadStateChanged`      | Per-chunk `max(speaker_probs) > threshold` (the same threshold the diarization head uses), with hysteresis (state retained across chunks). `speaker_id = argmax mean(speaker_probs)` on entering Speaking. |
+| CTC / TDT  | `VadStateChanged`      | Energy-VAD on raw PCM (sliding RMS window, dBFS threshold + hangover). Only fires when consumer opts in via `enable_energy_vad`.                                                                          |
+
+EOU's `EndOfTurn` is fired from both `Engine::transcribe_stream`
+(Mode 2) and `StreamSession::process_window` (Mode 3) so the event
+shape is identical regardless of which streaming entry point the
+consumer drives.
+
+### Implementation
+
+- `include/qvac-parakeet/ctc/engine.h` -- new public types +
+  `on_event` slots on both options structs + the `enable_energy_vad`
+  knobs. Adding fields with defaults to a struct is forward-compatible
+  for current consumers.
+
+- `src/energy_vad.{h,cpp}` -- internal helper. Sliding RMS over a
+  configurable ms window of mono f32 PCM, with hysteresis: enter
+  Speaking immediately on threshold-crossing; fall back to Silent
+  only after `hangover_ms` of below-threshold audio. Default
+  `-35 dBFS / 30 ms / 200 ms` is tuned for clean 16 kHz mono speech.
+  Not exposed in the public headers (would force the binding to
+  pin to our implementation; shape may evolve).
+
+- `src/parakeet_engine.cpp`:
+  - `StreamSession::Impl` gains a `unique_ptr<EnergyVad>` member
+    that is constructed only when `opts.enable_energy_vad` and the
+    underlying engine has no native VAD source (constructed for
+    CTC/TDT, skipped for EOU). The VAD is driven from a small
+    `stream_drive_energy_vad()` helper invoked from both
+    `feed_pcm_f32` and `feed_pcm_i16`.
+  - `SortformerStreamSession::Impl` gains a `vad_state` field
+    (initial `Unknown`, transitions on each chunk's emit-range
+    speaker probabilities). Fires `VadStateChanged` on transitions
+    only -- no per-chunk repeat events.
+  - Mode-2 and Mode-3 EOU paths each fire `EndOfTurn` events on
+    chunks where `eou_boundaries_in_chunk > 0`.
+
+### Tests
+
+- `test-streaming` (CTC + TDT) gained an opt-in energy-VAD
+  invocation that asserts at least one Speaking transition fires
+  on `jfk.wav`. Default-off path (sweep above) keeps emitting zero
+  events, confirming back-compat.
+- `test-eou-streaming` Mode-2 path now asserts that
+  `is_eou_boundary` and `EndOfTurn` event count are consistent
+  (boundary fires => at least one event fires). On `jfk.wav` chunk
+  size 1500 ms: 1 `EndOfTurn` event, matching the single trailing
+  `<EOU>` boundary.
+- `test-sortformer-streaming` asserts at least one `VadStateChanged`
+  event on a wav with audible speech and at least one Speaking
+  transition. Default fixture (`two-speakers-16k.wav`) skips when
+  missing; on `jfk.wav` (single speaker, 11 s) the test fires one
+  `Speaking` transition on chunk 0 with `speaker_id = 0`, which is
+  the expected shape.
+
+Numbers on `jfk.wav` (sanity check):
+
+| Test                              | Events fired                                      |
+|-----------------------------------|---------------------------------------------------|
+| test-streaming + energy-VAD (CTC) | 9 VadStateChanged (6 Speaking transitions)         |
+| test-streaming + energy-VAD (TDT) | 9 VadStateChanged (6 Speaking transitions)         |
+| test-eou-streaming Mode 2         | 1 EndOfTurn at chunk 7 (the trailing `<EOU>`)      |
+| test-sortformer-streaming v1.f16  | 1 VadStateChanged @ 0.00 s -> Speaking, speaker 0 |
+| test-sortformer-streaming v1.q8   | identical to f16                                   |
+| test-sortformer-streaming v2.q4   | 1 VadStateChanged @ 0.00 s -> Speaking, speaker 0 |
+
+### Shape decisions
+
+- **Single struct + enum, not separate event types.** Keeps the
+  callback signature trivial (`void(const StreamEvent&)`) which
+  maps cleanly through the binding's N-API ABI without per-type
+  wrappers. Costs a few unused fields per event; cheap.
+- **Engines fire what they natively know.** EOU has the `<EOU>`
+  token and fires only `EndOfTurn`; Sortformer has speaker probs
+  and fires only `VadStateChanged`; CTC/TDT have neither so they
+  fire `VadStateChanged` from energy-VAD when explicitly enabled.
+  No engine pretends to fire events it doesn't have a real signal
+  for, and no Silero / external VAD dependency is added.
+- **Default off.** Both `on_event = nullptr` and
+  `enable_energy_vad = false` are the defaults. No behavioural
+  change for existing consumers; opt-in only.

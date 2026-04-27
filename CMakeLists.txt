@@ -41,6 +41,7 @@ set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_sortformer.cpp
     src/mel_preprocess.cpp
     src/sentencepiece_bpe.cpp
+    src/energy_vad.cpp
 )
 
 if (QVAC_PARAKEET_BUILD_LIBRARY)
@@ -144,7 +145,8 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
         src/mel_preprocess.cpp
-        src/sentencepiece_bpe.cpp)
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml)
     target_include_directories(test-tdt-encoder-parity PRIVATE include src ggml/include)
 
@@ -156,7 +158,8 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
         src/mel_preprocess.cpp
-        src/sentencepiece_bpe.cpp)
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
     target_link_libraries(test-sortformer-parity PRIVATE ggml)
     target_include_directories(test-sortformer-parity PRIVATE include src ggml/include)
 endif()
