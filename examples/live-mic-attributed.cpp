@@ -251,50 +251,77 @@ int main(int argc, char ** argv) {
     };
 
     auto on_tx = [&](const StreamingSegment & seg) {
+        // EOU GGUFs raise `is_eou_boundary=true` on chunks where the
+        // model emitted the `<EOU>` end-of-user-turn token (see
+        // live-mic.cpp for the full rationale). The boundary may fire
+        // on the SAME chunk as the trailing speech tokens or on a
+        // SEPARATE post-speech silence chunk; we handle both cases.
         if (!args.accumulate) {
-            if (seg.text.empty()) return;
             const int spk = speaker_for_range(diar_history, seg.start_s, seg.end_s);
-            if (spk >= 0) {
-                std::printf("[%.2f-%.2f] speaker_%d:%s\n",
-                            seg.start_s, seg.end_s, spk, seg.text.c_str());
-            } else {
-                std::printf("[%.2f-%.2f] speaker_?:%s\n",
-                            seg.start_s, seg.end_s, seg.text.c_str());
+            if (!seg.text.empty()) {
+                if (spk >= 0) {
+                    std::printf("[%.2f-%.2f] speaker_%d:%s\n",
+                                seg.start_s, seg.end_s, spk, seg.text.c_str());
+                } else {
+                    std::printf("[%.2f-%.2f] speaker_?:%s\n",
+                                seg.start_s, seg.end_s, seg.text.c_str());
+                }
             }
-            std::fflush(stdout);
+            if (seg.is_eou_boundary) {
+                if (spk >= 0) {
+                    std::printf("[%.2f-%.2f] speaker_%d:  <EOU>  end of user turn\n",
+                                seg.start_s, seg.end_s, spk);
+                } else {
+                    std::printf("[%.2f-%.2f] speaker_?:  <EOU>  end of user turn\n",
+                                seg.start_s, seg.end_s);
+                }
+            }
+            if (!seg.text.empty() || seg.is_eou_boundary) {
+                std::fflush(stdout);
+            }
             return;
         }
 
-        if (seg.text.empty()) {
-            if (line_open &&
-                (seg.end_s - last_voice_end_s) * 1000.0 >= args.silence_flush_ms) {
+        const int spk = (seg.text.empty() && !seg.is_eou_boundary)
+                          ? line_speaker_id
+                          : speaker_for_range(diar_history, seg.start_s, seg.end_s);
+
+        if (!seg.text.empty()) {
+            if (line_open && spk != line_speaker_id) {
                 close_line_if_open();
             }
+
+            if (!line_open) {
+                if (spk >= 0) {
+                    std::printf("speaker_%d:%s",
+                                spk,
+                                seg.text.c_str() + (seg.text.front() == ' ' ? 1 : 0));
+                } else {
+                    std::printf("speaker_?:%s",
+                                seg.text.c_str() + (seg.text.front() == ' ' ? 1 : 0));
+                }
+                line_speaker_id = spk;
+                line_open = true;
+            } else {
+                std::fputs(seg.text.c_str(), stdout);
+            }
+            std::fflush(stdout);
+            last_voice_end_s = seg.end_s;
+        }
+
+        // <EOU> boundary -> hard line flush in accumulate mode.
+        if (seg.is_eou_boundary && line_open) {
+            std::fputs("  <EOU>\n", stdout);
+            std::fflush(stdout);
+            line_open = false;
+            line_speaker_id = -1;
             return;
         }
 
-        const int spk = speaker_for_range(diar_history, seg.start_s, seg.end_s);
-
-        if (line_open && spk != line_speaker_id) {
+        if (seg.text.empty() && line_open &&
+            (seg.end_s - last_voice_end_s) * 1000.0 >= args.silence_flush_ms) {
             close_line_if_open();
         }
-
-        if (!line_open) {
-            if (spk >= 0) {
-                std::printf("speaker_%d:%s",
-                            spk,
-                            seg.text.c_str() + (seg.text.front() == ' ' ? 1 : 0));
-            } else {
-                std::printf("speaker_?:%s",
-                            seg.text.c_str() + (seg.text.front() == ' ' ? 1 : 0));
-            }
-            line_speaker_id = spk;
-            line_open = true;
-        } else {
-            std::fputs(seg.text.c_str(), stdout);
-        }
-        std::fflush(stdout);
-        last_voice_end_s = seg.end_s;
     };
 
     StreamingOptions tx_sopts;

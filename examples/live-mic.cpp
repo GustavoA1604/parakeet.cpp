@@ -198,10 +198,31 @@ int main(int argc, char ** argv) {
         sopts.right_lookahead_ms = args.right_ms;
         tx_sess = engine.stream_start(sopts,
             [&](const qvac_parakeet::StreamingSegment & seg) {
+                // EOU GGUFs raise `is_eou_boundary=true` on the chunk
+                // where the model's joint network emitted the `<EOU>`
+                // token (i.e. natural end-of-user-turn). The token
+                // itself is not in `seg.text` because the decoder
+                // consumes it for its segment-flush + LSTM-state-reset
+                // side effect; the boolean field is the surfacing
+                // signal. CTC / TDT segments leave it false.
+                //
+                // Two cases: the boundary may fire on the SAME chunk
+                // as the trailing speech tokens, or on a SEPARATE
+                // post-speech silence chunk (text empty). We emit a
+                // dedicated `<EOU>` line in both cases so the event is
+                // always visible.
                 if (!args.accumulate) {
-                    if (seg.text.empty()) return;
-                    std::printf("\033[2K\r[%.2f-%.2f]%s\n", seg.start_s, seg.end_s, seg.text.c_str());
-                    std::fflush(stdout);
+                    if (!seg.text.empty()) {
+                        std::printf("\033[2K\r[%.2f-%.2f]%s\n",
+                                    seg.start_s, seg.end_s, seg.text.c_str());
+                    }
+                    if (seg.is_eou_boundary) {
+                        std::printf("\033[2K\r[%.2f-%.2f]  <EOU>  end of user turn\n",
+                                    seg.start_s, seg.end_s);
+                    }
+                    if (!seg.text.empty() || seg.is_eou_boundary) {
+                        std::fflush(stdout);
+                    }
                     return;
                 }
 
@@ -216,6 +237,17 @@ int main(int argc, char ** argv) {
                     }
                     std::fflush(stdout);
                     last_voice_end_s = seg.end_s;
+                }
+
+                // In --accumulate mode, an <EOU> boundary acts as a
+                // hard line break: flush the current accumulated turn
+                // immediately, regardless of the silence-timeout path
+                // below. This is the natural mapping of a turn-boundary
+                // signal onto the one-line-per-turn output mode.
+                if (seg.is_eou_boundary && line_open) {
+                    std::fputs("  <EOU>\n", stdout);
+                    std::fflush(stdout);
+                    line_open = false;
                     return;
                 }
 
