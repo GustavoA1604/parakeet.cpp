@@ -4,6 +4,7 @@
 
 #include "parakeet_ctc.h"
 #include "parakeet_tdt.h"
+#include "parakeet_eou.h"
 #include "mel_preprocess.h"
 
 #include <algorithm>
@@ -25,11 +26,13 @@ void print_usage(const char * argv0) {
         "Single CLI for all four engine families. The GGUF is auto-detected:\n"
         "  CTC        (parakeet-ctc-0.6b/1.1b)        -> transcription\n"
         "  TDT        (parakeet-tdt-0.6b-v3, 1.1b)    -> multilingual transcription\n"
+        "  EOU        (parakeet_realtime_eou_120m-v1) -> low-latency streaming ASR with\n"
+        "                                                native end-of-utterance token\n"
         "  Sortformer (diar_sortformer_4spk-v1, v2)   -> 4-speaker diarization\n"
         "Combined ASR + diarization (\"who said what\") via --diarization-model.\n"
         "\n"
         "options:\n"
-        "  --model PATH         path to a CTC, TDT, or Sortformer GGUF (required)\n"
+        "  --model PATH         path to a CTC, TDT, EOU, or Sortformer GGUF (required)\n"
         "  --wav PATH           path to a 16 kHz mono wav file\n"
         "  --pcm-in PATH        path to a raw PCM file (mono, format selected by --pcm-format)\n"
         "  --pcm-format FMT     raw PCM sample format: s16le (default) or f32le\n"
@@ -71,7 +74,8 @@ void print_usage(const char * argv0) {
         "                                (default 30000). Larger values stabilise speaker IDs\n"
         "                                across chunks at the cost of per-chunk encoder work.\n"
         "  --emit FMT           --stream output format: 'text' (default) prints segment text\n"
-        "                       one per line; 'jsonl' prints {text,start,end,chunk,is_final}\n"
+        "                       one per line; 'jsonl' prints {text,start,end,chunk,is_final,\n"
+        "                       is_eou_boundary}\n"
         "                       JSON Lines, one per segment. For Sortformer streaming, prints\n"
         "                       speaker segments instead of text.\n"
         "\n"
@@ -156,9 +160,11 @@ int load_raw_pcm(const std::string & path,
 void emit_segment(const qvac_parakeet::StreamingSegment & seg,
                   const std::string & format) {
     if (format == "jsonl") {
-        std::printf("{\"chunk\":%d,\"start\":%.3f,\"end\":%.3f,\"is_final\":%s,\"text\":\"",
+        std::printf("{\"chunk\":%d,\"start\":%.3f,\"end\":%.3f,\"is_final\":%s,"
+                    "\"is_eou_boundary\":%s,\"text\":\"",
                     seg.chunk_index, seg.start_s, seg.end_s,
-                    seg.is_final ? "true" : "false");
+                    seg.is_final ? "true" : "false",
+                    seg.is_eou_boundary ? "true" : "false");
         for (char c : seg.text) {
             switch (c) {
                 case '"':  std::fputs("\\\"", stdout); break;
@@ -572,6 +578,50 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         times.enc_ms = ms_since(t2);
         times.encoder_frames = enc_out.n_enc_frames;
 
+        if (const char * dump_path = std::getenv("PARAKEET_DUMP_OUR_MEL")) {
+            FILE * fp = std::fopen(dump_path, "wb");
+            if (fp) {
+                std::vector<float> transposed((size_t) model.mel_cfg.n_mels * n_frames);
+                for (int t = 0; t < n_frames; ++t)
+                    for (int m = 0; m < model.mel_cfg.n_mels; ++m)
+                        transposed[m * n_frames + t] = mel[t * model.mel_cfg.n_mels + m];
+                std::fwrite(transposed.data(), sizeof(float), transposed.size(), fp);
+                std::fclose(fp);
+                std::fprintf(stderr, "[dump] wrote our_mel (%d, %d) to %s\n",
+                             model.mel_cfg.n_mels, n_frames, dump_path);
+            }
+        }
+        if (const char * dump_path = std::getenv("PARAKEET_DUMP_ENCODER")) {
+            FILE * fp = std::fopen(dump_path, "wb");
+            if (fp) {
+                std::fwrite(enc_out.encoder_out.data(), sizeof(float),
+                            enc_out.encoder_out.size(), fp);
+                std::fclose(fp);
+                std::fprintf(stderr, "[dump] wrote encoder_out (%d frames x %d) to %s\n",
+                             enc_out.n_enc_frames, enc_out.d_model, dump_path);
+            }
+        }
+        if (const char * dump_path = std::getenv("PARAKEET_DUMP_SUBSAMPLE")) {
+            FILE * fp = std::fopen(dump_path, "wb");
+            if (fp) {
+                std::fwrite(enc_out.subsampling_out.data(), sizeof(float),
+                            enc_out.subsampling_out.size(), fp);
+                std::fclose(fp);
+                std::fprintf(stderr, "[dump] wrote subsampling_out (%zu floats) to %s\n",
+                             enc_out.subsampling_out.size(), dump_path);
+            }
+        }
+        if (const char * dump_path = std::getenv("PARAKEET_DUMP_BLOCK0")) {
+            FILE * fp = std::fopen(dump_path, "wb");
+            if (fp) {
+                std::fwrite(enc_out.block_0_out.data(), sizeof(float),
+                            enc_out.block_0_out.size(), fp);
+                std::fclose(fp);
+                std::fprintf(stderr, "[dump] wrote block_0_out (%zu floats) to %s\n",
+                             enc_out.block_0_out.size(), dump_path);
+            }
+        }
+
         const auto t3 = clock::now();
         if (model.model_type == ParakeetModelType::TDT) {
             static TdtRuntimeWeights rt;
@@ -583,6 +633,22 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             TdtDecodeOptions dopts;
             TdtDecodeResult  dres;
             if (int rc = tdt_greedy_decode(model, rt,
+                                           enc_out.encoder_out.data(),
+                                           enc_out.n_enc_frames, enc_out.d_model,
+                                           dopts, dres); rc != 0) return rc;
+            ids_out  = std::move(dres.token_ids);
+            text_out = std::move(dres.text);
+        } else if (model.model_type == ParakeetModelType::EOU) {
+            static EouRuntimeWeights rt;
+            static bool rt_ready = false;
+            if (!rt_ready) {
+                if (eou_prepare_runtime(model, rt) != 0) return 20;
+                rt_ready = true;
+            }
+            EouDecodeOptions dopts;
+            dopts.max_symbols_per_step = model.encoder_cfg.eou_max_symbols_per_step;
+            EouDecodeResult  dres;
+            if (int rc = eou_greedy_decode(model, rt,
                                            enc_out.encoder_out.data(),
                                            enc_out.n_enc_frames, enc_out.d_model,
                                            dopts, dres); rc != 0) return rc;
@@ -950,15 +1016,15 @@ int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result) {
         return rc;
     }
     if (model.model_type != ParakeetModelType::CTC) {
+        const char * mt = "Sortformer";
+        if (model.model_type == ParakeetModelType::TDT) mt = "TDT";
+        else if (model.model_type == ParakeetModelType::EOU) mt = "EOU";
         std::fprintf(stderr,
             "qvac_parakeet::transcribe_wav: %s is a %s GGUF; this entry point\n"
             "    only handles CTC. Use qvac_parakeet::Engine (see\n"
-            "    <qvac-parakeet/ctc/engine.h>) which auto-dispatches to TDT decode\n"
-            "    for parakeet-tdt-* GGUFs and to Sortformer diarize() for\n"
-            "    diar_sortformer_* GGUFs.\n",
-            opts.model_gguf_path.c_str(),
-            model.model_type == ParakeetModelType::TDT ? "TDT"
-                                                       : "Sortformer");
+            "    <qvac-parakeet/ctc/engine.h>) which auto-dispatches to TDT,\n"
+            "    EOU, and Sortformer GGUFs.\n",
+            opts.model_gguf_path.c_str(), mt);
         return 11;
     }
 

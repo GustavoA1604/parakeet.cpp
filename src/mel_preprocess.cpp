@@ -183,10 +183,19 @@ int compute_log_mel(const float        * samples,
     const int seq_len = (n_samples + cfg.hop_length - 1) / cfg.hop_length;
     const int valid_frames = std::min(seq_len, n_frames);
 
-    apply_per_feature_cmvn(mel, valid_frames, n_mels);
+    if (cfg.normalize == MelNormalize::PerFeature) {
+        apply_per_feature_cmvn(mel, valid_frames, n_mels);
 
-    for (int t = valid_frames; t < n_frames; ++t) {
-        for (int m = 0; m < n_mels; ++m) mel[t * n_mels + m] = 0.0f;
+        // Per-feature CMVN sets the trailing padded frames to mean=0 implicitly,
+        // but we still want them to contribute zero energy to the encoder mask
+        // path. For NeMo `normalize=NA` we leave them as raw log-mel values
+        // (typically near -16, the log_zero_guard floor) -- the encoder's
+        // pad_mask zeros them out at the conv module anyway, and crucially the
+        // CMVN-free branch must not introduce a bin-wise mean shift the model
+        // wasn't trained against.
+        for (int t = valid_frames; t < n_frames; ++t) {
+            for (int m = 0; m < n_mels; ++m) mel[t * n_mels + m] = 0.0f;
+        }
     }
 
     out_mel = std::move(mel);

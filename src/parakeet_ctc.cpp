@@ -18,9 +18,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -37,13 +39,15 @@ struct EncoderGraph {
     bool           all_valid = false;
 
     std::vector<float> pe_host;
+    std::vector<float> att_mask_host;   // (T_enc, T_enc) row-major; 0 for visible, -inf for masked
 
-    ggml_tensor * mel_in  = nullptr;
-    ggml_tensor * mask_t0 = nullptr;
-    ggml_tensor * mask_t1 = nullptr;
-    ggml_tensor * mask_t2 = nullptr;
-    ggml_tensor * mask_t3 = nullptr;
-    ggml_tensor * pe_in   = nullptr;
+    ggml_tensor * mel_in   = nullptr;
+    ggml_tensor * mask_t0  = nullptr;
+    ggml_tensor * mask_t1  = nullptr;
+    ggml_tensor * mask_t2  = nullptr;
+    ggml_tensor * mask_t3  = nullptr;
+    ggml_tensor * pe_in    = nullptr;
+    ggml_tensor * att_mask = nullptr;   // null when the encoder uses unrestricted attention
 
     ggml_tensor * sub_out_node         = nullptr;
     ggml_tensor * post_ff1_0_node      = nullptr;
@@ -271,10 +275,34 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.encoder_cfg.untie_biases    = get_bool(g, "parakeet.encoder.untie_biases", true);
     out_model.encoder_cfg.use_bias        = get_bool(g, "parakeet.encoder.use_bias", true);
 
+    {
+        const std::string conv_norm = get_str(g, "parakeet.encoder.conv_norm_type", "batch_norm");
+        out_model.encoder_cfg.conv_norm_type = (conv_norm == "layer_norm")
+                                                 ? ConvNormType::LayerNorm
+                                                 : ConvNormType::BatchNorm;
+    }
+    out_model.encoder_cfg.causal_downsampling =
+        get_bool(g, "parakeet.encoder.causal_downsampling", false);
+    {
+        const std::string conv_ctx = get_str(g, "parakeet.encoder.conv_context_size", "default");
+        out_model.encoder_cfg.conv_causal = (conv_ctx == "causal");
+    }
+    {
+        const int id_l = find_key(g, "parakeet.encoder.att_context_size_left");
+        const int id_r = find_key(g, "parakeet.encoder.att_context_size_right");
+        if (id_l >= 0) out_model.encoder_cfg.att_context_left  = gguf_get_val_i32(g, id_l);
+        if (id_r >= 0) out_model.encoder_cfg.att_context_right = gguf_get_val_i32(g, id_r);
+    }
+    {
+        const std::string style = get_str(g, "parakeet.encoder.att_context_style", "regular");
+        out_model.encoder_cfg.att_chunked_limited = (style == "chunked_limited");
+    }
+
     out_model.supports_streaming = get_bool(g, "parakeet.encoder.streaming.enabled", false);
 
     const std::string mtype_str = get_str(g, "parakeet.model.type", "ctc");
     if      (mtype_str == "tdt")        out_model.model_type = ParakeetModelType::TDT;
+    else if (mtype_str == "eou")        out_model.model_type = ParakeetModelType::EOU;
     else if (mtype_str == "sortformer") out_model.model_type = ParakeetModelType::SORTFORMER;
     else                                out_model.model_type = ParakeetModelType::CTC;
 
@@ -296,6 +324,24 @@ int load_from_gguf(const std::string & gguf_path,
         }
     }
 
+    if (out_model.model_type == ParakeetModelType::EOU) {
+        out_model.encoder_cfg.eou_pred_hidden           = get_u32(g, "parakeet.eou.pred_hidden",           640);
+        out_model.encoder_cfg.eou_pred_rnn_layers       = get_u32(g, "parakeet.eou.pred_rnn_layers",       1);
+        out_model.encoder_cfg.eou_joint_hidden          = get_u32(g, "parakeet.eou.joint_hidden",          640);
+        out_model.encoder_cfg.eou_chunk_mel_frames      = get_u32(g, "parakeet.eou.encoder_chunk_mel_frames", 25);
+        out_model.encoder_cfg.eou_cache_lookback_frames = get_u32(g, "parakeet.eou.cache_lookback_frames", 70);
+        out_model.encoder_cfg.eou_cache_time_steps      = get_u32(g, "parakeet.eou.cache_time_steps",      8);
+        out_model.encoder_cfg.eou_max_symbols_per_step  = get_u32(g, "parakeet.eou.max_symbols_per_step",  5);
+
+        out_model.vocab_size = get_u32(g, "parakeet.eou.vocab_size", 1026);
+        out_model.blank_id   = get_u32(g, "parakeet.eou.blank_id",   out_model.vocab_size);
+
+        const int id_eou = find_key(g, "parakeet.eou.eou_id");
+        const int id_eob = find_key(g, "parakeet.eou.eob_id");
+        out_model.eou_id = id_eou >= 0 ? gguf_get_val_i32(g, id_eou) : -1;
+        out_model.eob_id = id_eob >= 0 ? gguf_get_val_i32(g, id_eob) : -1;
+    }
+
     if (out_model.model_type == ParakeetModelType::SORTFORMER) {
         out_model.encoder_cfg.sortformer_num_spks      = get_u32 (g, "parakeet.sortformer.num_spks",      4);
         out_model.encoder_cfg.sortformer_fc_d_model    = get_u32 (g, "parakeet.sortformer.fc_d_model",    512);
@@ -314,6 +360,12 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.mel_cfg.preemph     = get_f32(g, "parakeet.preproc.preemph",     0.97f);
     out_model.mel_cfg.log_zero_guard_value =
         get_f32(g, "parakeet.preproc.log_zero_guard_value", kDefaultLogZeroGuard);
+    {
+        const std::string norm = get_str(g, "parakeet.preproc.normalize", "per_feature");
+        out_model.mel_cfg.normalize = (norm == "NA" || norm == "none" || norm == "None")
+                                        ? MelNormalize::None
+                                        : MelNormalize::PerFeature;
+    }
 
     if (out_model.model_type == ParakeetModelType::CTC) {
         out_model.vocab_size = get_u32(g, "parakeet.ctc.vocab_size", 1025);
@@ -400,8 +452,13 @@ int load_from_gguf(const std::string & gguf_path,
         b.conv_pw1_b  = maybe_tensor(impl->ctx, p + "conv.pw1.bias");
         b.conv_dw_w   = require_tensor(impl->ctx, p + "conv.dw.weight");
         b.conv_dw_b   = maybe_tensor(impl->ctx, p + "conv.dw.bias");
-        b.conv_bn_scale = require_tensor(impl->ctx, p + "conv.bn.scale");
-        b.conv_bn_shift = require_tensor(impl->ctx, p + "conv.bn.shift");
+        if (out_model.encoder_cfg.conv_norm_type == ConvNormType::LayerNorm) {
+            b.conv_norm_w = require_tensor(impl->ctx, p + "conv.norm.weight");
+            b.conv_norm_b = require_tensor(impl->ctx, p + "conv.norm.bias");
+        } else {
+            b.conv_bn_scale = require_tensor(impl->ctx, p + "conv.bn.scale");
+            b.conv_bn_shift = require_tensor(impl->ctx, p + "conv.bn.shift");
+        }
         b.conv_pw2_w  = require_tensor(impl->ctx, p + "conv.pw2.weight");
         b.conv_pw2_b  = maybe_tensor(impl->ctx, p + "conv.pw2.bias");
 
@@ -419,6 +476,23 @@ int load_from_gguf(const std::string & gguf_path,
     if (out_model.model_type == ParakeetModelType::CTC) {
         out_model.ctc.w = require_tensor(impl->ctx, "ctc.decoder.weight");
         out_model.ctc.b = require_tensor(impl->ctx, "ctc.decoder.bias");
+    } else if (out_model.model_type == ParakeetModelType::EOU) {
+        out_model.eou.predict_embed = require_tensor(impl->ctx, "eou.predict.embed.weight");
+        for (int l = 0; l < out_model.encoder_cfg.eou_pred_rnn_layers; ++l) {
+            const std::string pl = "eou.predict.lstm." + std::to_string(l) + ".";
+            TdtLstmLayer lyr;
+            lyr.w_ih = require_tensor(impl->ctx, pl + "w_ih");
+            lyr.w_hh = require_tensor(impl->ctx, pl + "w_hh");
+            lyr.b_ih = require_tensor(impl->ctx, pl + "b_ih");
+            lyr.b_hh = require_tensor(impl->ctx, pl + "b_hh");
+            out_model.eou.lstm.push_back(lyr);
+        }
+        out_model.eou.joint_enc_w  = require_tensor(impl->ctx, "eou.joint.enc.weight");
+        out_model.eou.joint_enc_b  = require_tensor(impl->ctx, "eou.joint.enc.bias");
+        out_model.eou.joint_pred_w = require_tensor(impl->ctx, "eou.joint.pred.weight");
+        out_model.eou.joint_pred_b = require_tensor(impl->ctx, "eou.joint.pred.bias");
+        out_model.eou.joint_out_w  = require_tensor(impl->ctx, "eou.joint.out.weight");
+        out_model.eou.joint_out_b  = require_tensor(impl->ctx, "eou.joint.out.bias");
     } else if (out_model.model_type == ParakeetModelType::SORTFORMER) {
         out_model.sortformer.encoder_proj_w = require_tensor(impl->ctx, "sortformer.encoder_proj.weight");
         out_model.sortformer.encoder_proj_b = require_tensor(impl->ctx, "sortformer.encoder_proj.bias");
@@ -486,20 +560,40 @@ int load_from_gguf(const std::string & gguf_path,
 void print_model_summary(const ParakeetCtcModel & m) {
     const char * mt = "ctc";
     if (m.model_type == ParakeetModelType::TDT)        mt = "tdt";
+    else if (m.model_type == ParakeetModelType::EOU)        mt = "eou";
     else if (m.model_type == ParakeetModelType::SORTFORMER) mt = "sortformer";
     std::fprintf(stderr, "parakeet-%s loaded:\n", mt);
-    std::fprintf(stderr, "  encoder: d_model=%d n_layers=%d n_heads=%d head_dim=%d ff_dim=%d conv_k=%d sub=%dx xscaling=%d untie=%d use_bias=%d\n",
+    const char * conv_norm = m.encoder_cfg.conv_norm_type == ConvNormType::LayerNorm ? "ln" : "bn";
+    std::fprintf(stderr, "  encoder: d_model=%d n_layers=%d n_heads=%d head_dim=%d ff_dim=%d conv_k=%d sub=%dx xscaling=%d untie=%d use_bias=%d conv_norm=%s\n",
                  m.encoder_cfg.d_model, m.encoder_cfg.n_layers, m.encoder_cfg.n_heads,
                  m.encoder_cfg.head_dim, m.encoder_cfg.ff_dim, m.encoder_cfg.conv_kernel,
                  m.encoder_cfg.subsampling_factor,
                  (int) m.encoder_cfg.xscaling, (int) m.encoder_cfg.untie_biases,
-                 (int) m.encoder_cfg.use_bias);
+                 (int) m.encoder_cfg.use_bias, conv_norm);
+    if (m.encoder_cfg.att_chunked_limited || m.encoder_cfg.causal_downsampling || m.encoder_cfg.conv_causal) {
+        std::fprintf(stderr, "  streaming: att_ctx=[%d,%d] style=%s causal_ds=%d conv_ctx=%s\n",
+                     m.encoder_cfg.att_context_left, m.encoder_cfg.att_context_right,
+                     m.encoder_cfg.att_chunked_limited ? "chunked_limited" : "regular",
+                     (int) m.encoder_cfg.causal_downsampling,
+                     m.encoder_cfg.conv_causal ? "causal" : "default");
+    }
     std::fprintf(stderr, "  preproc: sr=%d n_fft=%d win=%d hop=%d n_mels=%d preemph=%.2f log_guard=%.2e\n",
                  m.mel_cfg.sample_rate, m.mel_cfg.n_fft, m.mel_cfg.win_length,
                  m.mel_cfg.hop_length, m.mel_cfg.n_mels, m.mel_cfg.preemph,
                  (double) m.mel_cfg.log_zero_guard_value);
     if (m.model_type == ParakeetModelType::CTC) {
         std::fprintf(stderr, "  ctc:     vocab=%d blank=%d\n", m.vocab_size, m.blank_id);
+    } else if (m.model_type == ParakeetModelType::EOU) {
+        std::fprintf(stderr, "  eou:     vocab=%d blank=%d eou_id=%d eob_id=%d "
+                             "pred_hidden=%d pred_layers=%d joint_hidden=%d "
+                             "chunk_mel=%d cache_lookback=%d cache_time=%d max_syms=%d\n",
+                     m.vocab_size, m.blank_id, m.eou_id, m.eob_id,
+                     m.encoder_cfg.eou_pred_hidden, m.encoder_cfg.eou_pred_rnn_layers,
+                     m.encoder_cfg.eou_joint_hidden,
+                     m.encoder_cfg.eou_chunk_mel_frames,
+                     m.encoder_cfg.eou_cache_lookback_frames,
+                     m.encoder_cfg.eou_cache_time_steps,
+                     m.encoder_cfg.eou_max_symbols_per_step);
     } else if (m.model_type == ParakeetModelType::SORTFORMER) {
         std::fprintf(stderr, "  sortformer: num_spks=%d  fc_d_model=%d  tf=%dlx%dh d_model=%d inner=%d pre_ln=%d\n",
                      m.encoder_cfg.sortformer_num_spks,
@@ -526,6 +620,9 @@ void print_model_summary(const ParakeetCtcModel & m) {
 
 namespace {
 
+ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back);
+ggml_tensor * zero_pad_dim1(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back);
+
 ggml_tensor * conv_bias_bcast(ggml_context * ctx, ggml_tensor * bias, int64_t C) {
     return ggml_reshape_4d(ctx, bias, 1, 1, C, 1);
 }
@@ -543,21 +640,41 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
                                 ggml_tensor     * mask_t1,
                                 ggml_tensor     * mask_t2,
                                 ggml_tensor     * mask_t3,
-                                bool              all_valid) {
+                                bool              all_valid,
+                                bool              causal_downsampling) {
     ggml_tensor * x = mel_in;
 
     auto maybe_mask = [&](ggml_tensor * xin, ggml_tensor * m) {
         return all_valid ? xin : apply_time_mask(gctx, xin, m);
     };
 
+    // NeMo's CausalConv2D for `causal_downsampling=true` applies an
+    // asymmetric (L=stride, R=stride-1) zero-pad on **both** the freq
+    // (ne[0]) and time (ne[1]) axes per stride-2 conv (kernel=3), then
+    // calls the conv with `padding=0`. Total pad = stride+stride-1 = 3,
+    // so each layer's spatial output is `(F+3-3)/2 + 1 = F/2 + 1` --
+    // freq goes 128 -> 65 -> 33 -> 17 (instead of the 128 -> 64 -> 32
+    // -> 16 the symmetric `pad=1` baseline produces). The trained
+    // `encoder.subsampling.out.weight` has 17 freq-bin slots, so this
+    // asymmetric padding is mandatory for the matmul to line up.
+    auto causal_pad = [&](ggml_tensor * xin) {
+        if (!causal_downsampling) return xin;
+        xin = zero_pad_dim0(gctx, xin, /*L=*/2, /*R=*/1);
+        xin = zero_pad_dim1(gctx, xin, /*L=*/2, /*R=*/1);
+        return xin;
+    };
+    const int conv_pad = causal_downsampling ? 0 : 1;
+
     x = maybe_mask(x, mask_t0);
-    x = ggml_conv_2d(gctx, S.conv0_w, x, 2, 2, 1, 1, 1, 1);
+    x = causal_pad(x);
+    x = ggml_conv_2d(gctx, S.conv0_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv0_b, subsampling_channels));
     x = maybe_mask(x, mask_t1);
     x = ggml_relu(gctx, x);
 
     x = maybe_mask(x, mask_t1);
-    x = ggml_conv_2d_dw(gctx, S.conv1_dw_w, x, 2, 2, 1, 1, 1, 1);
+    x = causal_pad(x);
+    x = ggml_conv_2d_dw(gctx, S.conv1_dw_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv1_dw_b, subsampling_channels));
     x = maybe_mask(x, mask_t2);
     x = ggml_conv_2d(gctx, S.conv1_pw_w, x, 1, 1, 0, 0, 1, 1);
@@ -566,7 +683,8 @@ ggml_tensor * subsampling_graph(ggml_context    * gctx,
     x = ggml_relu(gctx, x);
 
     x = maybe_mask(x, mask_t2);
-    x = ggml_conv_2d_dw(gctx, S.conv2_dw_w, x, 2, 2, 1, 1, 1, 1);
+    x = causal_pad(x);
+    x = ggml_conv_2d_dw(gctx, S.conv2_dw_w, x, 2, 2, conv_pad, conv_pad, 1, 1);
     x = ggml_add(gctx, x, conv_bias_bcast(gctx, S.conv2_dw_b, subsampling_channels));
     x = maybe_mask(x, mask_t3);
     x = ggml_conv_2d(gctx, S.conv2_pw_w, x, 1, 1, 0, 0, 1, 1);
@@ -637,6 +755,28 @@ ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, in
     return y;
 }
 
+// Asymmetric zero-pad along the second axis (ne[1]). Mirrors
+// ``zero_pad_dim0`` but for the H dim so it can pre-pad the
+// time axis of the (W=freq, H=time) mel layout used in the
+// dw_striding subsampler.
+ggml_tensor * zero_pad_dim1(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
+    if (p_front <= 0 && p_back <= 0) return x;
+    ggml_tensor * y = x;
+    if (p_front > 0) {
+        ggml_tensor * head = ggml_view_4d(ctx, x, x->ne[0], p_front, x->ne[2], x->ne[3],
+                                          x->nb[1], x->nb[2], x->nb[3], 0);
+        ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, head), 0.0f);
+        y = ggml_concat(ctx, z, y, 1);
+    }
+    if (p_back > 0) {
+        ggml_tensor * tail = ggml_view_4d(ctx, y, y->ne[0], p_back, y->ne[2], y->ne[3],
+                                          y->nb[1], y->nb[2], y->nb[3], 0);
+        ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, tail), 0.0f);
+        y = ggml_concat(ctx, y, z, 1);
+    }
+    return y;
+}
+
 ggml_tensor * conv1d_via_matmul(ggml_context * ctx,
                                 ggml_tensor * kernel, ggml_tensor * input,
                                 int stride, int padding, int dilation) {
@@ -678,6 +818,7 @@ ggml_tensor * conformer_ff_graph(ggml_context * ctx, ggml_tensor * x,
 
 ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
                                 ggml_tensor * pos_emb,
+                                ggml_tensor * att_mask,
                                 const BlockWeights & W,
                                 int H, int HD, int T) {
     ggml_tensor * q = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_q_w, xn), W.attn_q_b);
@@ -723,8 +864,17 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
 #else
     ggml_tensor * ac     = ggml_mul_mat(ctx, k_perm, q_u);
     ggml_tensor * scores = ggml_add(ctx, ac, bd_final);
-    scores = ggml_scale(ctx, scores, scale);
-    ggml_tensor * attn = ggml_soft_max(ctx, scores);
+
+    ggml_tensor * attn;
+    if (att_mask) {
+        // ggml_soft_max_ext computes softmax(scale * x + mask) along the
+        // last dim of `scores`. The kernel requires an f16 mask whose
+        // shape broadcasts over the head axis: (T_k, T_q, 1, 1).
+        attn = ggml_soft_max_ext(ctx, scores, att_mask, scale, 0.0f);
+    } else {
+        scores = ggml_scale(ctx, scores, scale);
+        attn   = ggml_soft_max(ctx, scores);
+    }
 
     ggml_tensor * v_for_mm = ggml_cont(ctx, ggml_permute(ctx, v_perm, 1, 0, 2, 3));
     ggml_tensor * attn_v   = ggml_mul_mat(ctx, v_for_mm, attn);
@@ -738,7 +888,10 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
 ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
                                    const BlockWeights & W,
                                    int d_model, int /*T*/, int conv_kernel,
-                                   bool use_conv2d_dw) {
+                                   bool use_conv2d_dw,
+                                   ConvNormType conv_norm_type,
+                                   bool conv_causal,
+                                   float layer_norm_eps) {
     ggml_tensor * pw1_w_2d = ggml_reshape_2d(ctx, W.conv_pw1_w, d_model, 2 * d_model);
     ggml_tensor * y = ggml_mul_mat(ctx, pw1_w_2d, xn);
     y = maybe_add_bias(ctx, y, W.conv_pw1_b);
@@ -752,29 +905,47 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
 
     ggml_tensor * yt = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
 
-    const int pad = (conv_kernel - 1) / 2;
+    const int pad_left  = conv_causal ? (conv_kernel - 1) : ((conv_kernel - 1) / 2);
+    const int pad_right = conv_causal ? 0                 : ((conv_kernel - 1) / 2);
     if (use_conv2d_dw) {
         const int T_local = (int) yt->ne[0];
         ggml_tensor * yt_4d = ggml_reshape_4d(ctx, yt, T_local, 1, d_model, 1);
+        if (conv_causal && pad_left > 0) {
+            yt_4d = zero_pad_dim0(ctx, yt_4d, pad_left, pad_right);
+        }
         ggml_tensor * dw_kernel_f32 = W.conv_dw_w->type == GGML_TYPE_F32
                                     ? W.conv_dw_w
                                     : ggml_cast(ctx, W.conv_dw_w, GGML_TYPE_F32);
         ggml_tensor * dw_kernel_4d = ggml_reshape_4d(ctx, dw_kernel_f32, conv_kernel, 1, 1, d_model);
-        ggml_tensor * dw_out = ggml_conv_2d_dw_direct(ctx, dw_kernel_4d, yt_4d, 1, 1, pad, 0, 1, 1);
+        const int dw_pad = conv_causal ? 0 : pad_left;
+        ggml_tensor * dw_out = ggml_conv_2d_dw_direct(ctx, dw_kernel_4d, yt_4d, 1, 1, dw_pad, 0, 1, 1);
         yt = ggml_reshape_3d(ctx, dw_out, dw_out->ne[0], d_model, 1);
     } else {
-        yt = ggml_conv_1d_dw(ctx, W.conv_dw_w, yt, 1, pad, 1);
+        if (conv_causal && pad_left > 0) {
+            yt = zero_pad_dim0(ctx, yt, pad_left, pad_right);
+            yt = ggml_conv_1d_dw(ctx, W.conv_dw_w, yt, 1, 0, 1);
+        } else {
+            yt = ggml_conv_1d_dw(ctx, W.conv_dw_w, yt, 1, pad_left, 1);
+        }
     }
     if (W.conv_dw_b) {
         yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_dw_b, 1, d_model));
     }
 
-    yt = ggml_mul(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_scale, 1, d_model));
-    yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_shift, 1, d_model));
-
-    yt = ggml_silu(ctx, yt);
-
-    y = ggml_cont(ctx, ggml_permute(ctx, yt, 1, 0, 2, 3));
+    if (conv_norm_type == ConvNormType::LayerNorm) {
+        // NeMo applies LayerNorm over the channel axis. After the depthwise
+        // conv we are in (T, d_model) layout; transpose to (d_model, T) so
+        // ggml_norm reduces across the channel dim, run LN, then continue
+        // in (d_model, T) (saves one permute vs the BN path).
+        y = ggml_cont(ctx, ggml_permute(ctx, yt, 1, 0, 2, 3));
+        y = layer_norm_affine(ctx, y, W.conv_norm_w, W.conv_norm_b, layer_norm_eps);
+        y = ggml_silu(ctx, y);
+    } else {
+        yt = ggml_mul(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_scale, 1, d_model));
+        yt = ggml_add(ctx, yt, ggml_reshape_2d(ctx, W.conv_bn_shift, 1, d_model));
+        yt = ggml_silu(ctx, yt);
+        y  = ggml_cont(ctx, ggml_permute(ctx, yt, 1, 0, 2, 3));
+    }
 
     ggml_tensor * pw2_w_2d = ggml_reshape_2d(ctx, W.conv_pw2_w, d_model, d_model);
     y = ggml_mul_mat(ctx, pw2_w_2d, y);
@@ -785,10 +956,13 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
 
 ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
                                     ggml_tensor * pos_emb,
+                                    ggml_tensor * att_mask,
                                     const BlockWeights & W,
                                     int d_model, int H, int HD, int T,
                                     int conv_kernel, float eps,
-                                    bool use_conv2d_dw) {
+                                    bool use_conv2d_dw,
+                                    ConvNormType conv_norm_type,
+                                    bool conv_causal) {
     ggml_tensor * residual = x;
     ggml_tensor * y = conformer_ff_graph(ctx, x,
                                          W.norm_ff1_w, W.norm_ff1_b,
@@ -799,12 +973,13 @@ ggml_tensor * conformer_block_graph(ggml_context * ctx, ggml_tensor * x,
 
     residual = x;
     ggml_tensor * xn = layer_norm_affine(ctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-    y = rel_pos_mha_graph(ctx, xn, pos_emb, W, H, HD, T);
+    y = rel_pos_mha_graph(ctx, xn, pos_emb, att_mask, W, H, HD, T);
     x = ggml_add(ctx, residual, y);
 
     residual = x;
     xn = layer_norm_affine(ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw);
+    y = conformer_conv_graph(ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
+                             conv_norm_type, conv_causal, eps);
     x = ggml_add(ctx, residual, y);
 
     residual = x;
@@ -843,15 +1018,20 @@ int run_subsampling(ParakeetCtcModel   & model,
     }
     if (mel_valid == 0) mel_valid = n_mel_frames;
 
+    const bool causal_ds = model.encoder_cfg.causal_downsampling;
+    auto sub_out_len = [&](int Lin) {
+        return causal_ds ? (Lin / 2 + 1) : _conv_out_len(Lin, 3, 2, 1);
+    };
+
     const int L0 = n_mel_frames;
-    const int L1 = _conv_out_len(L0, 3, 2, 1);
-    const int L2 = _conv_out_len(L1, 3, 2, 1);
-    const int L3 = _conv_out_len(L2, 3, 2, 1);
+    const int L1 = sub_out_len(L0);
+    const int L2 = sub_out_len(L1);
+    const int L3 = sub_out_len(L2);
 
     const int V0 = mel_valid;
-    const int V1 = _conv_out_len(V0, 3, 2, 1);
-    const int V2 = _conv_out_len(V1, 3, 2, 1);
-    const int V3 = _conv_out_len(V2, 3, 2, 1);
+    const int V1 = sub_out_len(V0);
+    const int V2 = sub_out_len(V1);
+    const int V3 = sub_out_len(V2);
 
     auto make_mask = [](int L, int V) {
         std::vector<float> m(L, 0.0f);
@@ -881,7 +1061,8 @@ int run_subsampling(ParakeetCtcModel   & model,
     ggml_set_name(mask_t3, "mask_t3");
 
     ggml_tensor * out = subsampling_graph(gctx, mel_in, model.subsampling, C_sub, d_model,
-                                          mask_t0, mask_t1, mask_t2, mask_t3, false);
+                                          mask_t0, mask_t1, mask_t2, mask_t3, false,
+                                          causal_ds);
     ggml_set_name(out, "sub_out");
 
     ggml_cgraph * gf = ggml_new_graph(gctx);
@@ -936,13 +1117,49 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     // im2col+matmul lowering on any non-CPU backend.
     const bool use_conv2d_dw = ggml_backend_is_cpu(backend);
 
+    auto sub_out_len = [&](int Lin) {
+        return enc.causal_downsampling ? (Lin / 2 + 1) : _conv_out_len(Lin, 3, 2, 1);
+    };
+
     const int L0 = n_mel_frames;
-    const int L1 = _conv_out_len(L0, 3, 2, 1);
-    const int L2 = _conv_out_len(L1, 3, 2, 1);
-    const int L3 = _conv_out_len(L2, 3, 2, 1);
+    const int L1 = sub_out_len(L0);
+    const int L2 = sub_out_len(L1);
+    const int L3 = sub_out_len(L2);
     const int T = L3;
 
     g.pe_host = compute_rel_pos_encoding(T, d_model);
+
+    // Build the chunked-limited attention mask host-side once per graph.
+    // For an `att_context_size = [left, right]` with `att_context_style =
+    // chunked_limited`, frames are grouped into chunks of `chunk_size =
+    // right + 1`. A query frame at position i (in chunk c = i / chunk_size)
+    // attends to keys in [c*chunk_size - left, (c+1)*chunk_size - 1].
+    // Mask is `0.0f` for visible positions and `-INFINITY` for masked.
+    //
+    // The mask is shape (T, T) row-major in NumPy / (T, T, 1, 1) in ggml
+    // (ne[0]=T_k, ne[1]=T_q). Stored as f32; ggml_soft_max_ext accepts f32
+    // mask tensors and broadcasts over the head axis.
+    const bool use_chunked_mask = enc.att_chunked_limited &&
+                                  enc.att_context_left  >= 0 &&
+                                  enc.att_context_right >= 0;
+    if (use_chunked_mask) {
+        const int left  = enc.att_context_left;
+        const int right = enc.att_context_right;
+        const int chunk = right + 1;
+        g.att_mask_host.assign((size_t) T * T,
+                               -std::numeric_limits<float>::infinity());
+        for (int i = 0; i < T; ++i) {
+            const int c          = i / chunk;
+            const int win_start  = c * chunk - left;
+            const int win_end    = (c + 1) * chunk - 1;
+            const int j0 = std::max(0, win_start);
+            const int j1 = std::min(T - 1, win_end);
+            float * row = g.att_mask_host.data() + (size_t) i * T;
+            for (int j = j0; j <= j1; ++j) row[j] = 0.0f;
+        }
+    } else {
+        g.att_mask_host.clear();
+    }
 
     const size_t graph_slots = GGML_DEFAULT_GRAPH_SIZE * 16;
     const size_t overhead = ggml_tensor_overhead() * graph_slots
@@ -958,6 +1175,12 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     g.mask_t2 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L2, 1, 1);
     g.mask_t3 = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, 1, L3, 1, 1);
     g.pe_in   = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_model, 2 * T - 1);
+    if (use_chunked_mask) {
+        g.att_mask = ggml_new_tensor_4d(gctx, GGML_TYPE_F32, T, T, 1, 1);
+        ggml_set_name(g.att_mask, "att_mask");
+    } else {
+        g.att_mask = nullptr;
+    }
     ggml_set_name(g.mel_in,  "mel_in");
     ggml_set_name(g.mask_t0, "mask_t0");
     ggml_set_name(g.mask_t1, "mask_t1");
@@ -966,7 +1189,8 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
     ggml_set_name(g.pe_in,   "pe_in");
 
     ggml_tensor * x = subsampling_graph(gctx, g.mel_in, model.subsampling, C_sub, d_model,
-                                        g.mask_t0, g.mask_t1, g.mask_t2, g.mask_t3, all_valid);
+                                        g.mask_t0, g.mask_t1, g.mask_t2, g.mask_t3, all_valid,
+                                        enc.causal_downsampling);
     g.sub_out_node = x;
     ggml_set_name(g.sub_out_node, "subsampling_out");
     ggml_set_output(g.sub_out_node);
@@ -1001,7 +1225,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
             residual = x;
             ggml_tensor * xn = layer_norm_affine(gctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-            y = rel_pos_mha_graph(gctx, xn, g.pe_in, W, H, HD, T);
+            y = rel_pos_mha_graph(gctx, xn, g.pe_in, g.att_mask, W, H, HD, T);
             x = ggml_add(gctx, residual, y);
             g.post_attn_0_node = x;
             ggml_set_name(g.post_attn_0_node, "block_0_post_attn");
@@ -1009,7 +1233,8 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
             residual = x;
             xn = layer_norm_affine(gctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw);
+            y = conformer_conv_graph(gctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
+                                     enc.conv_norm_type, enc.conv_causal, eps);
             x = ggml_add(gctx, residual, y);
             g.post_conv_0_node = x;
             ggml_set_name(g.post_conv_0_node, "block_0_post_conv");
@@ -1032,9 +1257,10 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
             ggml_set_name(g.block_0_out_node, "block_0_out");
             ggml_set_output(g.block_0_out_node);
         } else {
-            x = conformer_block_graph(gctx, x, g.pe_in, model.blocks[i],
+            x = conformer_block_graph(gctx, x, g.pe_in, g.att_mask, model.blocks[i],
                                       d_model, H, HD, T, conv_kernel, eps,
-                                      use_conv2d_dw);
+                                      use_conv2d_dw,
+                                      enc.conv_norm_type, enc.conv_causal);
         }
         if (i == n_run_layers - 1) {
             g.block_last_out_node = x;
@@ -1133,15 +1359,19 @@ int run_encoder(ParakeetCtcModel   & model,
     }
     EncoderGraph & g = *g_ptr;
 
+    auto sub_out_len = [&](int Lin) {
+        return enc.causal_downsampling ? (Lin / 2 + 1) : _conv_out_len(Lin, 3, 2, 1);
+    };
+
     const int L0 = n_mel_frames;
-    const int L1 = _conv_out_len(L0, 3, 2, 1);
-    const int L2 = _conv_out_len(L1, 3, 2, 1);
-    const int L3 = _conv_out_len(L2, 3, 2, 1);
+    const int L1 = sub_out_len(L0);
+    const int L2 = sub_out_len(L1);
+    const int L3 = sub_out_len(L2);
 
     const int V0 = mel_valid;
-    const int V1 = _conv_out_len(V0, 3, 2, 1);
-    const int V2 = _conv_out_len(V1, 3, 2, 1);
-    const int V3 = _conv_out_len(V2, 3, 2, 1);
+    const int V1 = sub_out_len(V0);
+    const int V2 = sub_out_len(V1);
+    const int V3 = sub_out_len(V2);
 
     const int T = L3;
     const int vocab_size = model.vocab_size;
@@ -1169,6 +1399,10 @@ int run_encoder(ParakeetCtcModel   & model,
     safe_set(g.mask_t2, m2.data(),        m2.size()        * sizeof(float));
     safe_set(g.mask_t3, m3.data(),        m3.size()        * sizeof(float));
     safe_set(g.pe_in,   g.pe_host.data(), g.pe_host.size() * sizeof(float));
+    if (g.att_mask) {
+        safe_set(g.att_mask, g.att_mask_host.data(),
+                 g.att_mask_host.size() * sizeof(float));
+    }
 
     if (ggml_backend_graph_compute(backend, g.cgraph) != GGML_STATUS_SUCCESS) {
         return -4;
@@ -1252,14 +1486,16 @@ static int build_substage_graph(const ParakeetCtcModel & model,
     if (stage == Substage::ATTN || stage == Substage::FULL_BLOCK) {
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_attn_w, W.norm_attn_b, eps);
-        ggml_tensor * y = rel_pos_mha_graph(g.ctx, xn, g.pe_in, W, H, HD, T);
+        ggml_tensor * y = rel_pos_mha_graph(g.ctx, xn, g.pe_in, /*att_mask=*/nullptr,
+                                            W, H, HD, T);
         x = ggml_add(g.ctx, r, y);
     }
     if (stage == Substage::CONV || stage == Substage::FULL_BLOCK) {
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
         const bool use_conv2d_dw = ggml_backend_is_cpu(backend);
-        ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw);
+        ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
+                                               enc.conv_norm_type, enc.conv_causal, eps);
         x = ggml_add(g.ctx, r, y);
     }
     if (stage == Substage::FF2 || stage == Substage::FULL_BLOCK) {

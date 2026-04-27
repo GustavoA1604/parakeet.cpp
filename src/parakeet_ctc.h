@@ -40,6 +40,20 @@ namespace qvac_parakeet {
 // `TdtConfig`, and `SortformerConfig` so that the encoder struct
 // stops carrying decoder-specific fields. See parakeet_ctc.h note on
 // `ParakeetModel`.
+// Conv-module normalisation in a Conformer block.
+//   - BatchNorm  -- pre-fused into (scale, shift) at convert time
+//                   (CTC, TDT, offline Sortformer). Inference graph is
+//                   `mul + add`, no running stats needed.
+//   - LayerNorm  -- gamma/beta stored under the same `conv.batch_norm.*`
+//                   keys in the original NeMo state dict; converter
+//                   writes them as `conv.norm.{weight,bias}` instead
+//                   of fusing. Used by the streaming-trained EOU
+//                   FastConformer-RNN-T 120M.
+enum class ConvNormType {
+    BatchNorm,
+    LayerNorm,
+};
+
 struct EncoderConfig {
     int  d_model                  = 1024;
     int  n_layers                 = 24;
@@ -56,10 +70,36 @@ struct EncoderConfig {
     bool use_bias                 = true;
     float layer_norm_eps          = 1.0e-5f;
 
+    // Streaming / cache-aware encoder knobs (currently EOU-only; CTC/TDT
+    // GGUFs leave these at the offline defaults). `att_context_left/right`
+    // are in **post-subsampling encoder frames**, matching NeMo's
+    // `att_context_size`. `conv_causal` and `causal_downsampling` flip
+    // the depthwise conv module / subsampler from symmetric padding to
+    // left-only padding when the GGUF was trained that way.
+    ConvNormType conv_norm_type   = ConvNormType::BatchNorm;
+    bool causal_downsampling      = false;
+    bool conv_causal              = false;
+    int  att_context_left         = -1;     // -1 = unrestricted
+    int  att_context_right        = -1;
+    bool att_chunked_limited      = false;
+
     int  tdt_pred_hidden          = 640;
     int  tdt_pred_rnn_layers      = 2;
     int  tdt_joint_hidden         = 640;
     int  tdt_num_durations        = 5;
+
+    // EOU-specific (parakeet_realtime_eou_120m-v1).
+    // Predictor + joint dims mirror TDT's, but EOU has 1 LSTM layer
+    // (vs 2 for TDT) and no duration head. Cache shapes + chunk size
+    // come straight from the binding's `EOU_*` constants and the
+    // converter's metadata block.
+    int  eou_pred_hidden              = 640;
+    int  eou_pred_rnn_layers          = 1;
+    int  eou_joint_hidden             = 640;
+    int  eou_chunk_mel_frames         = 25;
+    int  eou_cache_lookback_frames    = 70;
+    int  eou_cache_time_steps         = 8;
+    int  eou_max_symbols_per_step     = 5;
 
     int  sortformer_num_spks      = 4;
     int  sortformer_fc_d_model    = 512;
@@ -115,8 +155,12 @@ struct BlockWeights {
     ggml_tensor * conv_pw1_b  = nullptr;
     ggml_tensor * conv_dw_w   = nullptr;
     ggml_tensor * conv_dw_b   = nullptr;
+    // BatchNorm path (CTC / TDT / offline Sortformer): pre-fused.
     ggml_tensor * conv_bn_scale = nullptr;
     ggml_tensor * conv_bn_shift = nullptr;
+    // LayerNorm path (EOU): gamma/beta over the channel dim.
+    ggml_tensor * conv_norm_w   = nullptr;
+    ggml_tensor * conv_norm_b   = nullptr;
     ggml_tensor * conv_pw2_w  = nullptr;
     ggml_tensor * conv_pw2_b  = nullptr;
 
@@ -158,7 +202,26 @@ struct TdtWeights {
 enum class ParakeetModelType {
     CTC,
     TDT,
+    EOU,
     SORTFORMER,
+};
+
+// EOU prediction-net + joint weights. Same shape as TdtWeights minus the
+// duration head: `joint.out` is (vocab+1, joint_hidden) -- where vocab
+// here counts the BPE pieces + `<EOU>` + `<EOB>` and the +1 is the
+// transducer blank as the last index. Stored as `ggml_tensor *` into
+// the GGUF mmap; dequantised once at Engine load via
+// `eou_prepare_runtime` (parakeet_eou.h).
+struct EouWeights {
+    ggml_tensor * predict_embed = nullptr;
+    std::vector<TdtLstmLayer> lstm;
+
+    ggml_tensor * joint_enc_w  = nullptr;
+    ggml_tensor * joint_enc_b  = nullptr;
+    ggml_tensor * joint_pred_w = nullptr;
+    ggml_tensor * joint_pred_b = nullptr;
+    ggml_tensor * joint_out_w  = nullptr;
+    ggml_tensor * joint_out_b  = nullptr;
 };
 
 struct SortformerTransformerBlock {
@@ -208,12 +271,20 @@ struct ParakeetCtcModel {
 
     bool supports_streaming = false;
 
+    // EOU-specific token IDs (resolved from the GGUF's `parakeet.eou.*`
+    // metadata; -1 if missing). The decoder pipeline keys on `eou_id`
+    // for the segment-flush + LSTM-state-reset behaviour and treats
+    // `eob_id` as a block-boundary "no-op" emitted during training.
+    int32_t eou_id = -1;
+    int32_t eob_id = -1;
+
     std::vector<int32_t> tdt_durations;
 
     SubsamplingWeights       subsampling;
     std::vector<BlockWeights> blocks;
     CtcHeadWeights            ctc;
     TdtWeights                tdt;
+    EouWeights                eou;
     SortformerWeights         sortformer;
 
     ggml_tensor * mel_filterbank = nullptr;

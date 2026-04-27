@@ -217,6 +217,14 @@ struct StreamingSegment {
     int  chunk_index = 0;
     bool is_final    = true;
 
+    // EOU-only: set to true when this segment ends because the decoder
+    // emitted the `<EOU>` end-of-utterance token (i.e. the model decided
+    // the speaker finished a turn). For CTC / TDT / whisper sessions
+    // this flag stays false; Phase 13 will map this onto a cross-engine
+    // `OnEndOfTurn` event with `eot_confidence` filled in.
+    bool   is_eou_boundary = false;
+    float  eot_confidence  = 0.0f;
+
     double encoder_ms = 0.0;
     double decode_ms  = 0.0;
 };

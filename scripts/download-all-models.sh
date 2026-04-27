@@ -108,11 +108,12 @@ if (( want_nemo )); then
           "$NEMO_DIR/parakeet-tdt_ctc-110m.nemo"
 
     hr
-    echo "== nemo: stt_en_fastconformer_hybrid_large_streaming_multi (EOU/streaming, ~440 MiB)"
-    echo "         (forward-looking: cached for the planned EOU streaming port,"
-    echo "          tracked in PROGRESS.md as a future workstream.)"
-    fetch "https://huggingface.co/nvidia/stt_en_fastconformer_hybrid_large_streaming_multi/resolve/main/stt_en_fastconformer_hybrid_large_streaming_multi.nemo" \
-          "$NEMO_DIR/stt_en_fastconformer_hybrid_large_streaming_multi.nemo"
+    echo "== nemo: parakeet_realtime_eou_120m-v1 (EOU streaming, FastConformer-RNNT 120M, ~440 MiB)"
+    echo "         (cache-aware streaming with att_context_size=[70,1] + <EOU>"
+    echo "          end-of-utterance token; English only; the .nemo source for the"
+    echo "          ONNX bundle the qvac-lib-infer-parakeet binding ships today.)"
+    fetch "https://huggingface.co/nvidia/parakeet_realtime_eou_120m-v1/resolve/main/parakeet_realtime_eou_120m-v1.nemo" \
+          "$NEMO_DIR/parakeet_realtime_eou_120m-v1.nemo"
 
     hr
     echo "== nemo: diar_sortformer_4spk-v1 (4-speaker diarization, offline, ~490 MiB)"

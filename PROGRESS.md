@@ -2101,3 +2101,460 @@ the eventual destination; 11.11.1 is what ships today.
   the f32 GGUF -- worth re-checking with the q8_0 path.
 - **Quantised (q8_0 / q4_0) Sortformer GGUFs**. Converter handles
   these via the universal dequant path; needs a sweep + parity check.
+
+## Phase 12 — EOU end-of-utterance streaming ASR  _(in progress; 12.0 + 12.1 shipped)_
+
+### Phase 12.0 — scope, model selection, API target  _(done)_
+
+The `qvac-lib-infer-parakeet` Node binding exposes four `modelType`
+flavours today: `tdt`, `ctc`, `eou`, `sortformer`. The first three +
+the fourth are all served via onnxruntime; this repo already provides
+ggml backends for `tdt` / `ctc` / `sortformer`. Phase 12 closes the
+loop on `eou` so the binding can swap its onnxruntime backend out for
+a single pure-ggml dependency.
+
+**Checkpoint.** The community ONNX bundle the binding ships
+(`altunenes/parakeet-rs/realtime_eou_120m-v1-onnx`) is a third-party
+re-export of NVIDIA's official **`nvidia/parakeet_realtime_eou_120m-v1`**
+NeMo `.nemo` checkpoint (NVIDIA Open Model License). Exposing the same
+NeMo source lets us reuse the exact pattern the CTC / TDT / Sortformer
+ports already followed: `.nemo` -> GGUF via `convert-nemo-to-gguf.py`,
+NeMo PyTorch as the parity oracle (no onnxruntime in the dev loop).
+
+**Architecture summary** (from `model_config.yaml` + state-dict probe):
+
+| Stage | Spec |
+|---|---|
+| Mel  | `AudioToMelSpectrogramPreprocessor`, 128 bins, n_fft=512, win=400, hop=160, normalize=NA, dither=1e-5, pad_to=0 |
+| Encoder | FastConformer, 17 layers, d_model=512, n_heads=8, ff_expansion=4, conv_kernel=9, dw_striding subsample 8x, **`use_bias=False`**, **`xscaling=False`**, **`conv_norm_type=layer_norm`** (gamma/beta still stored under `conv.batch_norm.{weight,bias}`; no running stats), **`att_context_size=[70,1]`** + `att_context_style=chunked_limited`, `causal_downsampling=true`, `conv_context_size=causal` |
+| Decoder | RNNT-Decoder, 1 LSTM layer x 640 hidden, embedding `[1027, 640]` (`vocab + 1` for `blank_as_pad=true`) |
+| Joint | RNNT-Joint, encoder_hidden=512 -> 640, pred_hidden=640 -> 640, ReLU, output dim **1027** = 1024 BPE + `<EOU>` (id 1024) + `<EOB>` (id 1025) + blank (id 1026) |
+| Latency | NVIDIA card cites 80 ms (p50) / 280 ms (p90) / 320 ms (p95) end-of-turn detection on TTS-augmented DialogStudio |
+
+So EOU is **TDT minus durations + streaming knobs + LayerNorm in the
+conv module**; encoder graph is ~95 % shared with the existing CTC/TDT
+encoder, with three deltas (LN-vs-fused-BN in conv module, chunked-
+limited attention masking + per-chunk KV cache state, depthwise-conv
+left state). The decoder + joint mirror TDT minus the duration head.
+
+**API target.** The binding's JS surface for EOU today (`index.d.ts`)
+is intentionally minimal: just the same generic transcription pipeline
+as TDT/CTC with `modelType: 'eou'`. Full enumeration:
+
+- Constructor: `new TranscriptionParakeet({ files: { eouEncoder,
+  eouDecoder, tokenizer }, config: { parakeetConfig: { modelType: 'eou',
+  maxThreads, sampleRate, channels, captionEnabled, timestampsEnabled,
+  seed } } })`.
+- Lifecycle: `activate()`, `loadWeights()`, `pause/unpause()`,
+  `reload()`, `cancel()`, `destroy()`.
+- Streaming I/O: `append({ type: 'audio', data: ArrayBuffer })` (any
+  chunk size, addon batches internally) + `append({ type: 'end of
+  job' })`. Output via callback as `TranscriptionSegment[]`
+  (`{ text, start, end, toAppend }`). **`start`/`end` are not populated
+  for EOU** -- only `text`.
+- No EOU-specific events (utterance boundary not surfaced to JS),
+  no partial/final distinction, no per-segment IDs.
+
+C++ pipeline this maps to (matching `processEOU` in the binding's
+`ParakeetModel.cpp`):
+
+1. mel(128) over the full input audio (offline; binding accumulates
+   the addon's append-queue until `end of job`, then mels the whole
+   buffer).
+2. Walk mel in fixed 25-frame slices (`encoder_chunk_mel_frames=25`);
+   skip trailing slice if `< 10` frames and not first.
+3. Per slice: cache-aware encoder forward with running
+   `cache_last_channel (17, 1, 70, 512)`,
+   `cache_last_time (17, 1, 512, 8)`, `cache_last_channel_len (1)`.
+4. Per encoder frame: RNN-T greedy with up to 5 symbols/step;
+   `<blank>` ends the per-frame loop, `<EOU>` flushes the current
+   segment with `\n` separator + zeroes h/c, otherwise append the
+   piece to the running segment.
+5. Concatenate segments with single space; trim; empty -> "no speech"
+   sentinel; total word count -> stats.
+
+Cross-engine VAD/EndOfTurn events are **not** part of Phase 12; they
+will be a Phase 13 cross-cutting concern wiring `<EOU>` and Sortformer
+per-frame any-speaker probabilities into a shared `StreamEvent`
+umbrella across qvac-parakeet.cpp + whisper.cpp. Phase 12 just needs
+to land the `EouStreamSession` callback signature with
+`is_eou_boundary` from day 1 so Phase 13 plugs in without churn.
+
+**Phase 12 outline (and current shipping status):**
+
+- 12.0 plan + scope (this section). _(done)_
+- 12.1 converter + Python reference + GGUF roundtrip. _(done; see
+  §12.1 below)_
+- 12.2 EOU GGUF loader + Engine routing.
+- 12.3 cache-aware FastConformer encoder graph (LN-in-conv,
+  chunked-limited attention mask, KV + conv state).
+- 12.4 RNN-T decoder (1-layer LSTM 640 + joint MLP) with `<EOU>`
+  reset semantics.
+- 12.5 `EouStreamSession` push API (callback shape ready for
+  Phase 13 events).
+- 12.6 CLI auto-routing + `live-mic` auto-detection.
+- 12.7 parity harness (`test-eou-parity` vs `dump-eou-reference.py`)
+  and end-to-end transcript check (`test-eou-streaming` on jfk.wav).
+
+### Phase 12.1 — converter + Python reference  _(done)_
+
+`scripts/convert-nemo-to-gguf.py` learned an EOU branch:
+
+1. **Detection** -- `detect_model_type()` distinguishes EOU from TDT
+   by the absence of `model_defaults.tdt_durations` plus the presence
+   of `<EOU>` in `cfg.labels`. Sortformer / CTC paths unchanged.
+2. **Conv-norm switch** -- when `cfg.encoder.conv_norm_type ==
+   "layer_norm"`, the per-block emitter writes
+   `encoder.blk.{i}.conv.norm.{weight,bias}` straight from the
+   `conv.batch_norm.{weight,bias}` tensors (gamma/beta) and skips the
+   BN running-stats fusion that the BatchNorm path requires. The
+   metadata key `parakeet.encoder.conv_norm_type` advertises which
+   path each GGUF expects.
+3. **Streaming hyperparameters in metadata** --
+   `parakeet.encoder.{conv_norm_type,conv_context_size,
+   causal_downsampling,att_context_style,att_context_size_left,
+   att_context_size_right}` so the C++ encoder can build the right
+   chunked-limited attention mask + KV-cache shapes without re-parsing
+   YAML.
+4. **EOU metadata block** under `parakeet.eou.*`:
+   `{vocab_size, blank_id, eou_id, eob_id, pred_hidden,
+   pred_rnn_layers, joint_hidden, encoder_chunk_mel_frames,
+   cache_lookback_frames, cache_time_steps, max_symbols_per_step}`.
+   `cache_lookback_frames` defaults from `att_context_size_left` (70)
+   and `cache_time_steps` from `conv_kernel - 1` (8).
+5. **EOU tensors** under `eou.*`: `eou.predict.embed.weight`,
+   `eou.predict.lstm.0.{w_ih,w_hh,b_ih,b_hh}`, `eou.joint.enc.*`,
+   `eou.joint.pred.*`, `eou.joint.out.*`. SentencePiece tokenizer
+   bytes embedded same as CTC/TDT.
+
+Output sizes on `nvidia/parakeet_realtime_eou_120m-v1.nemo`:
+
+| Quant | File size | Notes |
+|-|-|-|
+| f16   | 246.0 MiB | 251 f32 + 233 f16 tensors |
+| q8_0  | 131.7 MiB | same f32 set + 233 q8_0 tensors |
+
+`scripts/dump-eou-reference.py` mirrors `dump-tdt-reference.py` plus a
+streaming-mode pass:
+
+- Offline: 128-bin mel, full-context encoder output (T_enc, 512), LSTM
+  init state (1, 1, 640), prediction-net output for the blank/SOS
+  token (640,), and the NeMo `transcribe()` greedy reference text.
+- Streaming: `model.encoder.cache_aware_stream_step(...)` driven in
+  25-mel-frame chunks with explicit running caches; per-chunk encoder
+  outputs are concatenated and saved alongside per-chunk frame counts.
+  With `att_context_size=[70,1]` each 25-mel-frame chunk emits 2
+  encoder frames (the right-context-1 frame is held back), so on
+  jfk.wav (11 s, 1101 mel frames) the streaming pass produces 88
+  encoder frames vs the offline pass's 139. That's intentional and is
+  what the C++ streaming graph will need to reproduce in Phase 12.3.
+
+NeMo offline transcript on `test/samples/jfk.wav`:
+
+```
+and so my fellow americans ask not what your country can do for you ask
+what you can do for your country<EOU>
+```
+
+The trailing literal `<EOU>` is the joint network emitting the EOU
+token at end-of-utterance and is exactly the signal the C++ decoder
+will key on for `\n` segment-flush + LSTM state reset (per the
+binding's `eouDecodeChunk` semantics).
+
+`scripts/verify-gguf-roundtrip.py` learned to dispatch on
+`parakeet.model.type`: `build_expected_eou()` recreates the EOU tensor
+map (LayerNorm in conv, no use_bias on inner blocks, EOU/joint
+weights), `build_expected_ctc()` keeps the existing CTC path. The
+verifier also gained a Q8_0 / Q5_0 / Q4_0 dequant comparison branch
+with per-format rel gates, so the same script validates every quant
+tier we ship.
+
+Both tiers pass round-trip on the EOU GGUFs (worst rel 4.78e-4 at
+f16 -- under the 2^-10 gate -- and 4.0e-3 at q8_0 -- under the 2^-7
+gate); CTC GGUF baseline still passes after the verifier was
+generalised to handle trailing-1-axis squeezing in older artefacts.
+
+### Phase 12.2 — EOU GGUF loader + Engine routing  _(done)_
+
+Touched `parakeet_ctc.h` / `parakeet_ctc.cpp` / `parakeet_engine.cpp`.
+Additions:
+
+- `enum class ParakeetModelType` gains an `EOU` variant; the loader
+  routes on `parakeet.model.type == "eou"` and populates an
+  `EouWeights` struct alongside the existing CTC / TDT / Sortformer
+  weight blobs.
+- `EncoderConfig` gains a `ConvNormType conv_norm_type` enum +
+  `causal_downsampling`, `conv_causal`, `att_chunked_limited`,
+  `att_context_left`, `att_context_right` fields, all read from the
+  GGUF metadata block written by §12.1's converter changes. CTC / TDT
+  / Sortformer GGUFs leave these at their offline defaults so the
+  existing engines are bit-for-bit unchanged.
+- `BlockWeights` gains optional `conv_norm_w` / `conv_norm_b` (used
+  when `conv_norm_type == LayerNorm`) alongside the existing fused-BN
+  `conv_bn_scale` / `conv_bn_shift` (used when `BatchNorm`). The
+  loader's per-block tensor pull picks one or the other based on the
+  metadata.
+- `EouWeights` mirrors `TdtWeights` minus the duration head:
+  `predict.embed`, one-layer LSTM `(w_ih, w_hh, b_ih, b_hh)`, and
+  `joint.{enc,pred,out}.{weight,bias}`.
+- `Engine::Impl` gains an `EouRuntimeWeights eou_rt` slot and runs
+  `eou_prepare_runtime()` at construction when the GGUF is EOU
+  (dequantises the predict + joint to f32 once, same shape the
+  TDT runtime uses).
+- `Engine::transcribe_samples()` dispatches to a new EOU branch that
+  calls `eou_greedy_decode()`. `Engine::is_transcription_model()`
+  returns true for EOU; `Engine::model_type()` returns `"eou"`.
+
+CLI side (`src/main.cpp`): the manual decode dispatch in the closure
+gained an EOU branch (the bug that surfaced as a segfault during
+bring-up was that the manual closure had a TDT branch but no EOU
+branch, so EOU GGUFs fell through to `ctc_greedy_decode` on a NULL
+logits buffer). `transcribe_wav()` now lists EOU alongside TDT /
+Sortformer in its "use Engine instead" rejection message.
+
+### Phase 12.3 — encoder graph (LN-in-conv + causal subsampler + chunked-limited attention mask)  _(done)_
+
+Three structural changes to `subsampling_graph()` /
+`conformer_conv_graph()` / `rel_pos_mha_graph()` /
+`build_encoder_graph_cached()`, each gated on `EncoderConfig`
+metadata so CTC / TDT / Sortformer GGUFs take the original code
+path:
+
+1. **LayerNorm in conv module.** When `conv_norm_type ==
+   LayerNorm`, the conv graph permutes from `(T, d_model)` to
+   `(d_model, T)`, runs `layer_norm_affine(x, conv.norm.weight,
+   conv.norm.bias, eps)`, applies SiLU, and falls into the existing
+   pw2 / matmul path. Saves one permute vs the BN path. Existing
+   CTC / TDT / offline Sortformer keep the fused
+   `bn_scale * x + bn_shift -> silu -> permute -> pw2` flow.
+2. **Causal subsampler** (`causal_downsampling=true`). NeMo's
+   `CausalConv2D` pre-pads each stride-2 dw_striding conv with
+   `(L=k-1=2, R=s-1=1)` zeros on **both** the freq and time axes,
+   then convolves with `padding=0`. New `zero_pad_dim1` helper
+   (analogous to the existing `zero_pad_dim0`) implements the
+   freq-axis half. `subsampling_graph` gains a `causal_downsampling`
+   flag; when set it pre-pads and switches the conv `padding` to
+   zero. Output sizing changes from
+   `(L+2-k)/s+1 = (L-1)/2+1` (symmetric) to `(L+(L+R)-k)/s+1 =
+   L/2+1` (causal) so freq goes 128 -> 65 -> 33 -> 17 instead of
+   128 -> 64 -> 32 -> 16, matching the trained
+   `encoder.subsampling.out.weight` shape `[512, 4352=17*256]`.
+   `run_encoder()`'s mask-sizing math was also gated on the same
+   flag (a bug surfaced where the cached graph used the new sizes
+   but the per-call mask uploads still used the symmetric formula,
+   producing 138-frame outputs instead of 139).
+3. **Causal depthwise conv module** (`conv_context_size: causal`).
+   The conv module's k=9 depthwise stride=1 conv now uses
+   `(L=8, R=0)` zero-pad instead of the symmetric `(L=4, R=4)`.
+4. **Chunked-limited attention mask** (`att_context_style:
+   chunked_limited`). `EncoderGraph` gains an `att_mask` graph
+   input + `att_mask_host` buffer. Built host-side once per graph
+   (cached across calls): for query frame `i` in chunk
+   `c = i / (right + 1)`, the mask is `0.0f` on the visible
+   `[c*chunk_size - left, (c+1)*chunk_size - 1]` range (clamped to
+   `[0, T-1]`) and `-INFINITY` everywhere else. Wired into
+   `rel_pos_mha_graph` via `ggml_soft_max_ext(scores, mask, scale,
+   0.0f)` (which the `att_mask=nullptr` callers fall back to the
+   prior `ggml_scale + ggml_soft_max` path on, so CTC / TDT
+   regression unchanged). The formula matches NeMo's
+   `_create_masks` exactly: `chunk_idx[i] - chunk_idx[j] in
+   [0, left // chunk_size]` -- for `att_context_size=[70, 1]`,
+   `left_chunks_num = 70 // 2 = 35` and queries see their own chunk
+   plus 35 chunks of past context, exactly 72 keys per query (in
+   the steady state).
+
+The conv graph branches and the mask wiring also flow through
+`profile_block_substages` (CTC profiling helper). Tested across
+CTC / TDT / Sortformer with no regression.
+
+**Mel preprocessor (`mel_preprocess.{h,cpp}`)** also got a
+`MelNormalize` enum + `MelConfig::normalize` field. EOU's NeMo
+config sets `normalize: NA` (no per-feature CMVN); the loader reads
+the converter-emitted `parakeet.preproc.normalize` string and gates
+the existing `apply_per_feature_cmvn()` call on it. CTC / TDT /
+Sortformer all leave `normalize=per_feature` so their CMVN keeps
+running. **This was the dominant accuracy gap during bring-up:**
+CTC/TDT-style CMVN on EOU's preprocessor mean-centres each mel bin
+across the whole utterance, but the EOU encoder was trained against
+raw log-mel values that floor at the log-zero guard during
+silence frames; without CMVN our subsampler cosine jumped from
+`0.108` (broken) to `0.999688` (matched) and the encoder cosine
+landed at `0.999997` -- f16 quantisation floor.
+
+Per-stage parity on `test/samples/jfk.wav` (NeMo PyTorch reference
+via `dump-eou-reference.py` → C++ via `PARAKEET_DUMP_*` env vars):
+
+| Stage | max_abs | rel_max | cosine |
+|-|-|-|-|
+| log-mel          | 1.36e+1 (tail-frame artifacts) | 8.17e-1 | 0.999644 |
+| post-subsampler  | 3.30e+2                        | 1.00e-1 | 0.999688 |
+| encoder out      | **7.64e-2**                    | **7.70e-3** | **0.999997** |
+
+Transcript on `jfk.wav` (both `parakeet-eou-120m-v1.gguf` f16 and
+`parakeet-eou-120m-v1.q8_0.gguf`):
+
+```
+and so my fellow americans ask not what your country can do for you ask
+what you can do for your country
+```
+
+Bit-equal to NeMo's offline reference (modulo the trailing literal
+`<EOU>` token which the C++ decoder strips after using it for the
+segment-flush + LSTM-state-reset side effect). The 20 s
+`sample-16k.wav` Alice-in-Wonderland clip transcribes with zero
+errors on q8_0:
+
+```
+alice was beginning to get very tired of sitting by her sister on the
+bank and of having nothing to do once or twice she had peeped into the
+book her sister was reading but it had no pictures or conversations in
+it and what is the use of a book thought alice without pictures or
+conversations
+```
+
+### Phase 12.4 — RNN-T decoder + `<EOU>` reset semantics  _(done)_
+
+New `parakeet_eou.{h,cpp}` (~360 lines) modelled on
+`parakeet_tdt.{h,cpp}`. `EouRuntimeWeights` dequantises the predict
+(1-layer LSTM, 640 hidden) + joint (`enc 512->640`, `pred 640->640`,
+`out 640->1027`) to f32 once at Engine construction. `EouDecodeState`
+holds `h_state`, `c_state`, `pred_out`, `last_token`,
+`symbols_this_step`, `segment_start_token` -- everything needed to
+carry decoder state across chunked calls.
+
+`eou_decode_window()` runs greedy RNN-T over a span of encoder
+frames with up to `max_symbols_per_step=5` symbols per encoder step
+(matches the binding's `EOU_MAX_SYMBOLS_PER_STEP`). Per emitted
+token:
+
+- `<blank>` (id 1026) -> break out of inner loop, advance encoder.
+- `<EOB>` (id 1025) -> training-time block boundary marker; treated
+  as a no-op skip. Same policy as the binding.
+- `<EOU>` (id 1024) -> flush the in-progress segment to
+  `out_segments`, **zero h/c state**, set `last_token = blank`,
+  re-prime the predictor with the blank embedding, break out of
+  inner loop. The state reset is the binding's
+  `eouDecodeChunk` reset semantics carried through verbatim.
+- Any other special token (vocabulary entry of the form
+  `<...>`) -> defensive break (matches the binding's
+  `isSpecialToken` skip).
+- Otherwise: append to `out_tokens`, feed back into the LSTM,
+  update `pred_out` for the next joint call.
+
+`eou_greedy_decode()` is the one-shot wrapper used by
+`Engine::transcribe()`: detokenises segment-by-segment using the
+boundaries `eou_decode_window` recorded, joins with `\n`, returns
+the result as `EouDecodeResult.text`. `eou_count` is exposed for
+later wiring into the planned cross-engine `OnEndOfTurn` event.
+
+### Phase 12.5 — streaming push API (Modes 2 + 3)  _(done; cache-aware fast path deferred to Phase 12.x)_
+
+Public API additions in `include/qvac-parakeet/ctc/engine.h`:
+
+```cpp
+struct StreamingSegment {
+    // ... existing fields ...
+    bool   is_eou_boundary = false;   // EOU only: <EOU> token fired in this chunk
+    float  eot_confidence  = 0.0f;    // reserved for Phase 13's OnEndOfTurn event
+};
+```
+
+Existing `StreamSession` (`StreamSession::Impl`) gained an
+`EouDecodeState eou_state` slot and an EOU branch in
+`process_window()`. On `Engine::stream_start()` for an EOU GGUF the
+session initialises the EOU state via `eou_init_state(eou_rt,
+eou_state)` (priming the LSTM with the blank embedding, matching
+NeMo's `decoder.initialize_state`). The existing
+`Engine::transcribe_samples_stream()` (Mode 2) gained the same EOU
+branch. Both paths set `seg.is_eou_boundary = (win_segments.size() >
+0)` per emitted chunk, so the `<EOU>` token's emission shows up on
+the cadence the consumer is already iterating.
+
+CLI wiring (`src/main.cpp`):
+
+- `--stream` (Mode 2) on EOU GGUFs runs the offline encoder once
+  then walks chunks emitting `StreamingSegment`s, exactly like
+  CTC / TDT.
+- `--stream --stream-duplex` (Mode 3) on EOU GGUFs goes through
+  `Engine::stream_start()` -> `StreamSession`. Each chunk's
+  encoder runs over `[left + chunk + right_lookahead]` audio with
+  the chunked-limited mask applied; the EOU decoder state carries
+  across chunks. Mode 3 produces transcript output that's
+  byte-equal to Mode 1 on jfk.wav (104 B vs 104 B).
+- `--emit jsonl` includes `"is_eou_boundary"` per segment line.
+
+`live-mic` already routes anything that isn't a Sortformer GGUF
+through `StreamSession`, so `live-mic --model
+models/parakeet-eou-120m-v1.q8_0.gguf` works out of the box -- no
+new auto-detection logic was required.
+
+`test-eou-streaming` (new, `src/test_eou_streaming.cpp`) asserts:
+
+- Mode 2 concatenated text **byte-equal** to the offline
+  `Engine::transcribe()` reference;
+- Mode 2 `is_eou_boundary` fires on at least one segment (the
+  trailing `<EOU>` on `jfk.wav`);
+- Mode 3 transcript size matches the reference within a 20 % tail
+  jitter band (the cache-aware fast path will tighten this to
+  byte-equal in the deferred slice).
+
+Passes on both `parakeet-eou-120m-v1.gguf` (f16) and
+`parakeet-eou-120m-v1.q8_0.gguf`. Existing `test-streaming` (CTC /
+TDT byte-equality + WER tolerance) and `test-sortformer-streaming`
+both still pass after the `StreamSession::Impl` plumbing changes.
+
+#### Mode 3 caveat + Phase 12.x optimisation runway
+
+Mode 3 today re-runs the **offline** encoder per chunk over a
+sliding `[left + chunk + right_lookahead]` window without persistent
+KV / conv-state cache across chunks. The transcript matches Mode 2
+byte-equally on `jfk.wav`, but `<EOU>` boundary detection is
+approximate: the trailing chunk doesn't carry the long-context
+encoder state the EOU head needs to confidently fire `<EOU>` on
+end-of-utterance. This is exactly the trade-off documented when the
+slice was scoped: the public API is shaped to absorb a true
+cache-aware encoder graph (per-layer `(70, d_model)` K/V cache +
+`(d_model, kernel-1)` depthwise-conv state, sliding forward by
+`chunk_enc_frames` per call) without changing the public surface,
+and the Phase 8.5 KV-cache groundwork that was scoped for CTC / TDT
+will land here first. Tracked as the deferred Phase 12.x
+"cache-aware streaming encoder" todo. Per-chunk encoder cost on
+Mode 3 today is `O(left + chunk + right_lookahead)` ms;
+cache-aware will reduce it to `O(chunk + right_lookahead)`.
+
+### Phase 12.6 — download script + roundtrip verifier  _(done)_
+
+`scripts/download-all-models.sh` swapped the previously-cached
+forward-looking `stt_en_fastconformer_hybrid_large_streaming_multi.nemo`
+for the actual `parakeet_realtime_eou_120m-v1.nemo`. The verifier
+(`scripts/verify-gguf-roundtrip.py`) dispatches on `parakeet.model.type`
+and ships a `build_expected_eou()` map that asserts every GGUF tensor
+matches the source NeMo state-dict at f32 bit-exactness for the f32
+slots and within a per-tier rel gate for the quant slots
+(2^-10 for f16, 2^-7 for q8_0, 2^-4 for q5_0, 2^-3 for q4_0).
+
+### Phase 12.x — pending follow-ups
+
+- **Cache-aware streaming encoder graph.** Eliminates Mode 3's
+  `O(left + chunk + right_lookahead)` per-chunk cost and recovers
+  bit-equal Mode-2 `<EOU>` boundary detection. Closes the long-
+  outstanding Phase 8.5 KV-cache scope. Per-layer `(70, d_model)`
+  K/V cache and `(d_model, kernel-1)` depthwise-conv state, both
+  sliding forward by `chunk_enc_frames` (= 2 frames per 25-mel-frame
+  chunk). The streaming graph can then be re-applied to CTC / TDT
+  Mode 3 as a 6x compute reduction on long-form audio (per the
+  Phase 8.5 estimate). API stays the same; only the internal
+  encoder-graph dispatch changes.
+- **Quantised Sortformer GGUFs.** Same converter path as EOU's
+  q8_0 / q4_0 work; needs a sweep + parity check (also tracked
+  under §11.x).
+- **Cross-engine VadState + EndOfTurn events.** The
+  `is_eou_boundary` + `eot_confidence` slots in `StreamingSegment`
+  were specifically shaped for this: Phase 13 will land a
+  `StreamEvent` umbrella across qvac-parakeet.cpp + whisper.cpp
+  with `OnVadState` / `OnEndOfTurn` callbacks, sourcing from
+  whichever engines are loaded (EOU's `<EOU>` -> `OnEndOfTurn`,
+  Sortformer's any-speaker prob -> `OnVadState`, energy-VAD
+  fallback otherwise). No new model port needed, no Silero
+  dependency -- per the design discussion before Phase 12.0
+  started.

@@ -3,8 +3,9 @@
 **Parakeet** (NVIDIA, CC-BY-4.0 FastConformer ASR family) ported to
 [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference on CPU
 and GPU (Metal / CUDA / Vulkan), with no runtime dependency on Python,
-PyTorch, or onnxruntime. Ships CTC, TDT, and Sortformer engines today
-under one `Engine` umbrella; EOU pipelines are the next workstream.
+PyTorch, or onnxruntime. Ships CTC, TDT, EOU, and Sortformer engines
+under one `Engine` umbrella; EOU (FastConformer-RNN-T 120M with native
+`<EOU>` end-of-utterance token) is the most recently shipped engine.
 
 Supported checkpoints:
 
@@ -16,22 +17,30 @@ Supported checkpoints:
 | `nvidia/parakeet-tdt-1.1b`    | TDT  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1225 MiB q8_0               | 0.027-0.079 | English only, lowest WER (no PnC) |
 | `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
 | `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline + Phase 11.11.1 sliding-history live streaming today; full NeMo-style spkcache streaming in Phase 11.11.2) |
+| `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T (1L LSTM 640) + `<EOU>` token | 128 | 512 × 17 (chunked-limited att=[70,1] + causal subsampler + LN-in-conv) | 1027 (1024 BPE + `<EOU>` + `<EOB>` + blank) | 120 M | 246 MiB f16 / 132 MiB q8_0 | encoder out cosine 0.999997 vs NeMo offline; CPU-only today (GPU follow-up tracked) | English only, low-latency streaming ASR with native `<EOU>` end-of-utterance token detection (NeMo voice-agent target). NVIDIA Open Model License. Phase 12.5 ships offline + Mode 2 / Mode 3 streaming; cache-aware streaming encoder for byte-equal Mode 3 `<EOU>` boundary detection is tracked as Phase 12.x. |
 
-Same converter, same encoder graph (biases go through an optional
-path when the checkpoint sets `use_bias=False`), same GGUF schema.
-Model identity lives entirely in `parakeet.model.type` + the encoder
-hyperparameters.
+Same converter, same encoder graph (with conv_norm_type / causal_downsampling /
+chunked_limited_attention / use_bias all toggled by GGUF metadata so the EOU
+streaming-trained encoder reuses the same C++ graph as the offline
+CTC / TDT encoders), same GGUF schema. Model identity lives entirely in
+`parakeet.model.type` + the encoder hyperparameters.
 
-All five public entry points sit on a single `qvac_parakeet::Engine`
+All public entry points sit on a single `qvac_parakeet::Engine`
 that auto-dispatches on `parakeet.model.type`:
 
-- `Engine::transcribe()` -- one-shot wav -> text. CTC or TDT.
+- `Engine::transcribe()` -- one-shot wav -> text. CTC, TDT, or EOU.
 - `Engine::transcribe_stream()` -- Mode 2, offline encoder + streamed
-  segments. CTC or TDT.
+  segments. CTC, TDT, or EOU. EOU segments carry an extra
+  `is_eou_boundary` flag that fires on the chunk where the model
+  emits the `<EOU>` token.
 - `Engine::stream_start()` -> `StreamSession` -- Mode 3, live duplex
-  cache-aware push API. CTC or TDT. TDT needs slightly more context
-  at the same chunk size (transducer is more sensitive to missing
-  right-lookahead; typical WER delta vs offline is +5-10 %).
+  cache-aware push API. CTC, TDT, or EOU. TDT needs slightly more
+  context at the same chunk size (transducer is more sensitive to
+  missing right-lookahead; typical WER delta vs offline is +5-10 %).
+  EOU's Mode 3 transcript is byte-equal to its offline path on
+  shipping fixtures; the `<EOU>` boundary detection in Mode 3 is
+  approximate today (true cache-aware streaming encoder is the
+  Phase 12.x optimisation).
 - `Engine::diarize()` -- one-shot wav -> [{speaker, start, end}].
   Sortformer.
 - `Engine::diarize_start()` -> `SortformerStreamSession` -- live
@@ -46,14 +55,21 @@ asr_engine, ...)` for combined "who said what" attribution.
 ## Pipeline at a glance
 
 ```
-  wav -> log-mel (80/128) -> FastConformer encoder (sub 8x, 17-42 blocks)
+  wav -> log-mel (80/128) -> FastConformer encoder (sub 8x, 17-42 blocks,
+                                                    optional LN-in-conv +
+                                                    causal subsampler +
+                                                    chunked-limited attn mask)
                                     |
-        +---------------------------+---------------------------+
-        v                           v                           v
-   CTC head + greedy           TDT LSTM + joint MLP +     Sortformer encoder_proj +
-        + SP detok               transducer greedy        18L TF + sigmoid head
-        |                           |                           |
-       text                  text + PnC                {speaker, t0, t1}*
+        +-------------+--------------+--------------+--------------+
+        v             v              v              v              v
+   CTC head +    TDT 2L LSTM +    EOU 1L LSTM +   Sortformer encoder_proj +
+   greedy +     joint MLP +      joint MLP +     18L TF + sigmoid head +
+   SP detok     transducer       transducer +    threshold segmentation
+        |       greedy            <EOU> reset
+        |       + duration head   + segment flush
+        |       |                 |               |
+       text   text + PnC      text (\n on        {speaker, t0, t1}*
+                              <EOU> turn ends)
 ```
 
 Each `.gguf` ships everything its decoder needs in a single file
@@ -124,8 +140,8 @@ This produces the main binary plus per-stage validation harnesses:
 
 | Binary                            | What it does |
 |-----------------------------------|--------------|
-| `build/qvac-parakeet`             | End-to-end CLI: wav / raw PCM -> text (CTC + TDT) or speaker segments (Sortformer). Auto-routes on GGUF metadata. Supports `--stream` (Mode 2/3 transcription, sliding-history Sortformer streaming), `--diarization-model PATH` (combined ASR + Sortformer attribution), `--bench`, `--profile`. |
-| `build/live-mic`                  | Live microphone session for either transcription (CTC/TDT) or diarization (Sortformer). Auto-detects from the GGUF. |
+| `build/qvac-parakeet`             | End-to-end CLI: wav / raw PCM -> text (CTC + TDT + EOU) or speaker segments (Sortformer). Auto-routes on GGUF metadata. Supports `--stream` (Mode 2/3 transcription, sliding-history Sortformer streaming), `--diarization-model PATH` (combined ASR + Sortformer attribution), `--bench`, `--profile`. EOU streaming JSON output includes a `is_eou_boundary` flag per segment. |
+| `build/live-mic`                  | Live microphone session for either transcription (CTC/TDT/EOU) or diarization (Sortformer). Auto-detects from the GGUF. |
 | `build/live-mic-attributed`       | Live microphone with simultaneous ASR + Sortformer; tags each transcript segment with the speaker whose live diarization range overlaps it the most. `--accumulate` collapses output to one line per speaker. |
 | `build/test-mel`                  | 16 kHz log-mel parity vs NeMo `AudioToMelSpectrogramPreprocessor`. |
 | `build/test-encoder`              | FastConformer encoder per-stage parity vs `dump-ctc-reference.py`. |
@@ -133,6 +149,7 @@ This produces the main binary plus per-stage validation harnesses:
 | `build/test-tdt-encoder-parity`   | TDT encoder per-stage parity vs `dump-tdt-reference.py`. |
 | `build/test-sortformer-parity`    | Sortformer mel + encoder + speaker-prob parity vs `dump-sortformer-reference.py`. |
 | `build/test-streaming`            | CTC/TDT Mode 2 byte-equality + timestamp coverage + Mode 3 WER tolerance across chunk sizes. |
+| `build/test-eou-streaming`        | EOU Mode 2 transcript byte-equality vs `Engine::transcribe()` reference + `is_eou_boundary` firing on the trailing `<EOU>` chunk + Mode 3 transcript-within-tolerance. |
 | `build/test-sortformer-streaming` | `SortformerStreamSession` push API: random-burst feed, no-duplicate, single-`is_final` assertions. |
 
 ### Build options worth knowing
@@ -180,6 +197,13 @@ python scripts/convert-nemo-to-gguf.py \
   --ckpt    models/parakeet-tdt-1.1b.nemo \
   --hf-repo nvidia/parakeet-tdt-1.1b \
   --out     models/parakeet-tdt-1.1b.q8_0.gguf \
+  --quant   q8_0
+
+# Parakeet-EOU 120M (English, real-time streaming + native <EOU> end-of-utterance token)
+python scripts/convert-nemo-to-gguf.py \
+  --ckpt    models/parakeet_realtime_eou_120m-v1.nemo \
+  --hf-repo nvidia/parakeet_realtime_eou_120m-v1 \
+  --out     models/parakeet-eou-120m-v1.q8_0.gguf \
   --quant   q8_0
 
 # Sortformer 4-speaker diarization (offline v1, streaming-trained v2)
@@ -315,9 +339,11 @@ compute-bound on shader units.
 ```
 
 Auto-routing on the model type means the same command also works on
-TDT GGUFs (you get cased + punctuated text) and on Sortformer GGUFs
-(you get `[start-end] speaker_N` lines instead of text). See `--help`
-for the full flag set.
+TDT GGUFs (you get cased + punctuated text), on EOU GGUFs (you get
+the same lowercase no-PnC English text the EOU model was trained for,
+with a trailing `<EOU>` token segmenting the output by utterance),
+and on Sortformer GGUFs (you get `[start-end] speaker_N` lines
+instead of text). See `--help` for the full flag set.
 
 ### Raw PCM input
 
@@ -376,8 +402,10 @@ Flags:
   every shipped GGUF; the implementation derives it from the model's
   mel hop length and subsampling factor).
 - `--emit text` — one `[start-end] text` line per segment (default).
-- `--emit jsonl` — one `{"chunk","start","end","is_final","text"}` JSON
-  object per line, for easy downstream consumption.
+- `--emit jsonl` — one `{"chunk","start","end","is_final","is_eou_boundary","text"}`
+  JSON object per line, for easy downstream consumption. The
+  `is_eou_boundary` field is always present but only ever true on
+  EOU GGUFs (CTC / TDT segments leave it false).
 
 On a 5.5 minute speech clip (`LastQuestion_long_EN.raw`, 16 kHz
 s16le) Mode 2 lands at **RTF 0.046** (~22x real-time) on M4 Air with
@@ -439,6 +467,90 @@ drop-in swap.
 The Node binding at [qvac-lib-infer-parakeet](https://github.com/qvac/qvac-lib-infer-parakeet)
 is the intended consumer for `StreamSession`; check its README for
 the `qvac-parakeet.cpp` version it currently links against.
+
+### Streaming — EOU (`<EOU>` end-of-utterance token)
+
+EOU GGUFs flow through the same Mode 1 / Mode 2 / Mode 3 entry points
+as CTC / TDT, with two extras on each emitted `StreamingSegment`:
+
+```cpp
+struct StreamingSegment {
+    // ... existing CTC/TDT/EOU fields: text, token_ids, start_s, end_s,
+    //     chunk_index, is_final, encoder_ms, decode_ms ...
+
+    // EOU only: set true when this chunk's decoded portion contained
+    // the `<EOU>` token. CTC / TDT segments leave this false.
+    bool   is_eou_boundary = false;
+    float  eot_confidence  = 0.0f;     // reserved for Phase 13 OnEndOfTurn
+};
+```
+
+The decoder threads its own LSTM h/c state across chunks; on `<EOU>`
+it flushes the current segment to text, zeros h/c, and re-primes the
+predictor with the blank embedding -- exactly matching the binding's
+`processEOU` semantics from `qvac-lib-infer-parakeet`. The token is
+not in the visible vocab piece list, so it doesn't appear in
+`segment.text`; consumers see the `is_eou_boundary` flag instead.
+
+CLI examples on `jfk.wav` (the JFK quote ends naturally with one
+`<EOU>` boundary at the very end):
+
+```bash
+# Offline transcription (matches NeMo offline reference bit-for-bit):
+./build/qvac-parakeet \
+    --model models/parakeet-eou-120m-v1.q8_0.gguf \
+    --wav   test/samples/jfk.wav
+# -> "and so my fellow americans ask not what your country can do for
+#     you ask what you can do for your country"
+
+# Mode 2 streaming with chunked emit + JSON output (last chunk gets
+# is_eou_boundary=true because the model emits <EOU> at end-of-quote):
+./build/qvac-parakeet \
+    --model models/parakeet-eou-120m-v1.q8_0.gguf \
+    --wav   test/samples/jfk.wav \
+    --stream --stream-chunk-ms 1500 --emit jsonl
+# -> {"chunk":0,...,"is_eou_boundary":false,"text":"and so my"}
+#    {"chunk":1,...,"is_eou_boundary":false,"text":" fellow americans"}
+#    ...
+#    {"chunk":7,...,"is_eou_boundary":true, "text":" country"}
+
+# Mode 3 live duplex (push API; same audio -> same transcript):
+./build/qvac-parakeet \
+    --model models/parakeet-eou-120m-v1.q8_0.gguf \
+    --wav   test/samples/jfk.wav \
+    --stream --stream-duplex \
+    --stream-chunk-ms 1000 \
+    --stream-left-context-ms   5000 \
+    --stream-right-lookahead-ms 1000
+```
+
+Numerical parity vs NeMo PyTorch reference (`dump-eou-reference.py`)
+on `jfk.wav`:
+
+| Stage | rel error | cosine |
+|-|-|-|
+| log-mel          | 8.17e-1 (tail-frame artifacts) | 0.999644 |
+| post-subsampler  | 1.00e-1                        | 0.999688 |
+| encoder out      | **7.70e-3**                    | **0.999997** |
+
+Bit-equal transcripts on `jfk.wav` and `sample-16k.wav`
+(Alice-in-Wonderland 20 s clip) at both `f16` and `q8_0` quant tiers.
+`build/test-eou-streaming` asserts these properties on every CI run.
+
+Mode 3 caveat: today the streaming session re-runs the **offline**
+encoder per chunk over a sliding `[left + chunk + right_lookahead]`
+window without persistent KV / conv-state cache across chunks. The
+transcript is byte-equal to the offline path on shipping fixtures,
+but `<EOU>` boundary detection in Mode 3 is *approximate* because
+the trailing chunk doesn't carry the long-context encoder state the
+EOU head needs to confidently fire `<EOU>` at end-of-utterance. The
+true cache-aware encoder graph (per-layer `(70, d_model)` K/V cache
++ `(d_model, kernel-1)` depthwise-conv state, sliding forward by
+`chunk_enc_frames` per call) is the Phase 12.x optimisation that
+will recover bit-equal Mode-2 `<EOU>` detection AND give the
+~6x per-chunk compute reduction long planned for Phase 8.5 (which
+will benefit CTC / TDT Mode 3 too -- same internal graph reused
+across all three engine types).
 
 ### Streaming — Sortformer (live diarization)
 
@@ -645,13 +757,32 @@ python scripts/dump-sortformer-reference.py \
     models/sortformer-4spk-v1.f16.gguf test/samples/two-speakers-16k.wav artifacts/sortformer-ref
 ```
 
+EOU parity (mel + encoder + offline + Mode 2 / Mode 3 streaming).
+The reference dump produces both an offline-pass and a streaming-pass
+reference (`encoder_streaming_out.npy`); `test-eou-streaming` checks
+offline transcript byte-equality + `<EOU>` boundary firing on the
+trailing chunk:
+
+```bash
+python scripts/dump-eou-reference.py \
+    --wav test/samples/jfk.wav \
+    --out artifacts/eou-ref
+
+./build/test-eou-streaming \
+    --model models/parakeet-eou-120m-v1.q8_0.gguf --wav test/samples/jfk.wav
+```
+
 Streaming smoke tests (Mode 1/2/3 byte-equality + WER tolerance for
-CTC/TDT; sliding-history push API + no-duplicate + single-`is_final`
-for Sortformer):
+CTC/TDT; Mode 2 byte-equal + Mode 3 transcript-within-tolerance for
+EOU; sliding-history push API + no-duplicate + single-`is_final` for
+Sortformer):
 
 ```bash
 ./build/test-streaming \
     --model models/parakeet-ctc-0.6b.q8_0.gguf --wav test/samples/jfk.wav
+
+./build/test-eou-streaming \
+    --model models/parakeet-eou-120m-v1.q8_0.gguf --wav test/samples/jfk.wav
 
 ./build/test-sortformer-streaming \
     --model models/sortformer-4spk-v1.f16.gguf --wav test/samples/two-speakers-16k.wav
@@ -667,20 +798,34 @@ Stage D  block_last_out        rel ~ 2e-3
 Stage E  ctc_logits            rel ~ 1e-3   (CTC head only)
 Stage F  decoded transcript    edit distance = 0 on clean speech
 Stage S  speaker_probs         rel ~ 2e-4   (Sortformer head)
+Stage E2 eou_encoder_out       rel ~ 8e-3, cosine 0.999997 (EOU 17L
+                                                            chunked-limited)
 ```
 
 At `--quant q8_0` through `q4_0` the per-stage rel inflates by ~3x
-to ~25x, but the CTC transcript stays bit-equal on clean speech. See
-`PROGRESS.md` §5.12 for the CTC quant sweep, §10.x for TDT, and §11.x
-for Sortformer.
+to ~25x, but the transcript stays bit-equal on clean speech for CTC,
+TDT, and EOU alike. See `PROGRESS.md` §5.12 for the CTC quant sweep,
+§10.x for TDT, §11.x for Sortformer, and §12.x for EOU.
 
 ## Current status
 
-Phases 0 through 11 have shipped (see `PROGRESS.md` for the full
-journal). Outstanding workstreams are Phase 8.5 (true KV cache + conv
-state for ~6x compute reduction on long-form Mode 3 audio) and Phase
-11.11.2 (NeMo-style spkcache + encoder graph split for fully stable
-Sortformer streaming speaker IDs).
+Phases 0 through 12 have shipped (see `PROGRESS.md` for the full
+journal). Phase 12 (EOU FastConformer-RNN-T 120M with native
+`<EOU>` end-of-utterance token) is feature-complete on the offline
++ Mode 2 + Mode 3 streaming axes: bit-equal transcripts to NeMo on
+`jfk.wav` and the 20-second Alice-in-Wonderland clip at both `f16`
+and `q8_0` quant tiers, encoder cosine 0.999997 vs NeMo PyTorch
+reference, `is_eou_boundary` flag firing on the chunk that contains
+the trailing `<EOU>` token in Mode 2. The deferred Phase 12.x
+optimisation -- a true cache-aware streaming encoder graph
+(per-layer `(70, d_model)` K/V cache + `(d_model, kernel-1)`
+depthwise-conv state, sliding forward by `chunk_enc_frames` per
+call) -- will tighten Mode 3's `<EOU>` boundary detection to be
+bit-equal with Mode 2 and is the same internal graph the long-
+outstanding Phase 8.5 KV-cache scope for CTC/TDT will reuse. The
+other outstanding workstream is Phase 11.11.2 (NeMo-style spkcache
++ encoder graph split for fully stable Sortformer streaming
+speaker IDs).
 
 Headline highlights (per phase, one bullet each; PROGRESS.md `§N.x`
 has the full round-by-round journal):
@@ -720,12 +865,32 @@ has the full round-by-round journal):
   §11.11.1 ships `Engine::diarize_start()` ->
   `SortformerStreamSession` for live diarization (sliding-history v1;
   Phase 11.11.2 NeMo-style spkcache streaming pending).
+- **EOU end-of-utterance ASR (Phase 12)**:
+  `nvidia/parakeet_realtime_eou_120m-v1` ported -- a streaming-trained
+  120M FastConformer-RNN-T English ASR with a native `<EOU>`
+  end-of-utterance token that fires at natural turn boundaries
+  (NeMo voice-agent target). The same `parakeet_ctc.cpp` encoder
+  graph is reused with three structural switches gated on GGUF
+  metadata: LayerNorm in the conv module, asymmetric `(L=k-1, R=s-1)`
+  causal padding in the dw_striding subsampler, and a chunked-limited
+  attention mask via `ggml_soft_max_ext`. New `parakeet_eou.{h,cpp}`
+  ports the 1-layer LSTM + joint MLP RNN-T decoder with `<EOU>`
+  reset semantics. `StreamingSegment` gains an `is_eou_boundary`
+  flag + `eot_confidence` slot reserved for Phase 13's cross-engine
+  `OnEndOfTurn` event. Encoder cosine 0.999997 vs NeMo offline at
+  f16 quant floor; transcripts bit-equal to NeMo on `jfk.wav` and
+  `sample-16k.wav` at both `f16` and `q8_0` tiers. Phase 12.x
+  follow-up (deferred): cache-aware streaming encoder graph for
+  byte-equal Mode-3 `<EOU>` boundary detection (also closes the
+  long-outstanding Phase 8.5 KV-cache scope for CTC/TDT Mode 3).
 
-Next: Phase 8.5 (true KV cache + conv state for ~6x compute reduction
-on long-form Mode 3 audio without accuracy change), Accelerate BLAS
-for the TDT decoder's LSTM + joint gemvs and Sortformer's transformer
-attention, `CONV_2D_DW` on Metal (upstream ggml contribution), Metal
-flash-attn, Phase 11.11.2 Sortformer streaming, EOU pipelines.
+Next: Phase 12.x (cache-aware streaming encoder + cross-engine
+VadState / EndOfTurn events landing as Phase 13, plus the same
+graph reused to close Phase 8.5's KV-cache scope on CTC/TDT
+Mode 3), Accelerate BLAS for the TDT/EOU decoder's LSTM + joint
+gemvs and Sortformer's transformer attention, `CONV_2D_DW` on Metal
+(upstream ggml contribution), Metal flash-attn, Phase 11.11.2
+Sortformer streaming.
 
 ## Repository layout
 
@@ -742,40 +907,53 @@ qvac-parakeet.cpp/
     cli_main.cpp                 thin main() -> qvac_parakeet_cli_main shim
     parakeet_ctc.{h,cpp}         GGUF loader + FastConformer encoder ggml graph
                                    + CTC head + greedy decode (shared by all engines;
-                                   model_type field selects the decoder)
+                                   model_type field selects the decoder; LN-in-conv
+                                   + causal subsampler + chunked-limited attention
+                                   mask gated on EOU GGUFs)
     parakeet_tdt.{h,cpp}         TDT decoder: 2-layer LSTM prediction + joint MLP
                                    + transducer greedy decode (CPU)
+    parakeet_eou.{h,cpp}         EOU decoder: 1-layer LSTM prediction + joint MLP
+                                   + transducer greedy decode with `<EOU>` token
+                                   reset semantics (segment flush + h/c zeroing).
+                                   CPU only today.
     parakeet_sortformer.{h,cpp}  Sortformer diarization: encoder_proj + 18-layer
                                    Transformer encoder + ReLU MLP + sigmoid head + segmenter
     parakeet_engine.cpp          Engine + StreamSession + SortformerStreamSession
                                    (transcribe, transcribe_stream, stream_start, diarize,
                                     diarize_start, transcribe_with_speakers)
-    mel_preprocess.{h,cpp}       wav I/O + STFT + mel + CMVN
-    sentencepiece_bpe.{h,cpp}    SentencePiece BPE detokenizer (CTC + TDT)
+    mel_preprocess.{h,cpp}       wav I/O + STFT + mel + optional per-feature CMVN
+                                   (skipped on EOU GGUFs that set normalize=NA)
+    sentencepiece_bpe.{h,cpp}    SentencePiece BPE detokenizer (CTC + TDT + EOU)
     dr_wav.h                     vendored single-header WAV reader
     npy.h                        minimal .npy load / save + compare
     test_*.cpp                   per-stage numerical-parity harnesses (mel, encoder,
                                    ctc, tdt-encoder, sortformer) + streaming
-                                   validation (test-streaming, test-sortformer-streaming)
+                                   validation (test-streaming, test-eou-streaming,
+                                   test-sortformer-streaming)
   include/qvac-parakeet/
     qvac-parakeet.h              CLI entry (qvac_parakeet_cli_main) + library overview
     ctc/engine.h                 persistent multi-engine Engine umbrella + StreamSession +
                                    SortformerStreamSession + transcribe_with_speakers.
                                    The header path "ctc/" is historical -- the API now
-                                   covers CTC, TDT and Sortformer GGUFs.
+                                   covers CTC, TDT, EOU, and Sortformer GGUFs.
+                                   StreamingSegment carries is_eou_boundary +
+                                   eot_confidence (EOU-only fields; reserved for
+                                   Phase 13 cross-engine OnEndOfTurn event).
     ctc/pipeline.h               one-shot wav -> text API (CTC GGUFs only;
-                                   hard-errors on TDT/Sortformer)
+                                   hard-errors on TDT/EOU/Sortformer)
   examples/
-    live-mic.cpp                 live microphone -> transcription (CTC/TDT) or live
+    live-mic.cpp                 live microphone -> transcription (CTC/TDT/EOU) or live
                                    diarization (Sortformer); auto-detects the GGUF.
     live-mic-attributed.cpp      live microphone -> dual-engine ASR + Sortformer
                                    with per-segment speaker attribution.
     miniaudio.h                  vendored single-header audio capture (MIT).
   scripts/
     setup-ggml.sh                pin + clone ggml
-    convert-nemo-to-gguf.py    .nemo -> GGUF (auto-detects CTC / TDT / Sortformer)
+    convert-nemo-to-gguf.py    .nemo -> GGUF (auto-detects CTC / TDT / EOU / Sortformer)
     dump-ctc-reference.py        NeMo PyTorch -> .npy reference tensors (CTC stages)
     dump-tdt-reference.py        NeMo PyTorch -> .npy reference tensors (TDT stages)
+    dump-eou-reference.py        NeMo PyTorch -> .npy reference tensors (EOU stages,
+                                   offline + cache-aware streaming pass)
     dump-sortformer-reference.py NeMo PyTorch -> .npy reference tensors (Sortformer stages)
     dump-block0-substages.py     per-sub-stage timing inputs for --profile
     ref-encoder-from-gguf.py     run the GGUF encoder in PyTorch as a parity oracle
@@ -799,8 +977,11 @@ Released under the [Apache License 2.0](LICENSE).
 **Model licenses**: every NVIDIA Parakeet (CTC, TDT) and Sortformer
 checkpoint listed in the model table at the top of this README ships
 under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) on
-Hugging Face -- check each model card for the canonical attribution.
-This repository only ships the inference code; model weights are
+Hugging Face. The EOU checkpoint (`parakeet_realtime_eou_120m-v1`)
+is distributed under the
+[NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/)
+-- check each model card for the canonical attribution. This
+repository only ships the inference code; model weights are
 downloaded on demand by the converter / `download-all-models.sh`.
 
 The bundled `ggml/` is MIT-licensed (see `ggml/LICENSE`).

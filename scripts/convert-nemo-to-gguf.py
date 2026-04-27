@@ -5,13 +5,24 @@ qvac-parakeet.cpp Engine.
 Auto-detects the model flavour from ``cfg['target']``:
 
   - ``EncDecCTCModelBPE``                -> CTC head      (parakeet-ctc-0.6b, -1.1b)
-  - ``EncDecRNNTBPEModel``               -> TDT (RNN-T + duration head)
+  - ``EncDecRNNTBPEModel`` (with TDT durations)
+                                         -> TDT (RNN-T + duration head)
                                             (parakeet-tdt-0.6b-v3, -1.1b)
+  - ``EncDecRNNTBPEModel`` (no TDT durations, chunked-limited streaming
+                            encoder, conv_norm_type=layer_norm,
+                            ``<EOU>`` token in vocab)
+                                         -> EOU (FastConformer-RNN-T 120M,
+                                            cache-aware streaming, end-of-
+                                            utterance token detection;
+                                            parakeet_realtime_eou_120m-v1)
   - ``EncDecDiarLabelModel``             -> Sortformer    (diar_sortformer_4spk-v1,
                                             diar_streaming_sortformer_4spk-v2)
 
-The FastConformer encoder topology is shared across all three flavours;
-only the decoder / head tensors + metadata differ.
+The FastConformer encoder topology is shared across all four flavours; only
+the decoder / head tensors + metadata differ. EOU additionally swaps the
+conv module's BatchNorm for a LayerNorm and carries cache-aware streaming
+hyperparameters (att_context_size, subsampling-output cache lookback, and the
+chunk size used by the binding's reference EOU pipeline) in metadata.
 
 Footgun: the script's ``--hf-repo`` default is ``nvidia/parakeet-ctc-0.6b``,
 so when ``--ckpt`` points at a non-CTC path that does not exist locally
@@ -24,26 +35,40 @@ src/parakeet_sortformer.h for the consumer structs):
   Metadata:
     general.architecture  = "parakeet-ctc"  (kept for GGUF compat)
     general.name          = "<derived from cfg>"
-    parakeet.model.type   = "ctc", "tdt", or "sortformer"
-    parakeet.encoder.*    (hyperparameters, incl. use_bias, xscaling)
+    parakeet.model.type   = "ctc", "tdt", "eou", or "sortformer"
+    parakeet.encoder.*    (hyperparameters, incl. use_bias, xscaling,
+                           conv_norm_type, att_context_size,
+                           causal_downsampling, conv_context_size)
     parakeet.preproc.*    (mel/stft hyperparameters)
     parakeet.ctc.*        (vocab_size, blank_id)                    [CTC only]
     parakeet.tdt.*        (predictor + joint hyperparameters
                            + durations)                              [TDT only]
+    parakeet.eou.*        (vocab_size, blank_id, eou_id, eob_id,
+                           pred_hidden, pred_rnn_layers, joint_hidden,
+                           encoder_chunk_mel_frames,
+                           cache_lookback_frames, cache_time_steps,
+                           max_symbols_per_step)                     [EOU only]
     parakeet.sortformer.* (num_spks, fc/tf dims, tf layer count, ...)[Sortformer only]
-    tokenizer.ggml.model  = "sentencepiece"                          [CTC, TDT]
-    tokenizer.ggml.sentencepiece_model = <raw tokenizer.model bytes> [CTC, TDT]
+    tokenizer.ggml.model  = "sentencepiece"                          [CTC, TDT, EOU]
+    tokenizer.ggml.sentencepiece_model = <raw tokenizer.model bytes> [CTC, TDT, EOU]
 
   Tensors:
     preproc.mel_filterbank            (n_mels, 257)   f32
     preproc.window                    (400,)          f32
     encoder.subsampling.{conv0,conv{1,2}_{dw,pw},out}.{weight,bias?}
-    encoder.blk.{i}.* (17-42 blocks; biases omitted when use_bias=False)
+    encoder.blk.{i}.* (17-42 blocks; biases omitted when use_bias=False;
+                       conv module emits {bn.scale,bn.shift} for BatchNorm
+                       checkpoints OR {norm.weight,norm.bias} for LayerNorm
+                       checkpoints, gated by parakeet.encoder.conv_norm_type)
     ctc.decoder.{weight,bias}                                       [CTC only]
     tdt.predict.embed.weight                                         [TDT only]
     tdt.predict.lstm.{l}.{w_ih,w_hh,b_ih,b_hh}                       [TDT only]
     tdt.joint.{enc,pred}.{weight,bias}                               [TDT only]
     tdt.joint.out.{weight,bias}                                      [TDT only]
+    eou.predict.embed.weight                                         [EOU only]
+    eou.predict.lstm.0.{w_ih,w_hh,b_ih,b_hh}                         [EOU only]
+    eou.joint.{enc,pred}.{weight,bias}                               [EOU only]
+    eou.joint.out.{weight,bias}                                      [EOU only]
     sortformer.encoder_proj.{weight,bias}                            [Sortformer only]
     sortformer.transformer.blk.{i}.* (18 blocks)                     [Sortformer only]
     sortformer.head.{weight,bias}                                    [Sortformer only]
@@ -146,7 +171,16 @@ def detect_model_type(cfg: dict) -> str:
     target = cfg.get("target", "")
     if "Sortformer" in target or "sortformer_modules" in cfg:
         return "sortformer"
-    if "RNNT" in target or "tdt" in cfg.get("loss", {}).get("loss_name", "").lower():
+    is_rnnt = "RNNT" in target or \
+              "tdt" in cfg.get("loss", {}).get("loss_name", "").lower()
+    if is_rnnt:
+        durations = cfg.get("model_defaults", {}).get("tdt_durations")
+        if durations:
+            return "tdt"
+        labels = cfg.get("labels") or cfg.get("decoder", {}).get("vocabulary") or []
+        has_eou = any(str(lbl) == "<EOU>" for lbl in labels)
+        if has_eou:
+            return "eou"
         return "tdt"
     return "ctc"
 
@@ -200,6 +234,7 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     model_name = {
         "ctc":         f"parakeet-ctc-{d_model}-{n_layers}l",
         "tdt":         f"parakeet-tdt-{d_model}-{n_layers}l",
+        "eou":         f"parakeet-eou-{d_model}-{n_layers}l",
         "sortformer":  f"sortformer-{d_model}-{n_layers}l",
     }[model_type]
     writer.add_name(model_name)
@@ -207,6 +242,16 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     writer.add_file_type(FILE_TYPE_MAP[quant])
 
     writer.add_string("parakeet.model.type", model_type)
+
+    conv_norm_type   = str(enc.get("conv_norm_type", "batch_norm"))
+    conv_context_str = str(enc.get("conv_context_size", "default"))
+    causal_downsample = bool(enc.get("causal_downsampling", False))
+    att_style        = str(enc.get("att_context_style", "regular"))
+    att_ctx_raw      = enc.get("att_context_size", [-1, -1])
+    if isinstance(att_ctx_raw, (list, tuple)) and len(att_ctx_raw) >= 2:
+        att_ctx_left, att_ctx_right = int(att_ctx_raw[0]), int(att_ctx_raw[1])
+    else:
+        att_ctx_left, att_ctx_right = -1, -1
 
     writer.add_uint32("parakeet.encoder.d_model",                     d_model)
     writer.add_uint32("parakeet.encoder.n_layers",                    n_layers)
@@ -221,6 +266,14 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     writer.add_bool  ("parakeet.encoder.untie_biases",                untie_biases)
     writer.add_bool  ("parakeet.encoder.use_bias",                    use_bias)
     writer.add_uint32("parakeet.encoder.pos_emb_max_len",             pos_max_len)
+    writer.add_string("parakeet.encoder.conv_norm_type",              conv_norm_type)
+    writer.add_string("parakeet.encoder.conv_context_size",           conv_context_str)
+    writer.add_bool  ("parakeet.encoder.causal_downsampling",         causal_downsample)
+    writer.add_string("parakeet.encoder.att_context_style",           att_style)
+    writer.add_int32 ("parakeet.encoder.att_context_size_left",       att_ctx_left)
+    writer.add_int32 ("parakeet.encoder.att_context_size_right",      att_ctx_right)
+
+    normalize_str = str(pre.get("normalize", "per_feature"))
 
     writer.add_uint32 ("parakeet.preproc.sample_rate",               sample_rate)
     writer.add_uint32 ("parakeet.preproc.n_fft",                     n_fft)
@@ -229,12 +282,43 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
     writer.add_uint32 ("parakeet.preproc.n_mels",                    n_mels)
     writer.add_float32("parakeet.preproc.preemph",                   0.97)
     writer.add_float32("parakeet.preproc.log_zero_guard_value",      float(2 ** -24))
+    writer.add_string ("parakeet.preproc.normalize",                 normalize_str)
 
     if model_type == "ctc":
         vocab_size = int(dec["num_classes"]) + 1
         blank_id   = vocab_size - 1
         writer.add_uint32("parakeet.ctc.vocab_size", vocab_size)
         writer.add_uint32("parakeet.ctc.blank_id",   blank_id)
+    elif model_type == "eou":
+        pred_hidden       = int(dec["prednet"]["pred_hidden"])
+        pred_rnn_layers   = int(dec["prednet"]["pred_rnn_layers"])
+        joint_hidden      = int(cfg["joint"]["jointnet"]["joint_hidden"])
+        pred_vocab_size   = int(dec["vocab_size"])
+        joint_num_classes = int(cfg["joint"]["num_classes"])
+        blank_id          = joint_num_classes
+        labels = cfg.get("labels") or cfg.get("decoder", {}).get("vocabulary") or []
+        eou_id = next((i for i, lbl in enumerate(labels) if str(lbl) == "<EOU>"), -1)
+        eob_id = next((i for i, lbl in enumerate(labels) if str(lbl) == "<EOB>"), -1)
+        if eou_id < 0:
+            print(f"[convert] warn: <EOU> not found in vocabulary; consumer will fall back to id 1024",
+                  file=sys.stderr)
+
+        encoder_chunk_mel_frames = 25
+        cache_lookback_frames    = att_ctx_left if att_ctx_left > 0 else 70
+        cache_time_steps         = max(0, conv_kernel - 1)
+        max_symbols_per_step     = 5
+
+        writer.add_uint32("parakeet.eou.vocab_size",                pred_vocab_size)
+        writer.add_uint32("parakeet.eou.blank_id",                  blank_id)
+        writer.add_int32 ("parakeet.eou.eou_id",                    eou_id)
+        writer.add_int32 ("parakeet.eou.eob_id",                    eob_id)
+        writer.add_uint32("parakeet.eou.pred_hidden",               pred_hidden)
+        writer.add_uint32("parakeet.eou.pred_rnn_layers",           pred_rnn_layers)
+        writer.add_uint32("parakeet.eou.joint_hidden",              joint_hidden)
+        writer.add_uint32("parakeet.eou.encoder_chunk_mel_frames",  encoder_chunk_mel_frames)
+        writer.add_uint32("parakeet.eou.cache_lookback_frames",     cache_lookback_frames)
+        writer.add_uint32("parakeet.eou.cache_time_steps",          cache_time_steps)
+        writer.add_uint32("parakeet.eou.max_symbols_per_step",      max_symbols_per_step)
     elif model_type == "sortformer":
         sf  = cfg["sortformer_modules"]
         tfe = cfg["transformer_encoder"]
@@ -386,13 +470,19 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         add_2d (f"{p}.conv.dw.weight",    sd[f"{k}.conv.depthwise_conv.weight"])
         try_bias(f"{p}.conv.dw.bias",     f"{k}.conv.depthwise_conv.bias")
 
-        bn_w    = as_np(sd[f"{k}.conv.batch_norm.weight"],        np.float32)
-        bn_b    = as_np(sd[f"{k}.conv.batch_norm.bias"],          np.float32)
-        bn_mean = as_np(sd[f"{k}.conv.batch_norm.running_mean"],  np.float32)
-        bn_var  = as_np(sd[f"{k}.conv.batch_norm.running_var"],   np.float32)
-        bn_scale, bn_shift = fuse_bn(bn_w, bn_b, bn_mean, bn_var, eps=1e-5)
-        writer.add_tensor(f"{p}.conv.bn.scale", bn_scale)
-        writer.add_tensor(f"{p}.conv.bn.shift", bn_shift)
+        if conv_norm_type == "layer_norm":
+            ln_w = as_np(sd[f"{k}.conv.batch_norm.weight"], np.float32)
+            ln_b = as_np(sd[f"{k}.conv.batch_norm.bias"],   np.float32)
+            writer.add_tensor(f"{p}.conv.norm.weight", ln_w)
+            writer.add_tensor(f"{p}.conv.norm.bias",   ln_b)
+        else:
+            bn_w    = as_np(sd[f"{k}.conv.batch_norm.weight"],        np.float32)
+            bn_b    = as_np(sd[f"{k}.conv.batch_norm.bias"],          np.float32)
+            bn_mean = as_np(sd[f"{k}.conv.batch_norm.running_mean"],  np.float32)
+            bn_var  = as_np(sd[f"{k}.conv.batch_norm.running_var"],   np.float32)
+            bn_scale, bn_shift = fuse_bn(bn_w, bn_b, bn_mean, bn_var, eps=1e-5)
+            writer.add_tensor(f"{p}.conv.bn.scale", bn_scale)
+            writer.add_tensor(f"{p}.conv.bn.shift", bn_shift)
 
         add_2d (f"{p}.conv.pw2.weight",   sd[f"{k}.conv.pointwise_conv2.weight"])
         try_bias(f"{p}.conv.pw2.bias",    f"{k}.conv.pointwise_conv2.bias")
@@ -412,6 +502,26 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         dec_b = sd["decoder.decoder_layers.0.bias"]
         add_2d ("ctc.decoder.weight", dec_w)
         add_f32("ctc.decoder.bias",   dec_b)
+    elif model_type == "eou":
+        add_2d ("eou.predict.embed.weight", sd["decoder.prediction.embed.weight"])
+
+        eou_pred_layers = int(cfg["decoder"]["prednet"]["pred_rnn_layers"])
+        for l in range(eou_pred_layers):
+            add_2d (f"eou.predict.lstm.{l}.w_ih",
+                    sd[f"decoder.prediction.dec_rnn.lstm.weight_ih_l{l}"])
+            add_2d (f"eou.predict.lstm.{l}.w_hh",
+                    sd[f"decoder.prediction.dec_rnn.lstm.weight_hh_l{l}"])
+            add_f32(f"eou.predict.lstm.{l}.b_ih",
+                    sd[f"decoder.prediction.dec_rnn.lstm.bias_ih_l{l}"])
+            add_f32(f"eou.predict.lstm.{l}.b_hh",
+                    sd[f"decoder.prediction.dec_rnn.lstm.bias_hh_l{l}"])
+
+        add_2d ("eou.joint.enc.weight",  sd["joint.enc.weight"])
+        add_f32("eou.joint.enc.bias",    sd["joint.enc.bias"])
+        add_2d ("eou.joint.pred.weight", sd["joint.pred.weight"])
+        add_f32("eou.joint.pred.bias",   sd["joint.pred.bias"])
+        add_2d ("eou.joint.out.weight",  sd["joint.joint_net.2.weight"])
+        add_f32("eou.joint.out.bias",    sd["joint.joint_net.2.bias"])
     elif model_type == "sortformer":
         add_2d ("sortformer.encoder_proj.weight", sd["sortformer_modules.encoder_proj.weight"])
         add_f32("sortformer.encoder_proj.bias",   sd["sortformer_modules.encoder_proj.bias"])
@@ -482,6 +592,13 @@ def write_gguf(out: Path, cfg: dict, sd: dict, tok_bytes: bytes, quant: str):
         vocab_note = (f"num_spks={cfg['sortformer_modules']['num_spks']} "
                       f"tf_layers={cfg['transformer_encoder']['num_layers']} "
                       f"tf_d_model={cfg['transformer_encoder']['hidden_size']}")
+    elif model_type == "eou":
+        labels = cfg.get("labels") or cfg.get("decoder", {}).get("vocabulary") or []
+        eou_pos = next((i for i, lbl in enumerate(labels) if str(lbl) == "<EOU>"), -1)
+        vocab_note = (f"eou_vocab={int(cfg['decoder']['vocab_size'])} "
+                      f"blank_id={int(cfg['joint']['num_classes'])} eou_id={eou_pos} "
+                      f"att_ctx=[{att_ctx_left},{att_ctx_right}] "
+                      f"conv_norm={conv_norm_type}")
     else:
         vocab_note = f"tdt_vocab={int(cfg['decoder']['vocab_size'])} durations={cfg['model_defaults']['tdt_durations']}"
     print(f"[convert] wrote {out} ({size_mb:.1f} MiB, type={model_type}, quant={quant}, {vocab_note}, layers={n_layers}, use_bias={use_bias})", file=sys.stderr)

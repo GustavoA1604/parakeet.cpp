@@ -2,6 +2,7 @@
 
 #include "parakeet_ctc.h"
 #include "parakeet_tdt.h"
+#include "parakeet_eou.h"
 #include "parakeet_sortformer.h"
 #include "mel_preprocess.h"
 #include "sentencepiece_bpe.h"
@@ -48,6 +49,9 @@ struct Engine::Impl {
     TdtRuntimeWeights   tdt_rt;
     bool                tdt_ready = false;
 
+    EouRuntimeWeights   eou_rt;
+    bool                eou_ready = false;
+
     SortformerRuntimeWeights sortformer_rt;
     bool                     sortformer_ready = false;
 
@@ -74,6 +78,12 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
         }
         pimpl_->tdt_ready = true;
     }
+    if (pimpl_->model.model_type == ParakeetModelType::EOU) {
+        if (eou_prepare_runtime(pimpl_->model, pimpl_->eou_rt) != 0) {
+            throw std::runtime_error("Engine: eou_prepare_runtime failed");
+        }
+        pimpl_->eou_ready = true;
+    }
     if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
         if (sortformer_prepare_runtime(pimpl_->model, pimpl_->sortformer_rt) != 0) {
             throw std::runtime_error("Engine: sortformer_prepare_runtime failed");
@@ -94,6 +104,7 @@ const EngineOptions & Engine::options() const {
 std::string Engine::model_type() const {
     switch (pimpl_->model.model_type) {
         case ParakeetModelType::TDT:        return "tdt";
+        case ParakeetModelType::EOU:        return "eou";
         case ParakeetModelType::SORTFORMER: return "sortformer";
         case ParakeetModelType::CTC:
         default:                            return "ctc";
@@ -106,7 +117,8 @@ bool Engine::is_diarization_model() const {
 
 bool Engine::is_transcription_model() const {
     return pimpl_->model.model_type == ParakeetModelType::CTC ||
-           pimpl_->model.model_type == ParakeetModelType::TDT;
+           pimpl_->model.model_type == ParakeetModelType::TDT  ||
+           pimpl_->model.model_type == ParakeetModelType::EOU;
 }
 
 void Engine::cancel() {
@@ -174,6 +186,19 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
                                        enc_out.n_enc_frames, enc_out.d_model,
                                        dopts, dres); rc != 0) {
             throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: tdt_greedy_decode failed (rc=" +
+                                     std::to_string(rc) + ")");
+        }
+        ids  = std::move(dres.token_ids);
+        text = std::move(dres.text);
+    } else if (pimpl_->model.model_type == ParakeetModelType::EOU) {
+        EouDecodeOptions dopts;
+        dopts.max_symbols_per_step = pimpl_->model.encoder_cfg.eou_max_symbols_per_step;
+        EouDecodeResult dres;
+        if (int rc = eou_greedy_decode(pimpl_->model, pimpl_->eou_rt,
+                                       enc_out.encoder_out.data(),
+                                       enc_out.n_enc_frames, enc_out.d_model,
+                                       dopts, dres); rc != 0) {
+            throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: eou_greedy_decode failed (rc=" +
                                      std::to_string(rc) + ")");
         }
         ids  = std::move(dres.token_ids);
@@ -282,10 +307,13 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     const auto t_dec = clock::now();
 
     const bool is_tdt = (pimpl_->model.model_type == ParakeetModelType::TDT);
+    const bool is_eou = (pimpl_->model.model_type == ParakeetModelType::EOU);
 
     int32_t prev_token = -1;
     TdtDecodeState tdt_state;
+    EouDecodeState eou_state;
     if (is_tdt) tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, tdt_state);
+    if (is_eou) eou_init_state(pimpl_->eou_rt, eou_state);
 
     int chunk_index = 0;
     bool first_segment = true;
@@ -299,6 +327,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
         const auto t_win = clock::now();
 
         std::vector<int32_t> win_tokens;
+        int eou_boundaries_in_chunk = 0;
         if (is_tdt) {
             TdtDecodeOptions dopts;
             int steps = 0;
@@ -311,6 +340,22 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
                 throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
                                          "tdt_decode_window failed (rc=" + std::to_string(rc) + ")");
             }
+        } else if (is_eou) {
+            EouDecodeOptions dopts;
+            dopts.max_symbols_per_step = pimpl_->model.encoder_cfg.eou_max_symbols_per_step;
+            std::vector<EouSegmentBoundary> win_segments;
+            int steps = 0;
+            const float * win_enc = enc_out.encoder_out.data()
+                                  + static_cast<size_t>(start) * enc_out.d_model;
+            if (int rc = eou_decode_window(pimpl_->model, pimpl_->eou_rt,
+                                           win_enc, end - start, enc_out.d_model,
+                                           dopts, eou_state,
+                                           win_tokens, win_segments, steps);
+                rc != 0) {
+                throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
+                                         "eou_decode_window failed (rc=" + std::to_string(rc) + ")");
+            }
+            eou_boundaries_in_chunk = static_cast<int>(win_segments.size());
         } else {
             ctc_greedy_decode_window(enc_out.logits.data(),
                                      start, end, vocab, blank,
@@ -333,6 +378,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
             seg.end_s       = static_cast<double>(end)   * frame_stride_ms / 1000.0;
             seg.chunk_index = chunk_index;
             seg.is_final    = true;
+            seg.is_eou_boundary = eou_boundaries_in_chunk > 0;
             seg.encoder_ms  = first_segment ? encoder_ms : 0.0;
             seg.decode_ms   = win_decode_ms;
             on_segment(seg);
@@ -562,6 +608,7 @@ struct StreamSession::Impl {
     int64_t emitted_samples = 0;
     int32_t prev_token     = -1;
     TdtDecodeState tdt_state;
+    EouDecodeState eou_state;
 
     std::string             cumulative_text;
     std::vector<int32_t>    cumulative_token_ids;
@@ -629,6 +676,7 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
 
     const auto t_dec = clock::now();
     std::vector<int32_t> win_tokens;
+    int  eou_boundaries_in_chunk = 0;
     if (engine_impl->model.model_type == ParakeetModelType::TDT) {
         TdtDecodeOptions dopts;
         int steps = 0;
@@ -642,6 +690,24 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
             throw std::runtime_error("StreamSession: tdt_decode_window failed (rc=" +
                                      std::to_string(rc) + ")");
         }
+    } else if (engine_impl->model.model_type == ParakeetModelType::EOU) {
+        EouDecodeOptions dopts;
+        dopts.max_symbols_per_step =
+            engine_impl->model.encoder_cfg.eou_max_symbols_per_step;
+        std::vector<EouSegmentBoundary> win_segments;
+        int steps = 0;
+        const int n_frames = std::max(0, center_end_frame - left_drop_frames);
+        const float * win_enc = enc_out.encoder_out.data()
+                              + static_cast<size_t>(left_drop_frames) * enc_out.d_model;
+        if (int rc = eou_decode_window(engine_impl->model, engine_impl->eou_rt,
+                                       win_enc, n_frames, enc_out.d_model,
+                                       dopts, eou_state,
+                                       win_tokens, win_segments, steps);
+            rc != 0) {
+            throw std::runtime_error("StreamSession: eou_decode_window failed (rc=" +
+                                     std::to_string(rc) + ")");
+        }
+        eou_boundaries_in_chunk = static_cast<int>(win_segments.size());
     } else {
         ctc_greedy_decode_window(enc_out.logits.data(),
                                  left_drop_frames, center_end_frame,
@@ -667,6 +733,7 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
                                               (center_end_sample - center_start_sample)) / sr;
         seg.chunk_index = chunk_index;
         seg.is_final    = true;
+        seg.is_eou_boundary = eou_boundaries_in_chunk > 0;
         seg.encoder_ms  = encoder_ms;
         seg.decode_ms   = decode_ms;
         on_segment(seg);
@@ -811,6 +878,9 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
 
     if (pimpl_->model.model_type == ParakeetModelType::TDT) {
         tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, impl->tdt_state);
+    }
+    if (pimpl_->model.model_type == ParakeetModelType::EOU) {
+        eou_init_state(pimpl_->eou_rt, impl->eou_state);
     }
 
     return std::make_unique<StreamSession>(std::move(impl));

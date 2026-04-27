@@ -37,6 +37,7 @@ set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
     src/parakeet_engine.cpp
     src/parakeet_tdt.cpp
+    src/parakeet_eou.cpp
     src/parakeet_sortformer.cpp
     src/mel_preprocess.cpp
     src/sentencepiece_bpe.cpp
@@ -127,6 +128,10 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     target_link_libraries(test-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-streaming PRIVATE include src ggml/include)
 
+    add_executable(test-eou-streaming src/test_eou_streaming.cpp)
+    target_link_libraries(test-eou-streaming PRIVATE qvac-parakeet)
+    target_include_directories(test-eou-streaming PRIVATE include src ggml/include)
+
     add_executable(test-sortformer-streaming src/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
@@ -136,6 +141,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
         src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
@@ -147,6 +153,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
         src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)

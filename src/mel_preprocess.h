@@ -22,6 +22,16 @@ namespace qvac_parakeet {
 // this constant from any code path that needs the same fallback.
 inline constexpr float kDefaultLogZeroGuard = 5.960464477539063e-08f;
 
+// Mirrors NeMo's AudioToMelSpectrogramPreprocessor.normalize:
+//   PerFeature -> apply per-bin CMVN over the valid frames (CTC, TDT,
+//                  Sortformer in this repo). Default in NeMo.
+//   None       -> skip CMVN entirely; emit raw log-mel. EOU
+//                  (`nvidia/parakeet_realtime_eou_120m-v1`) uses this.
+enum class MelNormalize {
+    PerFeature,
+    None,
+};
+
 struct MelConfig {
     int sample_rate = 16000;
     int n_fft       = 512;
@@ -31,6 +41,7 @@ struct MelConfig {
 
     float preemph              = 0.97f;
     float log_zero_guard_value = kDefaultLogZeroGuard;
+    MelNormalize normalize     = MelNormalize::PerFeature;
 
     std::vector<float> filterbank;
     std::vector<float> window;
