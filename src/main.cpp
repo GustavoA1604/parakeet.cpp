@@ -974,7 +974,18 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         std::fprintf(fp, "{\n");
         std::fprintf(fp, "  \"model\": \"%s\",\n",  opts.model_gguf_path.c_str());
         std::fprintf(fp, "  \"wav\": \"%s\",\n",    opts.wav_path.c_str());
-        std::fprintf(fp, "  \"backend\": \"ggml-cpu\",\n");
+        const char * backend_label =
+#if defined(GGML_USE_METAL)
+            (opts.n_gpu_layers > 0 ? "ggml-metal" : "ggml-cpu");
+#elif defined(GGML_USE_CUDA)
+            (opts.n_gpu_layers > 0 ? "ggml-cuda" : "ggml-cpu");
+#elif defined(GGML_USE_VULKAN)
+            (opts.n_gpu_layers > 0 ? "ggml-vulkan" : "ggml-cpu");
+#else
+            "ggml-cpu";
+#endif
+        std::fprintf(fp, "  \"backend\": \"%s\",\n", backend_label);
+        std::fprintf(fp, "  \"n_gpu_layers\": %d,\n", opts.n_gpu_layers);
         std::fprintf(fp, "  \"threads\": %d,\n",    opts.n_threads);
         std::fprintf(fp, "  \"warmup_runs\": %d,\n", extra.bench_warmup);
         std::fprintf(fp, "  \"timed_runs\":  %d,\n", extra.bench_runs);
