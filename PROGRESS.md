@@ -1183,7 +1183,10 @@ strategy in Python on top of the NeMo offline model: each chunk feeds
 `[left_context + chunk + right_lookahead]` into the offline encoder,
 slices out the center frames, runs CTC greedy with a stateful
 `prev_token` carried across chunks. This mirrors what the eventual C++
-streaming path does (modulo the future Phase 8.5 KV-cache optimisation).
+streaming path does (modulo the indefinitely-deferred Phase 8.5
+KV-cache-on-offline-weights optimisation; see §8.5 for why this is
+distinct from chunked-limited streaming inference and why the latter
+is rejected).
 
 Sweep results on `test/samples/jfk.wav` (11 s clean speech) and
 `LastQuestion_long_EN.raw` (5.5 min sci-fi narration with proper nouns,
@@ -1319,25 +1322,111 @@ Metal Q8_0), default config `chunk_ms=2000, left=10000, right=2000`:
 - First-segment latency: `chunk_ms + right_lookahead_ms` ≈ 4 s wall
   (matches Python reference).
 
-### Phase 8.5 — KV cache / conv state (pending)
+### Phase 8.5 — KV cache / conv state (deferred indefinitely; not the same as chunked-limited streaming inference)
 
-Same `StreamSession` public API, swap the internal loop: keep
-per-layer `K`, `V`, and depthwise-conv left-state tensors around as
-backend buffers, slid forward each chunk. Each encoder call then only
-computes over new-chunk + right-lookahead frames instead of the full
-`(left + chunk + right)` window. Projected wins:
+> **Important distinction — read this before touching streaming
+> internals.** Two superficially-similar designs have been proposed
+> (and one of them has been attempted twice) on this project, and
+> they have very different quality implications. Conflating them is
+> what makes this corner trip-hazardous.
+
+#### (A) Chunked-limited streaming inference on a chunked-limited-trained checkpoint
+
+What NeMo's `cache_aware_stream_step` actually does. Each query
+attends only to a fixed lookback window; per-chunk encoder cost
+drops to `O(chunk)`; per-layer `(lookback, d_model)` K/V cache plus
+`(d_model, kernel-1)` depthwise-conv state slide forward each call.
+Looks like an attractive perf win on paper.
+
+**This shape has been evaluated twice on this project and rejected
+both times on quality grounds.**
+
+- **Round 1 — Phase 8.0** evaluated
+  `stt_en_fastconformer_hybrid_large_streaming_multi`, the only
+  NeMo cache-aware streaming Conformer family available at the time
+  and the same family that powers `qvac-lib-infer-parakeet`'s
+  legacy `'eou'` modelType. Real-world quality landed at ~2× WER
+  vs `parakeet-ctc-0.6b` offline (the user's own production
+  confirmed this). Phase 8 therefore chose the rolling-encoder
+  Mode 3 design instead.
+- **Round 2 — Phase 12.x exploration** ported
+  `nvidia/parakeet_realtime_eou_120m-v1` (same model family, newer
+  120 M variant) as the EOU engine in Phase 12.5 on the rolling-
+  encoder Mode 3, and scoped a true cache-aware fast path as the
+  follow-up. A bit-equal C++ port of NeMo's
+  `cache_aware_stream_step` was prototyped on a working branch:
+  per-layer K/V cache, depthwise-conv state, chunked-limited
+  streaming attention mask, generalised Transformer-XL `rel_shift`
+  for `T_q != T_kv`. Numerical parity vs NeMo was clean — worst rel
+  `1.85e-3` over 44 chunks of `jfk.wav` — but decoded end-to-end
+  through `eou_decode_window`, the result reproduced exactly NeMo's
+  streaming transcript, which is **not** the offline transcript:
+
+  ```
+  Mode 2 / offline:   "and so my fellow americans ask not what your
+                       country can do for you ask what you can do
+                       for your country<EOU>"
+  cache-aware
+    (NeMo + ours):    "that's all i've held america ask not what
+                       your country can do for you ask what you can
+                       do for your country"
+  ```
+
+  Same quality cliff Phase 8.0 had already documented two years
+  earlier on the same model family. NeMo's own cache-aware
+  streaming RNN-T over the same 88 encoder frames also fails to
+  emit any `<EOU>` token on `jfk.wav`, so the cache-aware path
+  doesn't even win on `<EOU>` boundary detection vs the rolling
+  encoder. **The branch was reverted** before any of it landed on
+  `main`; this section exists so a third iteration of the project
+  doesn't redo the same loop.
+
+**Bottom line for (A): cache-aware streaming inference on a
+chunked-limited-trained ASR checkpoint is a quality regression in
+this project's context (clean speech, offline-quality transcripts
+as the bar). It will not be implemented. If a future requirement
+explicitly trades early-utterance accuracy for bounded compute
+(low-power voice agent, very long-form streaming), revisit this
+decision with that requirement on the table — but assume by default
+that re-running this exploration will produce the same numbers.**
+
+#### (B) KV cache / depthwise-conv state on the offline-trained CTC / TDT weights
+
+The original scope of "Phase 8.5", and a *different* design from
+(A) despite the surface-level similarity. Same offline-trained
+weights, same full attention pattern as training, just amortised
+across chunks: keep per-layer `K`, `V`, and depthwise-conv
+left-state tensors as backend buffers, slid forward each chunk;
+each encoder call computes only over new-chunk + right-lookahead
+frames instead of the full `(left + chunk + right)` window. Pure
+compute-layout refactor — **accuracy unchanged**. Projected wins
+on the original §8.1 Python reference:
 
 - Per-chunk compute: down from `O(left + chunk + right)` to
   `O(chunk + right)`, i.e. ~5× on the default config
   (2 + 2 vs 10 + 2 + 2).
-- Total wall on the 5.5 min clip: down from 35 s to ~10-15 s (ballpark
-  close to the offline 15 s baseline).
-- Accuracy unchanged — this is a pure compute-layout refactor.
+- Total wall on the 5.5 min clip: down from 35 s to ~10-15 s
+  (close to the offline 15 s baseline).
+- Accuracy unchanged.
 
-Requires graph changes (persistent cache tensors for attention + conv
-module, streaming attention mask with `att_context_size` plumbing
-already used by NeMo's own cache-aware export path), plus a per-stage
-parity harness vs the §8.1 Python reference. Out of scope for this PR.
+Crucially, the streaming graph for (B) is **not** the same shape
+as the chunked-limited graph from (A). Different attention mask
+(no chunked-limit), different cache-size policy (sliding window
+without a quality-coupled lookback), different validation fixtures
+(parity vs offline forward, not vs `cache_aware_stream_step`). Any
+future attempt at (B) should treat it as a fresh design exercise,
+not as a retrofit of any (A) prototype recovered from git history.
+
+Requires graph changes (persistent cache tensors for attention +
+conv module), per-stage parity harness vs the §8.1 Python reference,
+and a sliding-window cache-eviction policy.
+
+**Status: deferred indefinitely.** No current owner. Not on the
+critical path of any shipping feature. Pick up only when a concrete
+consumer needs the per-chunk compute reduction and is willing to
+pay the engineering cost. The §8.1 Python reference and the rolling-
+encoder Mode 3 implementation in §8.4-8.7 remain the source of truth
+for streaming-quality expectations on CTC / TDT.
 
 ## Phase 9 — multi-model support _(done; ships parakeet-ctc-1.1b alongside 0.6B)_
 
@@ -2131,11 +2220,19 @@ NeMo PyTorch as the parity oracle (no onnxruntime in the dev loop).
 | Joint | RNNT-Joint, encoder_hidden=512 -> 640, pred_hidden=640 -> 640, ReLU, output dim **1027** = 1024 BPE + `<EOU>` (id 1024) + `<EOB>` (id 1025) + blank (id 1026) |
 | Latency | NVIDIA card cites 80 ms (p50) / 280 ms (p90) / 320 ms (p95) end-of-turn detection on TTS-augmented DialogStudio |
 
-So EOU is **TDT minus durations + streaming knobs + LayerNorm in the
-conv module**; encoder graph is ~95 % shared with the existing CTC/TDT
-encoder, with three deltas (LN-vs-fused-BN in conv module, chunked-
-limited attention masking + per-chunk KV cache state, depthwise-conv
-left state). The decoder + joint mirror TDT minus the duration head.
+So EOU is **TDT minus durations + LayerNorm in the conv module +
+two attention/conv shape switches**; encoder graph is ~95 % shared
+with the existing CTC/TDT encoder, with three shipping deltas
+(LN-vs-fused-BN in conv module, chunked-limited attention mask
+applied as a static offline mask via `ggml_soft_max_ext`, asymmetric
+`(L=k-1, R=s-1)` causal padding in the dw_striding subsampler).
+NeMo's own streaming forward additionally maintains per-chunk KV
+cache state and depthwise-conv left state for `cache_aware_stream_step`;
+this project deliberately does **not** ship that path -- see §8.5
+case (A) for why driving streaming-trained Parakeet checkpoints
+through chunked-limited streaming inference is a quality regression
+on the targets this repo cares about. The decoder + joint mirror
+TDT minus the duration head.
 
 **API target.** The binding's JS surface for EOU today (`index.d.ts`)
 is intentionally minimal: just the same generic transcription pipeline
@@ -2447,7 +2544,7 @@ boundaries `eou_decode_window` recorded, joins with `\n`, returns
 the result as `EouDecodeResult.text`. `eou_count` is exposed for
 later wiring into the planned cross-engine `OnEndOfTurn` event.
 
-### Phase 12.5 — streaming push API (Modes 2 + 3)  _(done; cache-aware fast path deferred to Phase 12.x)_
+### Phase 12.5 — streaming push API (Modes 2 + 3)  _(done; rolling-encoder Mode 3 is the chosen design -- chunked-limited streaming inference rejected, see §8.5)_
 
 Public API additions in `include/qvac-parakeet/ctc/engine.h`:
 
@@ -2495,15 +2592,17 @@ new auto-detection logic was required.
 - Mode 2 `is_eou_boundary` fires on at least one segment (the
   trailing `<EOU>` on `jfk.wav`);
 - Mode 3 transcript size matches the reference within a 20 % tail
-  jitter band (the cache-aware fast path will tighten this to
-  byte-equal in the deferred slice).
+  jitter band. Chasing byte-equality on Mode 3 via cache-aware
+  streaming inference was explored and rejected -- see §8.5 case (A)
+  for the full rationale -- so the rolling-encoder tail-jitter band
+  is the assertion the test will keep.
 
 Passes on both `parakeet-eou-120m-v1.gguf` (f16) and
 `parakeet-eou-120m-v1.q8_0.gguf`. Existing `test-streaming` (CTC /
 TDT byte-equality + WER tolerance) and `test-sortformer-streaming`
 both still pass after the `StreamSession::Impl` plumbing changes.
 
-#### Mode 3 caveat + Phase 12.x optimisation runway
+#### Mode 3 caveat — chosen design, not a workaround
 
 Mode 3 today re-runs the **offline** encoder per chunk over a
 sliding `[left + chunk + right_lookahead]` window without persistent
@@ -2511,16 +2610,22 @@ KV / conv-state cache across chunks. The transcript matches Mode 2
 byte-equally on `jfk.wav`, but `<EOU>` boundary detection is
 approximate: the trailing chunk doesn't carry the long-context
 encoder state the EOU head needs to confidently fire `<EOU>` on
-end-of-utterance. This is exactly the trade-off documented when the
-slice was scoped: the public API is shaped to absorb a true
-cache-aware encoder graph (per-layer `(70, d_model)` K/V cache +
-`(d_model, kernel-1)` depthwise-conv state, sliding forward by
-`chunk_enc_frames` per call) without changing the public surface,
-and the Phase 8.5 KV-cache groundwork that was scoped for CTC / TDT
-will land here first. Tracked as the deferred Phase 12.x
-"cache-aware streaming encoder" todo. Per-chunk encoder cost on
-Mode 3 today is `O(left + chunk + right_lookahead)` ms;
-cache-aware will reduce it to `O(chunk + right_lookahead)`.
+end-of-utterance.
+
+This is the **chosen design**, not a deferred workaround. The
+obvious alternative -- driving the streaming-trained EOU 120m-v1
+weights through NeMo's `cache_aware_stream_step` to recover
+"per-chunk `O(chunk)` compute and persistent encoder state" --
+was prototyped during the Phase 12.x exploration and rejected; see
+§8.5 case (A) for the full rationale. Short version: same model
+family Phase 8.0 already evaluated, same ~2× early-utterance WER
+cliff, same `<EOU>` token disappearing entirely in the cache-aware
+output (NeMo's own `cache_aware_stream_step` over `jfk.wav`
+produces 0 `<EOU>` tokens; we reproduced that bit-for-bit). Per-
+chunk encoder cost on Mode 3 today is `O(left + chunk +
+right_lookahead)`; trading that off for the chunked-limited
+streaming-inference path is a quality regression and is not on the
+roadmap.
 
 ### Phase 12.6 — download script + roundtrip verifier  _(done)_
 
@@ -2533,18 +2638,26 @@ matches the source NeMo state-dict at f32 bit-exactness for the f32
 slots and within a per-tier rel gate for the quant slots
 (2^-10 for f16, 2^-7 for q8_0, 2^-4 for q5_0, 2^-3 for q4_0).
 
-### Phase 12.x — pending follow-ups
+### Phase 12.x — follow-ups
 
-- **Cache-aware streaming encoder graph.** Eliminates Mode 3's
-  `O(left + chunk + right_lookahead)` per-chunk cost and recovers
-  bit-equal Mode-2 `<EOU>` boundary detection. Closes the long-
-  outstanding Phase 8.5 KV-cache scope. Per-layer `(70, d_model)`
-  K/V cache and `(d_model, kernel-1)` depthwise-conv state, both
-  sliding forward by `chunk_enc_frames` (= 2 frames per 25-mel-frame
-  chunk). The streaming graph can then be re-applied to CTC / TDT
-  Mode 3 as a 6x compute reduction on long-form audio (per the
-  Phase 8.5 estimate). API stays the same; only the internal
-  encoder-graph dispatch changes.
+#### Rejected (do not attempt again without new evidence)
+
+- **Cache-aware streaming encoder graph for EOU 120m-v1
+  (and any other chunked-limited-trained Parakeet checkpoint).**
+  Prototyped on a working branch during the Phase 12.x exploration:
+  bit-equal NeMo's `cache_aware_stream_step` (worst rel `1.85e-3`
+  over 44 chunks of `jfk.wav`), end-to-end transcript bit-equal
+  NeMo's *streaming* output -- which is structurally distinct
+  from, and meaningfully worse than, NeMo's offline output (~2×
+  early-utterance WER, no `<EOU>` token emitted). Reverted before
+  landing. Same quality cliff Phase 8.0 documented two years
+  earlier on `streaming_multi`; the EOU 120m-v1 family is the same
+  cache-aware streaming Conformer family with a slightly newer
+  120 M variant. **Will not be implemented.** See §8.5 case (A)
+  for the full rationale and numbers.
+
+#### Pending (no current owner)
+
 - **Quantised Sortformer GGUFs.** Same converter path as EOU's
   q8_0 / q4_0 work; needs a sweep + parity check (also tracked
   under §11.x).

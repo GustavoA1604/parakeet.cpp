@@ -17,7 +17,7 @@ Supported checkpoints:
 | `nvidia/parakeet-tdt-1.1b`    | TDT  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1225 MiB q8_0               | 0.027-0.079 | English only, lowest WER (no PnC) |
 | `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
 | `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline + Phase 11.11.1 sliding-history live streaming today; full NeMo-style spkcache streaming in Phase 11.11.2) |
-| `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T (1L LSTM 640) + `<EOU>` token | 128 | 512 × 17 (chunked-limited att=[70,1] + causal subsampler + LN-in-conv) | 1027 (1024 BPE + `<EOU>` + `<EOB>` + blank) | 120 M | 246 MiB f16 / 132 MiB q8_0 | encoder out cosine 0.999997 vs NeMo offline; CPU-only today (GPU follow-up tracked) | English only, low-latency streaming ASR with native `<EOU>` end-of-utterance token detection (NeMo voice-agent target). NVIDIA Open Model License. Phase 12.5 ships offline + Mode 2 / Mode 3 streaming; cache-aware streaming encoder for byte-equal Mode 3 `<EOU>` boundary detection is tracked as Phase 12.x. |
+| `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T (1L LSTM 640) + `<EOU>` token | 128 | 512 × 17 (chunked-limited att=[70,1] + causal subsampler + LN-in-conv) | 1027 (1024 BPE + `<EOU>` + `<EOB>` + blank) | 120 M | 246 MiB f16 / 132 MiB q8_0 | encoder out cosine 0.999997 vs NeMo offline; CPU-only today (GPU follow-up tracked) | English only, low-latency streaming ASR with native `<EOU>` end-of-utterance token detection (NeMo voice-agent target). NVIDIA Open Model License. Phase 12.5 ships offline + Mode 2 + rolling-encoder Mode 3 with offline-equivalent transcripts (Mode 2 byte-equal NeMo, Mode 3 within tolerance). Driving the streaming-trained weights through NeMo's chunked-limited `cache_aware_stream_step` was prototyped during the Phase 12.x exploration and rejected on quality grounds (~2× early-utterance WER, no `<EOU>` emitted) -- see PROGRESS.md §8.5 case (A). |
 
 Same converter, same encoder graph (with conv_norm_type / causal_downsampling /
 chunked_limited_attention / use_bias all toggled by GGUF metadata so the EOU
@@ -39,8 +39,9 @@ that auto-dispatches on `parakeet.model.type`:
   missing right-lookahead; typical WER delta vs offline is +5-10 %).
   EOU's Mode 3 transcript is byte-equal to its offline path on
   shipping fixtures; the `<EOU>` boundary detection in Mode 3 is
-  approximate today (true cache-aware streaming encoder is the
-  Phase 12.x optimisation).
+  approximate by design (the chunked-limited streaming-inference
+  alternative was evaluated and rejected on quality grounds; see
+  PROGRESS.md §8.5 case (A)).
 - `Engine::diarize()` -- one-shot wav -> [{speaker, start, end}].
   Sortformer.
 - `Engine::diarize_start()` -> `SortformerStreamSession` -- live
@@ -537,20 +538,33 @@ Bit-equal transcripts on `jfk.wav` and `sample-16k.wav`
 (Alice-in-Wonderland 20 s clip) at both `f16` and `q8_0` quant tiers.
 `build/test-eou-streaming` asserts these properties on every CI run.
 
-Mode 3 caveat: today the streaming session re-runs the **offline**
-encoder per chunk over a sliding `[left + chunk + right_lookahead]`
-window without persistent KV / conv-state cache across chunks. The
-transcript is byte-equal to the offline path on shipping fixtures,
-but `<EOU>` boundary detection in Mode 3 is *approximate* because
-the trailing chunk doesn't carry the long-context encoder state the
-EOU head needs to confidently fire `<EOU>` at end-of-utterance. The
-true cache-aware encoder graph (per-layer `(70, d_model)` K/V cache
-+ `(d_model, kernel-1)` depthwise-conv state, sliding forward by
-`chunk_enc_frames` per call) is the Phase 12.x optimisation that
-will recover bit-equal Mode-2 `<EOU>` detection AND give the
-~6x per-chunk compute reduction long planned for Phase 8.5 (which
-will benefit CTC / TDT Mode 3 too -- same internal graph reused
-across all three engine types).
+Mode 3 caveat (chosen design, not a workaround): the streaming
+session re-runs the **offline** encoder per chunk over a sliding
+`[left + chunk + right_lookahead]` window without persistent KV /
+conv-state cache across chunks. The transcript is byte-equal to
+the offline path on shipping fixtures, but `<EOU>` boundary
+detection in Mode 3 is *approximate* because the trailing chunk
+doesn't carry the long-context encoder state the EOU head needs to
+confidently fire `<EOU>` at end-of-utterance.
+
+The obvious alternative -- driving the streaming-trained EOU
+weights through NeMo's `cache_aware_stream_step` (per-layer K/V
+cache + depthwise-conv state, chunked-limited streaming attention
+mask, `O(chunk)` per-chunk encoder cost) -- was prototyped during
+the Phase 12.x exploration and rejected on quality grounds. It
+produces NeMo's *streaming* transcript, which is structurally
+distinct from and meaningfully worse than NeMo's offline transcript
+(~2× early-utterance WER on `jfk.wav`, with the trailing `<EOU>`
+token disappearing entirely from the cache-aware output). This
+isn't a C++ port issue: NeMo's own RNN-T over the cache-aware
+streaming encoder output reproduces the same regression bit-for-
+bit, and Phase 8.0 already documented the same quality cliff two
+years earlier on the older `streaming_multi` checkpoint from the
+same model family. See PROGRESS.md §8.5 for the full rationale and
+a strict separation of (A) chunked-limited streaming inference
+[rejected] from (B) the original Phase 8.5 KV-cache-on-offline-
+weights scope [deferred indefinitely, but a different design
+shape].
 
 ### Streaming — Sortformer (live diarization)
 
@@ -816,16 +830,21 @@ journal). Phase 12 (EOU FastConformer-RNN-T 120M with native
 `jfk.wav` and the 20-second Alice-in-Wonderland clip at both `f16`
 and `q8_0` quant tiers, encoder cosine 0.999997 vs NeMo PyTorch
 reference, `is_eou_boundary` flag firing on the chunk that contains
-the trailing `<EOU>` token in Mode 2. The deferred Phase 12.x
-optimisation -- a true cache-aware streaming encoder graph
-(per-layer `(70, d_model)` K/V cache + `(d_model, kernel-1)`
-depthwise-conv state, sliding forward by `chunk_enc_frames` per
-call) -- will tighten Mode 3's `<EOU>` boundary detection to be
-bit-equal with Mode 2 and is the same internal graph the long-
-outstanding Phase 8.5 KV-cache scope for CTC/TDT will reuse. The
-other outstanding workstream is Phase 11.11.2 (NeMo-style spkcache
-+ encoder graph split for fully stable Sortformer streaming
-speaker IDs).
+the trailing `<EOU>` token in Mode 2.
+
+A cache-aware streaming inference path (NeMo's
+`cache_aware_stream_step`) was prototyped during a Phase 12.x
+exploration and **rejected on quality grounds**: it produces NeMo's
+streaming transcript, which is structurally distinct from and
+meaningfully worse than the offline transcript on this model family
+(~2× early-utterance WER, no `<EOU>` token emitted). The same
+quality cliff was documented two years earlier in Phase 8.0 on the
+predecessor `streaming_multi` checkpoint family. The exploration
+branch was reverted before landing; PROGRESS.md §8.5 captures the
+detailed rationale so future contributors don't re-run the same
+loop. The outstanding active workstream is Phase 11.11.2 (NeMo-
+style spkcache + encoder graph split for fully stable Sortformer
+streaming speaker IDs).
 
 Headline highlights (per phase, one bullet each; PROGRESS.md `§N.x`
 has the full round-by-round journal):
@@ -879,18 +898,18 @@ has the full round-by-round journal):
   flag + `eot_confidence` slot reserved for Phase 13's cross-engine
   `OnEndOfTurn` event. Encoder cosine 0.999997 vs NeMo offline at
   f16 quant floor; transcripts bit-equal to NeMo on `jfk.wav` and
-  `sample-16k.wav` at both `f16` and `q8_0` tiers. Phase 12.x
-  follow-up (deferred): cache-aware streaming encoder graph for
-  byte-equal Mode-3 `<EOU>` boundary detection (also closes the
-  long-outstanding Phase 8.5 KV-cache scope for CTC/TDT Mode 3).
+  `sample-16k.wav` at both `f16` and `q8_0` tiers. Driving these
+  streaming-trained weights through NeMo's chunked-limited
+  `cache_aware_stream_step` was prototyped + rejected on quality
+  grounds (PROGRESS.md §8.5 case (A)).
 
-Next: Phase 12.x (cache-aware streaming encoder + cross-engine
-VadState / EndOfTurn events landing as Phase 13, plus the same
-graph reused to close Phase 8.5's KV-cache scope on CTC/TDT
-Mode 3), Accelerate BLAS for the TDT/EOU decoder's LSTM + joint
-gemvs and Sortformer's transformer attention, `CONV_2D_DW` on Metal
-(upstream ggml contribution), Metal flash-attn, Phase 11.11.2
-Sortformer streaming.
+Next: Phase 13 (cross-engine VadState / EndOfTurn events on top of
+the existing `is_eou_boundary` / `eot_confidence` slots, sourcing
+from whichever engines are loaded; energy-VAD fallback otherwise),
+Accelerate BLAS for the TDT/EOU decoder's LSTM + joint gemvs and
+Sortformer's transformer attention, `CONV_2D_DW` on Metal (upstream
+ggml contribution), Metal flash-attn, Phase 11.11.2 Sortformer
+streaming.
 
 ## Repository layout
 

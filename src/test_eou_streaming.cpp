@@ -210,10 +210,12 @@ int main(int argc, char ** argv) {
         // Mode 3 rolls the encoder per chunk over a sliding `[left + chunk +
         // right]` window WITHOUT persistent cache state, so the encoder loses
         // the "long-context model state" the EOU head needs to confidently fire
-        // <EOU> at the very end. The transcript still matches; the next slice
-        // (cache-aware streaming encoder) will carry per-layer K/V + conv state
-        // across chunks and recover bit-equal Mode-2 EOU detection. For now we
-        // only assert text parity within the chunk-boundary jitter band.
+        // <EOU> at the very end. The transcript still matches; tail-jitter
+        // tolerance is by design. Driving the streaming-trained EOU weights
+        // through NeMo's chunked-limited cache_aware_stream_step to recover
+        // byte-equal Mode-2 EOU detection was prototyped + rejected on quality
+        // grounds (see PROGRESS.md §8.5 case (A)) -- it produces NeMo's
+        // streaming transcript, not the offline one.
         const auto distance = mode3_text.size() < ref.text.size()
                                   ? ref.text.size() - mode3_text.size()
                                   : mode3_text.size() - ref.text.size();
@@ -229,8 +231,8 @@ int main(int argc, char ** argv) {
         } else {
             std::fprintf(stderr, "[test-eou-streaming] PASS Mode 3 chunk=%dms left=%dms "
                                  "right=%dms: %d segments (text=%zu B vs ref %zu B; "
-                                 "EOU boundary chunk=%d -- approximate without "
-                                 "cache-aware streaming)\n",
+                                 "EOU boundary chunk=%d -- rolling-encoder Mode 3 "
+                                 "is approximate by design; see PROGRESS.md §8.5)\n",
                          chunk_ms, left_ms, right_ms,
                          seg_count, mode3_text.size(), ref.text.size(),
                          eou_boundary_seg);

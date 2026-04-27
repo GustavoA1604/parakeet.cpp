@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
 """Dump per-stage reference tensors from NeMo for Parakeet-EOU numerical parity.
 
-EOU = ``nvidia/parakeet_realtime_eou_120m-v1`` (FastConformer-RNN-T 120M, English,
-17 encoder layers, cache-aware streaming with att_context_size=[70, 1] and a
-``<EOU>`` end-of-utterance token in the vocabulary).
+EOU = ``nvidia/parakeet_realtime_eou_120m-v1`` (FastConformer-RNN-T 120M,
+English, 17 encoder layers, ``att_context_size=[70, 1]`` chunked-limited,
+``<EOU>`` end-of-utterance token).
 
-Produces a directory of .npy files + the NeMo reference transcript; used by
-the C++ EOU bring-up to validate encoder output and decoder state transitions
-bit-for-bit (at f16 quant precision):
+Produces a directory of .npy files + the NeMo *offline* reference transcript;
+consumed by the C++ EOU bring-up to validate encoder output and decoder state
+transitions bit-for-bit (at f16 quant precision):
 
     <out>/
         mel.npy              (n_mels, T_mel)   post-preprocessor log-mel (offline)
         encoder_out.npy      (T_enc, d_model)  NeMo encoder final output (offline,
                                                full attention, no streaming caches)
-        encoder_streaming_out.npy
-                             (T_enc, d_model)  NeMo encoder output produced by the
-                                               cache-aware streaming forward pass
-                                               (att_context_size=[70,1], chunk=25
-                                               mel frames). Concatenated across chunks.
-        encoder_streaming_chunk_lens.npy
-                             (n_chunks,)       int32 per-chunk encoded frame counts
         transcript.txt                         NeMo transcribe() greedy transcript
                                                (offline).
         pred_init_h.npy      (L, 1, H)         initial LSTM hidden state
@@ -27,6 +20,14 @@ bit-for-bit (at f16 quant precision):
         pred_blank_out.npy   (H,)              prediction-net output for the blank
                                                token (sanity check that our embed +
                                                LSTM matches NeMo)
+
+NeMo also exposes a ``model.encoder.cache_aware_stream_step`` chunked-limited
+streaming forward pass. This script intentionally does **not** dump references
+from that path: driving streaming-trained Parakeet checkpoints through
+chunked-limited streaming inference was evaluated and rejected on quality
+grounds (PROGRESS.md §8.5 case (A)). Adding back a streaming-reference dump
+here is a strong signal that someone is about to redo the rejected exploration;
+read PROGRESS.md §8.5 first.
 """
 
 import argparse
@@ -47,10 +48,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--nemo-model", type=Path,
                    default=Path("models/parakeet_realtime_eou_120m-v1.nemo"))
     p.add_argument("--device", default="cpu")
-    p.add_argument("--chunk-mel-frames", type=int, default=25,
-                   help="Mel frames per streaming encoder chunk (matches the binding)")
-    p.add_argument("--skip-streaming", action="store_true",
-                   help="Skip the cache-aware streaming pass (faster; offline only)")
     return p.parse_args()
 
 
@@ -125,64 +122,6 @@ def main():
         np.save(args.out / "pred_blank_out.npy", g_np)
         print(f"[eou-ref] pred_blank_out: {g_np.shape} (g full shape was {tuple(g.shape)}, took [:,0])",
               file=sys.stderr)
-
-        if not args.skip_streaming:
-            chunk_mel = int(args.chunk_mel_frames)
-            T_mel = int(mel.shape[-1])
-
-            n_layers = model.encoder.n_layers
-            d_model  = model.encoder.d_model
-            ctx_left = int(model.encoder.att_context_size[0])
-            sub_factor = int(model.encoder.subsampling_factor)
-            conv_kernel = int(model.encoder.layers[0].conv.depthwise_conv.kernel_size[0])
-            cache_time_steps = conv_kernel - 1
-
-            cache_chan = torch.zeros(
-                n_layers, 1, ctx_left, d_model,
-                dtype=mel.dtype, device=mel.device)
-            cache_time = torch.zeros(
-                n_layers, 1, d_model, cache_time_steps,
-                dtype=mel.dtype, device=mel.device)
-            cache_chan_len = torch.zeros(1, dtype=torch.long, device=mel.device)
-
-            chunk_outs = []
-            chunk_lens = []
-            for start in range(0, T_mel, chunk_mel):
-                end = min(start + chunk_mel, T_mel)
-                if end - start < 10 and start > 0:
-                    break
-                mel_chunk = mel[:, :, start:end].contiguous()
-                len_chunk = torch.tensor([end - start],
-                                         dtype=torch.long, device=mel.device)
-                step_out, step_len, cache_chan, cache_time, cache_chan_len = \
-                    model.encoder.cache_aware_stream_step(
-                        processed_signal=mel_chunk,
-                        processed_signal_length=len_chunk,
-                        cache_last_channel=cache_chan,
-                        cache_last_time=cache_time,
-                        cache_last_channel_len=cache_chan_len,
-                        keep_all_outputs=False,
-                    )
-                step_np = step_out[0].permute(1, 0).detach().cpu().numpy().astype(np.float32)
-                step_T  = int(step_len[0])
-                chunk_outs.append(step_np[:step_T])
-                chunk_lens.append(step_T)
-                print(f"[eou-ref] streaming chunk @ mel[{start}:{end}] -> "
-                      f"{step_T} encoder frames (running cache_chan_len={int(cache_chan_len[0])})",
-                      file=sys.stderr)
-
-            if chunk_outs:
-                stream_np = np.concatenate(chunk_outs, axis=0)
-                np.save(args.out / "encoder_streaming_out.npy", stream_np)
-                np.save(args.out / "encoder_streaming_chunk_lens.npy",
-                        np.asarray(chunk_lens, dtype=np.int32))
-                print(f"[eou-ref] encoder_streaming_out: {stream_np.shape} "
-                      f"(T_enc, d_model) across {len(chunk_lens)} chunks "
-                      f"-> encoder_streaming_out.npy",
-                      file=sys.stderr)
-            else:
-                print(f"[eou-ref] streaming pass produced no chunks (audio too short)",
-                      file=sys.stderr)
 
     print(f"[eou-ref] transcribing {args.wav} with NeMo EOU (offline)...", file=sys.stderr)
     hyps = model.transcribe([str(args.wav)], batch_size=1)
