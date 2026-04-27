@@ -15,8 +15,8 @@ Supported checkpoints:
 | `nvidia/parakeet-ctc-1.1b`    | CTC  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1217 MiB q8_0               | 0.026-0.074 | English only |
 | `nvidia/parakeet-tdt-0.6b-v3` | TDT  | 128 | 1024 × 24 | 8192 | 600 M  | 715 MiB q8_0 / 1.34 GiB f16 | 0.024-0.050 | ~25 languages + PnC |
 | `nvidia/parakeet-tdt-1.1b`    | TDT  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1225 MiB q8_0               | 0.027-0.079 | English only, lowest WER (no PnC) |
-| `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
-| `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline + Phase 11.11.1 sliding-history live streaming today; full NeMo-style spkcache streaming in Phase 11.11.2) |
+| `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 / 141 MiB q8_0 / 75 MiB q4_0 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
+| `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 / 134 MiB q8_0 / 72 MiB q4_0 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline + Phase 11.11.1 sliding-history live streaming today; full NeMo-style spkcache streaming in Phase 11.11.2) |
 | `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T (1L LSTM 640) + `<EOU>` token | 128 | 512 × 17 (chunked-limited att=[70,1] + causal subsampler + LN-in-conv) | 1027 (1024 BPE + `<EOU>` + `<EOB>` + blank) | 120 M | 246 MiB f16 / 132 MiB q8_0 | encoder out cosine 0.999997 vs NeMo offline; CPU-only today (GPU follow-up tracked) | English only, low-latency streaming ASR with native `<EOU>` end-of-utterance token detection (NeMo voice-agent target). NVIDIA Open Model License. Phase 12.5 ships offline + Mode 2 + rolling-encoder Mode 3 with offline-equivalent transcripts (Mode 2 byte-equal NeMo, Mode 3 within tolerance). Driving the streaming-trained weights through NeMo's chunked-limited `cache_aware_stream_step` was prototyped during the Phase 12.x exploration and rejected on quality grounds (~2× early-utterance WER, no `<EOU>` emitted) -- see PROGRESS.md §8.5 case (A). |
 
 Same converter, same encoder graph (with conv_norm_type / causal_downsampling /
@@ -883,7 +883,10 @@ has the full round-by-round journal):
   `transcribe_with_speakers` for combined ASR + speaker attribution.
   §11.11.1 ships `Engine::diarize_start()` ->
   `SortformerStreamSession` for live diarization (sliding-history v1;
-  Phase 11.11.2 NeMo-style spkcache streaming pending).
+  Phase 11.11.2 NeMo-style spkcache streaming pending). Sortformer
+  also ships at `q8_0` (~140 MiB, 1.9x smaller than f16) and `q4_0`
+  (~75 MiB, 3.5x smaller); user-facing diarization output is
+  identical across all three quant tiers on `jfk.wav`.
 - **EOU end-of-utterance ASR (Phase 12)**:
   `nvidia/parakeet_realtime_eou_120m-v1` ported -- a streaming-trained
   120M FastConformer-RNN-T English ASR with a native `<EOU>`

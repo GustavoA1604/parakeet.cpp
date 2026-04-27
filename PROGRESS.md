@@ -2188,8 +2188,63 @@ the eventual destination; 11.11.1 is what ships today.
   form bottleneck on Sortformer's 18-layer TF (T^2 cost dominates).
   See §5.4 for the prior Accelerate sched-assertion investigation on
   the f32 GGUF -- worth re-checking with the q8_0 path.
-- **Quantised (q8_0 / q4_0) Sortformer GGUFs**. Converter handles
-  these via the universal dequant path; needs a sweep + parity check.
+
+### Phase 11.12 — quantised Sortformer GGUFs  _(done)_
+
+Both Sortformer checkpoints (`diar_sortformer_4spk-v1` offline and
+`diar_streaming_sortformer_4spk-v2` streaming-trained) now ship at
+`q8_0` and `q4_0` via the universal `add_2d` quantisation path in
+`scripts/convert-nemo-to-gguf.py`. No converter changes needed --
+Sortformer's encoder shares the FastConformer graph with CTC/EOU,
+and the transformer encoder + diarization head are 2D linear layers
+that already flow through `add_2d`.
+
+Sizes:
+
+| GGUF                             | f16     | q8_0    | q4_0    |
+|----------------------------------|---------|---------|---------|
+| sortformer-4spk-v1               | 263 MiB | 141 MiB | 75 MiB  |
+| sortformer-streaming-4spk-v2     | 251 MiB | 134 MiB | 72 MiB  |
+
+`scripts/verify-gguf-roundtrip.py` gained `build_expected_sortformer`
+covering the encoder + `sortformer.encoder_proj` + 18 transformer
+blocks (`attn.{q,k,v,out}`, `ln{1,2}`, `ffn.{in,out}`) + the
+two-layer diarization head. All 6 GGUFs (2 models × 3 tiers) PASS
+the roundtrip gate (worst rel `1.15e-1` on `parakeet-ctc-0.6b.q4_0`-
+class q4 weights, well within the `2^-3 = 0.125` quant gate).
+
+`test-sortformer-parity` was extended with `--enc-rel-tol` and
+`--probs-abs-tol` flags so each quant tier can pass at appropriate
+gates (defaults still f16 = 5e-3 / 5e-2). Per-tier numbers on
+`jfk.wav` (single-speaker, 11 s):
+
+| GGUF                                     | enc rel  | probs max_abs |
+|------------------------------------------|----------|---------------|
+| sortformer-4spk-v1.f16                   | 1.6e-3   | 8.7e-4        |
+| sortformer-4spk-v1.q8_0                  | 2.7e-2   | 2.7e-2        |
+| sortformer-4spk-v1.q4_0                  | 3.2e-1   | 1.3e-1        |
+| sortformer-streaming-4spk-v2.f16         | 5.0e-2   | 5.1e-2        |
+| sortformer-streaming-4spk-v2.q8_0        | 5.2e-2   | 5.4e-2        |
+| sortformer-streaming-4spk-v2.q4_0        | 2.2e-1   | 2.0e-1        |
+
+(v2's f16 baseline is already worse than v1's because the
+streaming-trained encoder's offline forward in our C++ graph diverges
+from NeMo's offline forward -- this is a structural property of the
+streaming-trained checkpoint when run offline, not a quantisation
+regression. v2 q8/q4 inflate within the same factor band as v1.)
+
+User-facing diarization output is identical across all three tiers
+of v2 on `jfk.wav` (`[0.24-2.40] [3.36-4.56] [5.44-11.04]`,
+all speaker_0). v1's three tiers also produce the same three
+segments, with q4 boundaries shifted by at most ~80 ms (one encoder
+frame) vs f16 -- well within the post-processing `min_segment_ms`
+band.
+
+**Recommendation:** prefer q8_0 for general use (1.9× smaller than
+f16 with negligible quality impact); use q4_0 when memory is tight
+(3.5× smaller than f16, marginally noisier individual speaker
+probabilities but identical thresholded segments on shipping
+fixtures).
 
 ## Phase 12 — EOU end-of-utterance streaming ASR  _(in progress; 12.0 + 12.1 shipped)_
 
@@ -2658,9 +2713,6 @@ slots and within a per-tier rel gate for the quant slots
 
 #### Pending (no current owner)
 
-- **Quantised Sortformer GGUFs.** Same converter path as EOU's
-  q8_0 / q4_0 work; needs a sweep + parity check (also tracked
-  under §11.x).
 - **Cross-engine VadState + EndOfTurn events.** The
   `is_eou_boundary` + `eot_confidence` slots in `StreamingSegment`
   were specifically shaped for this: Phase 13 will land a

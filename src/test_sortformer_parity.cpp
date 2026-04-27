@@ -66,13 +66,25 @@ void parity(const std::vector<float> & a, const std::vector<float> & b,
 int main(int argc, char ** argv) {
     if (argc < 4) {
         std::fprintf(stderr,
-            "usage: %s <sortformer.gguf> <wav> <ref-dir>\n"
-            "  ref-dir produced by scripts/dump-sortformer-reference.py\n", argv[0]);
+            "usage: %s <sortformer.gguf> <wav> <ref-dir> [--enc-rel-tol R] [--probs-abs-tol R]\n"
+            "  ref-dir produced by scripts/dump-sortformer-reference.py\n"
+            "  --enc-rel-tol     gates encoder rel-err vs NeMo (default 5e-3 for f16;\n"
+            "                    bump to ~3e-2 for q8_0, ~5e-1 for q4_0 -- the head\n"
+            "                    absorbs the inflated intermediates)\n"
+            "  --probs-abs-tol   gates speaker_probs max-abs vs NeMo (default 5e-2;\n"
+            "                    raise to 1.5e-1 for q4_0)\n", argv[0]);
         return 2;
     }
     const std::string gguf_path = argv[1];
     const std::string wav_path  = argv[2];
     const std::string ref_dir   = argv[3];
+    double enc_rel_tol   = 5e-3;
+    double probs_abs_tol = 5e-2;
+    for (int i = 4; i + 1 < argc; ++i) {
+        std::string a = argv[i];
+        if      (a == "--enc-rel-tol")   enc_rel_tol   = std::atof(argv[++i]);
+        else if (a == "--probs-abs-tol") probs_abs_tol = std::atof(argv[++i]);
+    }
 
     using namespace qvac_parakeet::ctc;
     std::fprintf(stderr, "[sf-parity] loading %s\n", gguf_path.c_str());
@@ -143,8 +155,9 @@ int main(int argc, char ** argv) {
     std::vector<float> b(enc_ref.begin(), enc_ref.begin() + common);
     double max_abs_enc = 0, rel_enc = 0;
     parity(a, b, max_abs_enc, rel_enc);
-    std::fprintf(stderr, "[sf-parity] enc  : max_abs=%.4e rel=%.4e  (%s)\n",
-                 max_abs_enc, rel_enc, rel_enc < 5e-3 ? "PASS" : "FAIL");
+    const bool enc_pass = rel_enc < enc_rel_tol;
+    std::fprintf(stderr, "[sf-parity] enc  : max_abs=%.4e rel=%.4e  (%s, rel tol=%.1e)\n",
+                 max_abs_enc, rel_enc, enc_pass ? "PASS" : "FAIL", enc_rel_tol);
 
     SortformerRuntimeWeights W;
     if (sortformer_prepare_runtime(model, W) != 0) return 8;
@@ -166,9 +179,9 @@ int main(int argc, char ** argv) {
             std::vector<float> bb(probs_ref.begin(), probs_ref.begin() + n);
             double max_abs = 0, rel = 0;
             parity(aa, bb, max_abs, rel);
-            const bool ok = max_abs < 5e-2;
-            std::fprintf(stderr, "[sf-parity] probs: max_abs=%.4e rel=%.4e  (%s, max_abs tol=5e-2)\n",
-                         max_abs, rel, ok ? "PASS" : "FAIL");
+            const bool ok = max_abs < probs_abs_tol;
+            std::fprintf(stderr, "[sf-parity] probs: max_abs=%.4e rel=%.4e  (%s, max_abs tol=%.1e)\n",
+                         max_abs, rel, ok ? "PASS" : "FAIL", probs_abs_tol);
             if (!ok) worst = 1;
         }
     }
@@ -194,5 +207,5 @@ int main(int argc, char ** argv) {
                      dres.segments[i].start_s, dres.segments[i].end_s);
     }
 
-    return (rel_enc < 5e-3 && worst == 0) ? 0 : 1;
+    return (enc_pass && worst == 0) ? 0 : 1;
 }
