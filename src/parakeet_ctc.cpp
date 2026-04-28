@@ -4,7 +4,9 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
+#endif
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -77,7 +79,9 @@ struct ParakeetCtcModel::Impl {
     gguf_context         * gguf           = nullptr;
     ggml_context         * ctx            = nullptr;
     ggml_backend_t         backend_cpu    = nullptr;
+#ifdef GGML_USE_BLAS
     ggml_backend_t         backend_blas   = nullptr;
+#endif
     ggml_backend_t         backend_gpu    = nullptr;
     ggml_backend_t         backend_active = nullptr;
     ggml_backend_buffer_t  weights_buffer = nullptr;
@@ -92,7 +96,9 @@ struct ParakeetCtcModel::Impl {
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         if (ctx)            ggml_free(ctx);
         if (gguf)           gguf_free(gguf);
+#ifdef GGML_USE_BLAS
         if (backend_blas)   ggml_backend_free(backend_blas);
+#endif
         if (backend_gpu)    ggml_backend_free(backend_gpu);
         if (backend_cpu)    ggml_backend_free(backend_cpu);
     }
@@ -198,10 +204,12 @@ int load_from_gguf(const std::string & gguf_path,
     }
     ggml_backend_cpu_set_n_threads(impl->backend_cpu, resolved_threads);
 
+#ifdef GGML_USE_BLAS
     impl->backend_blas = ggml_backend_blas_init();
     if (impl->backend_blas && resolved_threads > 0) {
         ggml_backend_blas_set_n_threads(impl->backend_blas, resolved_threads);
     }
+#endif
 
     impl->backend_gpu    = init_gpu_backend(n_gpu_layers, verbose);
     impl->backend_active = impl->backend_gpu ? impl->backend_gpu : impl->backend_cpu;
@@ -540,10 +548,12 @@ int load_from_gguf(const std::string & gguf_path,
         out_model.tdt.joint_out_b  = require_tensor(impl->ctx, "tdt.joint.out.bias");
     }
 
+#ifdef GGML_USE_BLAS
     if (impl->backend_blas) {
         ggml_backend_free(impl->backend_blas);
         impl->backend_blas = nullptr;
     }
+#endif
 
     out_model.impl = impl;
 
