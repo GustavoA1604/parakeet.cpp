@@ -1146,8 +1146,13 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         const int left  = enc.att_context_left;
         const int right = enc.att_context_right;
         const int chunk = right + 1;
-        g.att_mask_host.assign((size_t) T * T,
-                               -std::numeric_limits<float>::infinity());
+        // Use a large finite "very negative" sentinel rather than -inf:
+        // Apple Clang at -O3 emits `-Wnan-infinity-disabled` because some
+        // FP optimisations treat infinity as UB, which empirically
+        // corrupts the chunked-limited mask on the EOU offline encoder
+        // (CTC / TDT use full attention so they're unaffected). Softmax
+        // with -1e30 saturates to ~0 just like -inf, with no UB risk.
+        g.att_mask_host.assign((size_t) T * T, -1.0e30f);
         for (int i = 0; i < T; ++i) {
             const int c          = i / chunk;
             const int win_start  = c * chunk - left;
