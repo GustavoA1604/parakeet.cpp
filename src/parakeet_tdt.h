@@ -86,30 +86,67 @@ struct TdtRuntimeWeights {
     // ---- GPU graph scaffolding (populated only when use_graphs) ----
     ggml_context * gctx = nullptr;
 
+    // Phase 14 — Persistent decoder state on the backend.
+    //
+    // Each emission step on Metal is dominated by command-buffer commit +
+    // wait latency (~150 us / compute_graph). Phase 13 ran two compute_graph
+    // calls per non-blank step (joint, then LSTM) and one per blank step;
+    // the joint readback was 32 KB but the dispatch floor was the real
+    // cost.
+    //
+    // Phase 14 keeps `h`, `c`, `pred` and the full-window `enc_proj` resident
+    // in `persist_buffer`, plumbs them as in-graph inputs/outputs via
+    // ggml_cpy, and adds a fused `g_lstm_joint` graph used after a non-blank
+    // emission (LSTM update + joint forward in one commit). Net effect:
+    // 247 + 95 = 342 commits drops to 247 + 1, saving ~95 commits per call.
+    ggml_context *           persist_ctx    = nullptr;
+    ggml_backend_buffer_t    persist_buffer = nullptr;
+    ggml_tensor *            h_persist        = nullptr;  // [H_pred, L]
+    ggml_tensor *            c_persist        = nullptr;  // [H_pred, L]
+    ggml_tensor *            pred_persist     = nullptr;  // [H_pred]
+    ggml_tensor *            enc_proj_persist = nullptr;  // [H_joint, T_max]
+    int                      enc_proj_T_max   = 0;
+
+    // (1) Init-only LSTM graph: zeroes h/c and runs LSTM with the blank
+    //     token to seed pred_persist. Used once per call (tdt_init_state).
     ggml_cgraph *  g_lstm     = nullptr;
     ggml_gallocr_t alloc_lstm = nullptr;
     ggml_tensor *  lstm_token_in = nullptr;
-    ggml_tensor *  lstm_h_in     = nullptr;
-    ggml_tensor *  lstm_c_in     = nullptr;
-    ggml_tensor *  lstm_h_out    = nullptr;
-    ggml_tensor *  lstm_c_out    = nullptr;
-    ggml_tensor *  lstm_pred_out = nullptr;
+    ggml_tensor *  lstm_h_out    = nullptr;  // ggml_cpy result aliasing h_persist
+    ggml_tensor *  lstm_c_out    = nullptr;  // ggml_cpy result aliasing c_persist
+    ggml_tensor *  lstm_pred_out = nullptr;  // ggml_cpy result aliasing pred_persist
 
+    // (2) Joint-only graph: used after a blank emission (pred unchanged
+    //     from previous iteration). Reads pred_persist + enc_proj_persist
+    //     [frame_idx], writes logits to host.
     ggml_cgraph *  g_joint     = nullptr;
     ggml_gallocr_t alloc_joint = nullptr;
-    ggml_tensor *  joint_pred_in     = nullptr;
-    ggml_tensor *  joint_enc_proj_in = nullptr;
-    ggml_tensor *  joint_logits_out  = nullptr;
+    ggml_tensor *  joint_frame_idx_in = nullptr;  // i32[1]
+    ggml_tensor *  joint_logits_out   = nullptr;  // f32[V_out]
+
+    // (3) Fused LSTM + joint graph: used after a non-blank emission.
+    //     LSTM updates h/c/pred from the last emitted token, then joint
+    //     reads the *fresh* pred and enc_proj_persist[frame_idx] in the
+    //     same compute_graph (one command-buffer commit instead of two).
+    ggml_cgraph *  g_lstm_joint     = nullptr;
+    ggml_gallocr_t alloc_lstm_joint = nullptr;
+    ggml_tensor *  lj_token_in        = nullptr;  // i32[1]
+    ggml_tensor *  lj_frame_idx_in    = nullptr;  // i32[1]
+    ggml_tensor *  lj_logits_out      = nullptr;  // f32[V_out]
 
     struct EncProjGraph {
         ggml_cgraph *  cg     = nullptr;
         ggml_gallocr_t alloc  = nullptr;
         ggml_tensor *  enc_in = nullptr;
-        ggml_tensor *  out    = nullptr;
+        ggml_tensor *  out    = nullptr;  // ggml_cpy aliasing enc_proj_persist[:T]
         int            T      = 0;
     };
     std::vector<EncProjGraph> enc_proj_cache;
     static constexpr size_t k_enc_proj_cache_max = 3;
+    // ~5 minutes of audio at the encoder's 80 ms-frame rate fits in 4096
+    // rows; H_joint=640 * f32 → ~10 MB, fine for any backend we target.
+    // Audio that exceeds this falls back to a per-call dynamic-T allocation.
+    static constexpr int k_enc_proj_T_max = 4096;
 
     TdtRuntimeWeights() = default;
     TdtRuntimeWeights(const TdtRuntimeWeights &) = delete;
