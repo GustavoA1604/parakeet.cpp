@@ -71,6 +71,9 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
     if (GGML_VULKAN)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_VULKAN)
     endif()
+    if (GGML_OPENCL)
+        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_OPENCL)
+    endif()
 
     set_target_properties(qvac-parakeet PROPERTIES
         POSITION_INDEPENDENT_CODE ON
