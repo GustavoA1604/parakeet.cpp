@@ -16,6 +16,9 @@
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
 #endif
+#ifdef GGML_USE_OPENCL
+#include "ggml-opencl.h"
+#endif
 #include "gguf.h"
 
 #include <algorithm>
@@ -127,6 +130,12 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
         return b;
     }
 #endif
+#ifdef GGML_USE_OPENCL
+    if (auto * b = ggml_backend_opencl_init()) {
+        if (verbose) std::fprintf(stderr, "parakeet: using OpenCL backend\n");
+        return b;
+    }
+#endif
     if (verbose) std::fprintf(stderr, "parakeet: no GPU backend compiled in, falling back to CPU\n");
     return nullptr;
 }
@@ -210,6 +219,9 @@ int load_from_gguf(const std::string & gguf_path,
         ggml_backend_blas_set_n_threads(impl->backend_blas, resolved_threads);
     }
 #endif
+    // No #else branch: Impl::backend_blas is default-initialised to
+    // nullptr at the struct (see line ~86), so the GGML_USE_BLAS=OFF
+    // case needs no explicit assignment here.
 
     impl->backend_gpu    = init_gpu_backend(n_gpu_layers, verbose);
     impl->backend_active = impl->backend_gpu ? impl->backend_gpu : impl->backend_cpu;

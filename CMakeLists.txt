@@ -82,6 +82,9 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
         target_link_libraries(qvac-parakeet PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
+    if (GGML_BLAS)
+        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_BLAS)
+    endif()
     if (GGML_CUDA)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_CUDA)
     endif()
@@ -91,8 +94,11 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
     if (GGML_VULKAN)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_VULKAN)
     endif()
-    if (GGML_BLAS)
-        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_BLAS)
+    # GGML_USE_BLAS already surfaced above (matches upstream 8da4939's
+    # placement; the QVAC-17997 wire-up originally re-added it before
+    # GGML_USE_CUDA which is now redundant after the rebase).
+    if (GGML_OPENCL)
+        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_OPENCL)
     endif()
 
     set_target_properties(qvac-parakeet PROPERTIES
@@ -124,6 +130,30 @@ if (QVAC_PARAKEET_BUILD_EXECUTABLES)
 endif()
 
 if (QVAC_PARAKEET_BUILD_TESTS)
+    # Helper: keep the parakeet_ctc.cpp #ifdefs (BLAS / CUDA / Metal / Vulkan /
+    # OpenCL backend init) consistent across the qvac-parakeet library and any
+    # test executable that compiles parakeet_ctc.cpp from source. Without this,
+    # tests that don't link the library would always evaluate the #ifdefs as
+    # "no backend defined", producing link errors against ggml-blas / ggml-vk
+    # / ggml-opencl when the parent build did enable them.
+    function(qvac_parakeet_apply_backend_defs target)
+        if (GGML_BLAS)
+            target_compile_definitions(${target} PRIVATE GGML_USE_BLAS)
+        endif()
+        if (GGML_CUDA)
+            target_compile_definitions(${target} PRIVATE GGML_USE_CUDA)
+        endif()
+        if (GGML_METAL)
+            target_compile_definitions(${target} PRIVATE GGML_USE_METAL)
+        endif()
+        if (GGML_VULKAN)
+            target_compile_definitions(${target} PRIVATE GGML_USE_VULKAN)
+        endif()
+        if (GGML_OPENCL)
+            target_compile_definitions(${target} PRIVATE GGML_USE_OPENCL)
+        endif()
+    endfunction()
+
     add_executable(test-mel
         src/test_mel.cpp
         src/mel_preprocess.cpp
@@ -131,6 +161,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-mel PRIVATE ggml)
     target_include_directories(test-mel PRIVATE ggml/include src include)
+    qvac_parakeet_apply_backend_defs(test-mel)
 
     add_executable(test-encoder
         src/test_encoder.cpp
@@ -139,6 +170,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-encoder PRIVATE ggml)
     target_include_directories(test-encoder PRIVATE ggml/include src)
+    qvac_parakeet_apply_backend_defs(test-encoder)
 
     add_executable(test-ctc
         src/test_ctc.cpp
@@ -147,6 +179,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-ctc PRIVATE ggml)
     target_include_directories(test-ctc PRIVATE ggml/include src)
+    qvac_parakeet_apply_backend_defs(test-ctc)
 
     add_executable(test-streaming src/test_streaming.cpp)
     target_link_libraries(test-streaming PRIVATE qvac-parakeet)
@@ -172,6 +205,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/energy_vad.cpp)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml)
     target_include_directories(test-tdt-encoder-parity PRIVATE include src ggml/include)
+    qvac_parakeet_apply_backend_defs(test-tdt-encoder-parity)
 
     add_executable(test-sortformer-parity
         src/test_sortformer_parity.cpp
@@ -185,6 +219,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/energy_vad.cpp)
     target_link_libraries(test-sortformer-parity PRIVATE ggml)
     target_include_directories(test-sortformer-parity PRIVATE include src ggml/include)
+    qvac_parakeet_apply_backend_defs(test-sortformer-parity)
 endif()
 
 if (QVAC_PARAKEET_BUILD_EXAMPLES)
