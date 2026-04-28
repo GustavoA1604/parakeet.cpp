@@ -939,6 +939,86 @@ shrink the model file and the unified-memory footprint.
     encoder. Today the mel runs inline on host before the encoder
     starts; with a sched we could overlap them.
 
+### 6.6 — OpenCL backend  _(added; runtime-validated on Adreno/Intel iGPU pending)_
+
+Adds the `ggml_backend_opencl` path as a fourth GPU backend option
+alongside the existing Metal / CUDA / Vulkan integrations. The
+target hardware is Qualcomm **Adreno** (Snapdragon SoCs) and
+**Intel** integrated GPUs — the two GPU families that the upstream
+`ggml-opencl` backend explicitly supports. The motivating use case
+is on-device ASR on Android phones with Adreno silicon (e.g. the
+Pixel 9 Pro family for the QVAC mobile pod) and on Intel-iGPU
+laptops.
+
+  - **Wire-up.** Follows the same compile-time-gated pattern used by
+    the other GPU backends:
+      - `CMakeLists.txt`: new `if (GGML_OPENCL)` branch that defines
+        `GGML_USE_OPENCL` for the `qvac-parakeet` target.
+      - `src/parakeet_ctc.cpp`: new `#ifdef GGML_USE_OPENCL` include
+        for `ggml-opencl.h`, plus an OpenCL branch in
+        `init_gpu_backend()` that calls `ggml_backend_opencl_init()`
+        and prints `parakeet: using OpenCL backend` in verbose mode.
+        Updated init order is `CUDA -> Metal -> Vulkan -> OpenCL -> CPU`.
+  - **Pre-existing BLAS link bug fixed along the way.**
+    `#include "ggml-blas.h"` was unconditional, and
+    `ggml_backend_blas_init()` / `ggml_backend_blas_set_n_threads()`
+    were always called from `load_from_gguf`. Building against a
+    `ggml` without BLAS (the default on most non-macOS
+    configurations, including the local Windows + clang-19 setup
+    used during this work) failed at link time with
+    `undefined symbol __imp_ggml_backend_blas_init`. Both the
+    include and the calls are now correctly guarded by
+    `#ifdef GGML_USE_BLAS`, matching the pattern already in place
+    for the GPU backends.
+  - **Default behaviour unchanged.** All OpenCL changes are gated
+    behind `#ifdef GGML_USE_OPENCL`, so when `-DGGML_OPENCL=ON` is
+    not passed to CMake the build, the binary size, and the runtime
+    path are byte-for-byte identical to the pre-change tree.
+
+#### Local validation
+
+The author was unable to run the OpenCL path end-to-end on the
+development machine. The only OpenCL device available locally is an
+**NVIDIA GeForce RTX 5060**, and `ggml-opencl` deliberately rejects
+non-Adreno and non-Intel GPUs at device-init time. The relevant
+guards in upstream `ggml/src/ggml-opencl/ggml-opencl.cpp`:
+
+  - The `ggml_backend_opencl_device_init` path inspects the OpenCL
+    `CL_DEVICE_NAME` string and bails with
+    `Unsupported GPU: <name>` when the vendor is neither Adreno nor
+    Intel.
+  - Multiple critical kernels (`mul_mat`, `mul_mat_id`,
+    `flash_attn_ext`, `conv_2d_dw`, etc.) contain
+    `GGML_ASSERT(false && "Unsupported GPU")` paths gated on the
+    detected GPU family, which would crash the run even if the
+    device-name allowlist were patched out.
+
+That is not a `parakeet.cpp` design choice — it is the intentional
+shape of the upstream `ggml-opencl` backend, which ships fast paths
+only for the Adreno and Intel families it explicitly targets. As a
+result:
+
+  - **What was verified locally on Windows + clang-19:**
+      - Builds cleanly with `-DGGML_OPENCL=ON` (and with the OpenCL
+        ICD loader from the Khronos OpenCL SDK) — no compile or link
+        errors.
+      - Builds cleanly with `-DGGML_OPENCL=OFF` — confirms the
+        `#ifdef` gating leaves the default path untouched.
+      - The CPU end-to-end run on `test/samples/jfk.wav` continues
+        to produce identical transcripts to the pre-change tree.
+  - **What still needs a runtime validation pass** (out of scope
+    for this PR; tracked as the OpenCL "phase 1" follow-up in the
+    QVAC ticket):
+      - End-to-end transcription parity on a Qualcomm Adreno device
+        (Pixel 9 Pro / Tensor G4 + Adreno 740-class is the QVAC
+        mobile-pod reference target).
+      - End-to-end transcription parity on an Intel iGPU (e.g. Iris
+        Xe / Arc) host.
+      - `RTF` benchmarks vs the CPU baseline on both targets, to
+        decide whether the OpenCL path warrants any backend-specific
+        graph tweaks similar to the Metal `CONV_2D_DW` fallback
+        already documented in §6.1.
+
 ---
 
 ### 5.18 — Phase 5 follow-up: future CPU-only headroom

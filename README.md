@@ -2,7 +2,7 @@
 
 **Parakeet** (NVIDIA, CC-BY-4.0 FastConformer ASR family) ported to
 [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference on CPU
-and GPU (Metal / CUDA / Vulkan), with no runtime dependency on Python,
+and GPU (Metal / CUDA / Vulkan / OpenCL), with no runtime dependency on Python,
 PyTorch, or onnxruntime. Ships CTC, TDT, EOU, and Sortformer engines
 under one `Engine` umbrella; EOU (FastConformer-RNN-T 120M with native
 `<EOU>` end-of-utterance token) is the most recently shipped engine.
@@ -117,7 +117,7 @@ git clone <this-repo> qvac-parakeet.cpp
 cd qvac-parakeet.cpp
 
 # Clone ggml at the pinned commit. The same pin is used for every
-# backend (CPU, Metal, CUDA, Vulkan); no engine- or backend-specific
+# backend (CPU, Metal, CUDA, Vulkan, OpenCL); no engine- or backend-specific
 # ggml patches are applied today.
 ./scripts/setup-ggml.sh
 
@@ -126,8 +126,9 @@ cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 ```
 
 For a GPU backend pick **one** of Metal (Apple Silicon, **~2.5x faster
-than CPU**), CUDA (NVIDIA), or Vulkan (everything else) at configure
-time. The init order at runtime is `CUDA -> Metal -> Vulkan -> CPU`,
+than CPU**), CUDA (NVIDIA), Vulkan (most cross-platform GPUs), or
+OpenCL (Qualcomm Adreno SoCs and Intel iGPUs) at configure time. The
+init order at runtime is `CUDA -> Metal -> Vulkan -> OpenCL -> CPU`,
 so a single binary built with multiple backends compiled in will use
 the first available one and there is no runtime backend switch -- the
 expectation is one backend per build.
@@ -136,8 +137,9 @@ expectation is one backend per build.
 # Apple Silicon:
 cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
     -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
-# NVIDIA:   -DGGML_CUDA=ON
-# Generic:  -DGGML_VULKAN=ON
+# NVIDIA:                     -DGGML_CUDA=ON
+# Cross-platform GPUs:         -DGGML_VULKAN=ON
+# Adreno SoC / Intel iGPU:     -DGGML_OPENCL=ON
 cmake --build build-metal -j$(sysctl -n hw.ncpu)
 
 # `--n-gpu-layers` is a yes/no toggle today: any value > 0 moves the
@@ -180,8 +182,11 @@ This produces the main binary plus per-stage validation harnesses:
   a sub-project): builds `live-mic` + `live-mic-attributed`.
 - `-DQVAC_PARAKEET_USE_SYSTEM_GGML=ON`: link against an installed
   ggml instead of the pinned clone in `ggml/`.
-- `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON`: pick
-  exactly one GPU backend at configure time (see GPU note above).
+- `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON` /
+  `-DGGML_OPENCL=ON`: pick exactly one GPU backend at configure time
+  (see GPU note above). `OPENCL` is intended primarily for Adreno
+  SoCs and Intel iGPUs; the upstream `ggml-opencl` backend
+  deliberately rejects other GPU vendors at runtime.
 
 ## 2. One-time: convert weights
 
