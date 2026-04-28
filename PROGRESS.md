@@ -2732,3 +2732,127 @@ binary CPU vs GPU runs.
     only; rerun on `parakeet-tdt-1.1b` to populate the
     "RTF (Metal)" column for that row in the README's Supported
     checkpoints table.
+
+## Phase 14 — fused LSTM+joint + persistent decoder state (Metal)
+
+Phase 13 ported the TDT decoder to ggml graphs and shipped on Metal
+with two `compute_graph` dispatches per non-blank emission step
+(joint, then LSTM). Profiling on M3 Ultra showed the dominant cost
+per step is **the Metal command-buffer commit + wait latency, not
+the readback or the kernel work itself**:
+
+```
+[probe] phase 13 decoder = 57.6 ms / 247 dispatches = ~233 us/dispatch
+                                                    ~ commit ~150 us + GPU ~25 us + bookkeeping
+```
+
+Phase 14 collapses the per-non-blank dispatch pair into a single
+fused graph. The LSTM update writes h / c / pred in place into a
+persistent backend buffer via `ggml_cpy`; the joint mat-muls take
+the `pred_cpy` node as their input so gallocr orders the LSTM
+update strictly before the joint reads inside one Metal command
+buffer.
+
+### 14.1 — persistent decoder state
+
+`TdtRuntimeWeights` gains a dedicated `persist_buffer` allocated
+via `ggml_backend_alloc_ctx_tensors` that holds:
+
+  - `h_persist`        : f32[H_pred, L]  (LSTM hidden, layer-major)
+  - `c_persist`        : f32[H_pred, L]  (LSTM cell)
+  - `pred_persist`     : f32[H_pred]     (last-layer h, fed into joint)
+  - `enc_proj_persist` : f32[H_joint, T_max]  (T_max = 4096 frames)
+
+All four stay resident on the backend across the entire decode
+loop. Per-step host upload shrinks from ~5 KB (token + h + c +
+enc_proj_row) to **4 B** (just the frame index or token id);
+`enc_proj` is no longer downloaded after the full-window
+projection — it's `ggml_cpy`'d straight into the persistent slab
+and the joint network reads rows via `ggml_get_rows` on a
+host-supplied frame index.
+
+### 14.2 — three fixed-shape graphs
+
+A `build_lstm_body` helper is shared between two of them so the
+LSTM math stays numerically identical across init and the fused
+hot path:
+
+  1. `g_lstm`       — init-only. Used once per call (`tdt_init_state`)
+                      to seed `pred_persist` after a blank LSTM step.
+  2. `g_joint`      — used after blank emissions (pred unchanged).
+                      Reads `pred_persist`, slices `enc_proj_persist`
+                      via `ggml_get_rows(frame_idx)`, writes logits
+                      to host.
+  3. `g_lstm_joint` — used after non-blank emissions. **Fused**:
+                      LSTM body writes the new pred via `ggml_cpy`,
+                      then the joint mat-muls take that cpy node as
+                      their pred input. One commit instead of two.
+
+The decoder loop tracks `pending_lstm_token`: blank emissions
+clear it and the next iteration uses `g_joint`, non-blank
+emissions defer the LSTM update so the next iteration fuses it
+with the next frame's joint forward via `g_lstm_joint`.
+Streaming windows flush any deferred update at end-of-window.
+
+### 14.3 — bench (Metal, M3 Ultra, sample-16k.wav, 20.1 s, 95 tokens)
+
+3-warmup + 10-timed runs, averaged across 3 invocations:
+
+| Stage          | Phase 13 base | Phase 14 fused | Δ        |
+|----------------|--------------:|---------------:|---------:|
+| mel ms         |        14.4   |          14.6  |  noise   |
+| encoder ms     |        68.5   |          68.6  |  noise   |
+| **decode ms**  |    **57.6**   |      **43.0**  | **−25%** |
+| **inference**  |     **141**   |       **126**  | **−10%** |
+| RTF            |        0.007  |         0.006  |          |
+| realtime mult  |       146×    |        **160×**| **+14×** |
+
+Parity gate: `test-tdt-decoder-parity` PASSes — CPU and graph
+paths emit byte-identical 95-token streams. The fused graph is
+numerically equivalent to the sequential path because:
+
+  1. `ggml_cpy(h_new, h_persist)` writes h_persist's memory in
+     place; subsequent readers of `h_persist` see the new value.
+  2. The joint body uses the `pred_cpy` result tensor (not
+     `pred_persist` directly) so its mat_muls dataflow-depend on
+     the cpy and gallocr emits the LSTM update's barriers first.
+  3. `h_persist` and `c_persist` live in `persist_buffer`, which
+     is a separate backend buffer from gallocr's compute buffer,
+     so gallocr cannot alias them with intermediate `h_new` /
+     `c_new` and there are no read-before-write hazards.
+
+### 14.4 — what didn't work
+
+**Batched-joint over K consecutive frames** *(prototyped, reverted)*
+
+The arithmetic looked promising: 152 single-frame blank-path
+joints could collapse to ~96 K-frame batches (one per non-blank
+cycle, since avg blank-run length ≈ 152 / 95 = 1.6 frames).
+Tested K ∈ {4, 8} on the same sample; both regressed by ~0–1 ms
+back to phase-13-ish numbers:
+
+| Variant   | decode ms (3-run mean) |
+|-----------|-----------------------:|
+| Phase 14  |                  43.0  |
+| K = 4     |                  43.8  |
+| K = 8     |                  43.2  |
+
+Empirical conclusion: **Apple Silicon Metal command-buffer
+commit latency is much lower than the ~150 us I assumed from
+back-of-envelope, probably ~30–50 us in practice**. The 56-commit
+saving from K = 8 (predicted ~8 ms) gets eaten by the larger
+per-batch GPU work (each batch computes joint over K frames
+even though only ~1.6 are consumed before a non-blank). Reverted
+the prototype rather than ship neutral code; phase 14's fused
+LSTM+joint is the local optimum on this hardware.
+
+### 14.5 — remaining work
+
+  - **CUDA / Vulkan validation.** Same plumbing as Phase 13:
+    `g_lstm_joint` and the persistent-state buffer should "just
+    work" on any backend that already supports `ggml_cpy`,
+    `ggml_get_rows`, `ggml_backend_alloc_ctx_tensors`. Worth
+    benchmarking — backends with higher dispatch overhead
+    (CUDA) could see proportionally larger Phase 14 wins.
+  - **TDT 1.1B sweep.** Same caveat as Phase 13; the relative
+    win should hold but absolute numbers shift.
