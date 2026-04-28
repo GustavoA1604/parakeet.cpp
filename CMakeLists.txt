@@ -19,6 +19,22 @@ option(QVAC_PARAKEET_BUILD_EXAMPLES    "qvac-parakeet: build standalone examples
 option(QVAC_PARAKEET_INSTALL           "qvac-parakeet: generate install rules"                                 ON)
 option(QVAC_PARAKEET_USE_SYSTEM_GGML   "qvac-parakeet: use system-installed GGML library"                      OFF)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    if (NOT DEFINED GGML_NATIVE OR GGML_NATIVE)
+        message(STATUS "qvac-parakeet: iOS target detected -- forcing GGML_NATIVE=OFF "
+                       "(ggml's ARM feature try_run() probes cannot execute when cross-compiling). "
+                       "EOU q8_0 precision caveat from the macOS/Linux native build does not apply: "
+                       "iOS prebuilds are per-arch and use the armv8-a baseline.")
+        set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    endif()
+    if (NOT DEFINED GGML_BLAS OR GGML_BLAS)
+        set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+    endif()
+    if (NOT DEFINED GGML_ACCELERATE OR GGML_ACCELERATE)
+        set(GGML_ACCELERATE OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
+
 if (NOT TARGET ggml)
     if (QVAC_PARAKEET_USE_SYSTEM_GGML)
         find_package(ggml CONFIG REQUIRED)
