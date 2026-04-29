@@ -193,6 +193,10 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
 
+    add_executable(test-perf-regression src/test_perf_regression.cpp)
+    target_link_libraries(test-perf-regression PRIVATE qvac-parakeet)
+    target_include_directories(test-perf-regression PRIVATE include src ggml/include)
+
     add_executable(test-tdt-encoder-parity
         src/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp

@@ -581,7 +581,9 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
         const auto t2 = clock::now();
         EncoderOutputs enc_out;
-        if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out); rc != 0) return rc;
+        if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out,
+                                 /*max_layers=*/-1,
+                                 /*capture_intermediates=*/false); rc != 0) return rc;
         times.enc_ms = ms_since(t2);
         times.encoder_frames = enc_out.n_enc_frames;
 
@@ -1050,7 +1052,9 @@ int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result) {
 
     const auto t2 = clock::now();
     EncoderOutputs enc_out;
-    if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out); rc != 0) return rc;
+    if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) return rc;
     const double enc_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                              clock::now() - t2).count() / 1000.0;
 

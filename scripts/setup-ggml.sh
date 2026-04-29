@@ -14,6 +14,12 @@
 #       (NVIDIA, AMD, Apple) so the build can be parity-tested on
 #       commodity desktop hardware. Real Adreno deployments build with
 #       the patch applied as a no-op (Adreno path is unchanged).
+#   patches/ggml-opencl-program-binary-cache.patch
+#       Persistent OpenCL kernel binary cache via clCreateProgramWithBinary +
+#       CL_PROGRAM_BINARIES. Removes seconds of cold-start shader compile on
+#       every Adreno / Mesa / Mali / iGPU launch by serialising compiled kernels
+#       under $GGML_OPENCL_CACHE_DIR (or XDG/HOME fallback). Same shape as the
+#       Vulkan pipeline-cache patch QVAC-17872 landed for chatterbox.cpp.
 #       See patches/README.md for the full rationale.
 
 set -euo pipefail

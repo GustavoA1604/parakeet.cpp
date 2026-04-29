@@ -170,7 +170,9 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     const auto t_enc = clock::now();
     EncoderOutputs enc_out;
     if (int rc = run_encoder(pimpl_->model, mel.data(), n_mel_frames,
-                             pimpl_->model.mel_cfg.n_mels, enc_out); rc != 0) {
+                             pimpl_->model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
         throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -283,7 +285,9 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     const auto t_enc = clock::now();
     EncoderOutputs enc_out;
     if (int rc = run_encoder(pimpl_->model, mel.data(), n_mel_frames,
-                             pimpl_->model.mel_cfg.n_mels, enc_out); rc != 0) {
+                             pimpl_->model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
         throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -466,7 +470,9 @@ static DiarizationResult engine_impl_diarize_helper(Engine::Impl & impl,
     const auto t_enc = clock::now();
     EncoderOutputs enc_out;
     if (int rc = run_encoder(impl.model, mel.data(), n_mel_frames,
-                             impl.model.mel_cfg.n_mels, enc_out); rc != 0) {
+                             impl.model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
         throw std::runtime_error("diarize: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -665,7 +671,9 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
 
     EncoderOutputs enc_out;
     if (int rc = run_encoder(engine_impl->model, mel.data(), n_mel_frames,
-                             engine_impl->model.mel_cfg.n_mels, enc_out); rc != 0) {
+                             engine_impl->model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
         throw std::runtime_error("StreamSession: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }

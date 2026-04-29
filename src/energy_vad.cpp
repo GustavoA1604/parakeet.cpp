@@ -31,6 +31,11 @@ EnergyVad::Transition EnergyVad::process(const float * samples, int n_samples,
     Transition out;
     if (n_samples <= 0) return out;
 
+    // Hot loop -- replaces the per-sample `(pos + 1) % window_n_`
+    // modulo (a divide on non-power-of-2 window sizes) with a branch
+    // that the compiler emits as a `cmov`. Sample-rate * window_ms
+    // is rarely a power of 2 (e.g. 16000 * 30 / 1000 = 480), so the
+    // div was hot under the streaming energy-VAD path.
     for (int i = 0; i < n_samples; ++i) {
         const float s = samples[i];
         const float sq = s * s;
@@ -38,14 +43,13 @@ EnergyVad::Transition EnergyVad::process(const float * samples, int n_samples,
         if (window_fill_ < window_n_) {
             window_sq_[window_pos_] = sq;
             window_sum_sq_ += sq;
-            window_pos_ = (window_pos_ + 1) % window_n_;
             ++window_fill_;
         } else {
             window_sum_sq_ -= window_sq_[window_pos_];
             window_sq_[window_pos_] = sq;
             window_sum_sq_ += sq;
-            window_pos_ = (window_pos_ + 1) % window_n_;
         }
+        if (++window_pos_ >= window_n_) window_pos_ = 0;
 
         ++total_samples_seen_;
 
