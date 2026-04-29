@@ -42,10 +42,36 @@ void print_usage(const char * argv0) {
         "  --threads N          number of CPU threads (0 = hardware_concurrency)\n"
         "  --n-gpu-layers N     when > 0, run the encoder on the compiled-in GPU\n"
         "                       backend (build with -DGGML_METAL=ON / -DGGML_CUDA=ON\n"
-        "                       / -DGGML_VULKAN=ON; only one is active per binary --\n"
-        "                       CUDA wins over Metal wins over Vulkan if multiple are\n"
-        "                       compiled in). N is only checked >0 today: the whole\n"
-        "                       encoder moves; partial layer offload is not implemented.\n"
+        "                       / -DGGML_VULKAN=ON / -DGGML_OPENCL=ON; only one is\n"
+        "                       active per binary -- CUDA wins over Metal wins over\n"
+        "                       Vulkan wins over OpenCL if multiple are compiled in.\n"
+        "                       N is only checked >0 today: the whole encoder moves;\n"
+        "                       partial layer offload is not implemented.\n"
+        "                       OpenCL note: ggml-opencl is tuned for Adreno (Android);\n"
+        "                       on commodity desktop GPUs build with\n"
+        "                       -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF (the qvac-parakeet\n"
+        "                       patch under patches/ relaxes the upstream Adreno-only\n"
+        "                       device whitelist for dev/CI parity testing). Production\n"
+        "                       Adreno deployments leave both at their defaults.\n"
+        "  --opencl-cache-dir DIR             persistent OpenCL kernel binary cache directory\n"
+        "                                     (sets $GGML_OPENCL_CACHE_DIR; consumed by\n"
+        "                                     patches/ggml-opencl-program-binary-cache.patch).\n"
+        "                                     Empty string disables the cache; default\n"
+        "                                     resolves to $XDG_CACHE_HOME/ggml/opencl\n"
+        "                                     -> $HOME/.cache/ggml/opencl.\n"
+        "  --opencl-platform NAME_OR_INDEX    select OpenCL platform (sets $GGML_OPENCL_PLATFORM).\n"
+        "                                     Useful when several ICDs are loaded e.g.\n"
+        "                                     'NVIDIA CUDA' alongside 'rusticl'/'PoCL'.\n"
+        "  --opencl-device NAME_OR_INDEX      select OpenCL device (sets $GGML_OPENCL_DEVICE).\n"
+        "  --opencl-disable-fusion            sets $GGML_OPENCL_DISABLE_FUSION=1; disables\n"
+        "                                     the NORM/GROUP_NORM + MUL + ADD fusion that\n"
+        "                                     ggml-opencl auto-detects. Useful for A/B-ing\n"
+        "                                     fusion impact on first-Adreno bring-up.\n"
+        "  --opencl-adreno-use-large-buffer   sets $GGML_OPENCL_ADRENO_USE_LARGE_BUFFER=1;\n"
+        "                                     Adreno-only knob to allow >256 MB single\n"
+        "                                     allocations when cl_qcom_large_buffer is\n"
+        "                                     exposed by the driver. Required for 0.6B+\n"
+        "                                     Q8_0 GGUFs on Adreno per FINDINGS \u00a75.3.\n"
         "  --verbose            print per-stage wall times and shapes to stderr\n"
         "\n"
         "  --stream             enable streaming. Without --stream-duplex this is Mode 2:\n"
@@ -214,7 +240,44 @@ struct ExtraCliOpts {
     std::string diarization_model_path;
     int         attributed_min_segment_ms = 200;
     int         attributed_pad_segment_ms = 0;
+
+    // QVAC-17997 round-3: surface ggml-opencl's runtime knobs through the
+    // CLI so bench scripts can A/B them without `env VAR=… ./binary`. All
+    // four are read by ggml-opencl via getenv() and (for the cache dir)
+    // by `patches/ggml-opencl-program-binary-cache.patch`. Applied via
+    // `setenv()` BEFORE any qvac_parakeet API call so the backend init
+    // cascade picks them up. Empty string for any field => leave the
+    // existing process-env value untouched (do not setenv).
+    std::string opencl_cache_dir;
+    std::string opencl_platform;     // GGML_OPENCL_PLATFORM
+    std::string opencl_device;       // GGML_OPENCL_DEVICE
+    bool        opencl_disable_fusion = false; // GGML_OPENCL_DISABLE_FUSION=1
+    bool        opencl_adreno_use_large_buffer = false; // GGML_OPENCL_ADRENO_USE_LARGE_BUFFER=1
 };
+
+// Apply OpenCL runtime overrides from the CLI to the process env.
+// Must run BEFORE the first ggml-opencl backend init (i.e. before
+// load_from_gguf / Engine ctor) so the backend reads our settings.
+// Empty / false fields are no-ops -- leave any pre-existing
+// $GGML_OPENCL_* env value alone so a wrapper script's settings
+// still take precedence over the CLI-default-empty fields.
+void apply_opencl_cli_env(const ExtraCliOpts & e) {
+    if (!e.opencl_cache_dir.empty()) {
+        setenv("GGML_OPENCL_CACHE_DIR", e.opencl_cache_dir.c_str(), /*overwrite=*/1);
+    }
+    if (!e.opencl_platform.empty()) {
+        setenv("GGML_OPENCL_PLATFORM", e.opencl_platform.c_str(), 1);
+    }
+    if (!e.opencl_device.empty()) {
+        setenv("GGML_OPENCL_DEVICE", e.opencl_device.c_str(), 1);
+    }
+    if (e.opencl_disable_fusion) {
+        setenv("GGML_OPENCL_DISABLE_FUSION", "1", 1);
+    }
+    if (e.opencl_adreno_use_large_buffer) {
+        setenv("GGML_OPENCL_ADRENO_USE_LARGE_BUFFER", "1", 1);
+    }
+}
 
 double ms_since(std::chrono::steady_clock::time_point a) {
     using namespace std::chrono;
@@ -277,6 +340,16 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             opts.n_threads = std::atoi(argv[++i]);
         } else if (a == "--n-gpu-layers" && i + 1 < argc) {
             opts.n_gpu_layers = std::atoi(argv[++i]);
+        } else if (a == "--opencl-cache-dir" && i + 1 < argc) {
+            extra.opencl_cache_dir = argv[++i];
+        } else if (a == "--opencl-platform" && i + 1 < argc) {
+            extra.opencl_platform = argv[++i];
+        } else if (a == "--opencl-device" && i + 1 < argc) {
+            extra.opencl_device = argv[++i];
+        } else if (a == "--opencl-disable-fusion") {
+            extra.opencl_disable_fusion = true;
+        } else if (a == "--opencl-adreno-use-large-buffer") {
+            extra.opencl_adreno_use_large_buffer = true;
         } else if (a == "--verbose" || a == "-v") {
             opts.verbose = true;
         } else if (a == "--dump-mel" && i + 1 < argc) {
@@ -351,6 +424,12 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
     using namespace qvac_parakeet;
     using clock = std::chrono::steady_clock;
+
+    // Apply CLI -> $GGML_OPENCL_* env overrides before any backend init
+    // so the `init_gpu_backend()` cascade reads our settings. No-op
+    // when the binary was built without -DGGML_OPENCL=ON (the env vars
+    // just aren't read by anything).
+    apply_opencl_cli_env(extra);
 
     const auto t_load = clock::now();
     ParakeetCtcModel model;
@@ -574,7 +653,9 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
         const auto t2 = clock::now();
         EncoderOutputs enc_out;
-        if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out); rc != 0) return rc;
+        if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out,
+                                 /*max_layers=*/-1,
+                                 /*capture_intermediates=*/false); rc != 0) return rc;
         times.enc_ms = ms_since(t2);
         times.encoder_frames = enc_out.n_enc_frames;
 
@@ -1043,7 +1124,9 @@ int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result) {
 
     const auto t2 = clock::now();
     EncoderOutputs enc_out;
-    if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out); rc != 0) return rc;
+    if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) return rc;
     const double enc_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                              clock::now() - t2).count() / 1000.0;
 

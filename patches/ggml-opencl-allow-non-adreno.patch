@@ -1,0 +1,57 @@
+diff --git a/src/ggml-opencl/ggml-opencl.cpp b/src/ggml-opencl/ggml-opencl.cpp
+index 6f3fc588..84bce8b4 100644
+--- a/src/ggml-opencl/ggml-opencl.cpp
++++ b/src/ggml-opencl/ggml-opencl.cpp
+@@ -3020,9 +3020,23 @@ static ggml_backend_opencl_context * ggml_cl2_init(ggml_backend_dev_t dev) {
+     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
+         backend_ctx->gpu_family = GPU_FAMILY::INTEL;
+     } else {
+-        GGML_LOG_ERROR("Unsupported GPU: %s\n", dev_ctx->device_name.c_str());
++        // qvac-parakeet patch: upstream ggml-opencl is hard-coded to reject any
++        // GPU that is not Adreno/Qualcomm or Intel. Parakeet's real OpenCL
++        // deployment target is Adreno (Android), but we want to be able to
++        // bring up + parity-test the wire-up on commodity desktop hardware
++        // (NVIDIA, AMD, Apple). Allow the device through with the generic
++        // GPU_FAMILY::UNKNOWN family; downstream code already gates every
++        // Adreno-specific path on `gpu_family == ADRENO`, and the build-time
++        // GGML_OPENCL_USE_ADRENO_KERNELS guard below prevents shipping the
++        // shuffle kernels on top of generic devices. This makes
++        // -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF the supported build flag for
++        // non-Adreno targets; with that flag still ON (the default) we
++        // refuse the device so the user gets a clear actionable error.
++        GGML_LOG_WARN("ggml_opencl: GPU '%s' is not Adreno/Qualcomm or Intel; "
++                      "running with generic OpenCL kernels (qvac-parakeet patch). "
++                      "Adreno-specific kernels and large-buffer paths stay off.\n",
++                      dev_ctx->device_name.c_str());
+         backend_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
+-        return nullptr;
+     }
+ 
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+@@ -4075,8 +4089,25 @@ static ggml_backend_i ggml_backend_opencl_i = {
+ };
+ 
+ ggml_backend_t ggml_backend_opencl_init(void) {
+-    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_opencl_reg(), 0);
++    // qvac-parakeet patch: bail out cleanly when the OpenCL backend
++    // discovery saw zero usable devices. Upstream calls
++    // ggml_backend_reg_dev_get() unconditionally, which asserts on an
++    // empty device list. Parakeet's host code expects a nullable result
++    // from ggml_backend_opencl_init() (it falls back to CPU when the
++    // returned backend is null); the assertion makes that fallback path
++    // unreachable on hosts where ggml-opencl can't find any GPU it
++    // accepts (Adreno-only environments without an Adreno device,
++    // headless CI runners, etc.).
++    ggml_backend_reg_t reg = ggml_backend_opencl_reg();
++    if (ggml_backend_reg_dev_count(reg) == 0) {
++        return nullptr;
++    }
++
++    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, 0);
+     ggml_backend_opencl_context *backend_ctx = ggml_cl2_init(dev);
++    if (backend_ctx == nullptr) {
++        return nullptr;
++    }
+ 
+     ggml_backend_t backend = new ggml_backend {
+         /* .guid    = */ ggml_backend_opencl_guid(),

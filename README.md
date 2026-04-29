@@ -126,11 +126,16 @@ cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 ```
 
 For a GPU backend pick **one** of Metal (Apple Silicon, **~2.5x faster
-than CPU**), CUDA (NVIDIA), or Vulkan (everything else) at configure
-time. The init order at runtime is `CUDA -> Metal -> Vulkan -> CPU`,
-so a single binary built with multiple backends compiled in will use
-the first available one and there is no runtime backend switch -- the
-expectation is one backend per build.
+than CPU**), CUDA (NVIDIA), Vulkan (most other desktops), or OpenCL
+(Android Adreno target) at configure time. The init order at runtime
+is `CUDA -> Metal -> Vulkan -> OpenCL -> CPU`, so a single binary
+built with multiple backends compiled in will use the first available
+one and there is no runtime backend switch -- the expectation is one
+backend per build. The `OpenCL` slot is the most recently shipped
+backend (QVAC-17997) and is primarily for **Android Adreno**
+deployments (Snapdragon 7+ / 8 series); see [`patches/README.md`](patches/README.md)
+for the small ggml-opencl patch parakeet ships and how it relates to
+the Adreno-only upstream design.
 
 ```bash
 # Apple Silicon:
@@ -138,6 +143,13 @@ cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
     -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
 # NVIDIA:   -DGGML_CUDA=ON
 # Generic:  -DGGML_VULKAN=ON
+# Android Adreno production build (cross-compile via NDK; OpenCL ICD
+# loader and headers come from the Android NDK / Snapdragon toolchain):
+#           -DGGML_OPENCL=ON
+# OpenCL on a non-Adreno desktop (NVIDIA / AMD / Apple iGPU) for dev /
+# CI parity testing only -- Adreno-tuned matmul kernels off, generic
+# OpenCL paths only:
+#           -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF
 cmake --build build-metal -j$(sysctl -n hw.ncpu)
 
 # `--n-gpu-layers` is a yes/no toggle today: any value > 0 moves the
@@ -180,8 +192,13 @@ This produces the main binary plus per-stage validation harnesses:
   a sub-project): builds `live-mic` + `live-mic-attributed`.
 - `-DQVAC_PARAKEET_USE_SYSTEM_GGML=ON`: link against an installed
   ggml instead of the pinned clone in `ggml/`.
-- `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON`: pick
-  exactly one GPU backend at configure time (see GPU note above).
+- `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON` /
+  `-DGGML_OPENCL=ON`: pick exactly one GPU backend at configure time
+  (see GPU note above). For OpenCL on non-Adreno hardware also pass
+  `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF` and ensure
+  `scripts/setup-ggml.sh` has applied
+  `patches/ggml-opencl-allow-non-adreno.patch` -- both are no-ops
+  on real Adreno builds.
 
 ## 2. One-time: convert weights
 

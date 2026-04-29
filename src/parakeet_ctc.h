@@ -332,12 +332,26 @@ struct EncoderOutputs {
     int vocab_size   = 0;
 };
 
+// `capture_intermediates`: when true (default, kept for backward compat with
+// the per-stage parity harnesses such as `test-encoder` /
+// `test-tdt-encoder-parity` / `test-sortformer-parity`), every per-stage
+// capture tensor (subsampling_out, block_0_post_*, block_0_out,
+// block_last_out) is copied back to `out`. When false, only `encoder_out`
+// and (CTC GGUFs only) `logits` are copied -- the production path
+// (`Engine::transcribe()`, `StreamSession::process_window()`,
+// `Engine::diarize()` etc.) doesn't need the intermediates and pays a
+// 5+ MB host-copy round-trip per inference today, which is real
+// per-call cost on GPU/OpenCL backends and negligible-but-noisy on
+// CPU. The graph topology is unchanged either way -- only the
+// host-copy step is gated, so this is safe regardless of backend
+// scheduling.
 int run_encoder(ParakeetCtcModel   & model,
                 const float        * mel,
                 int                  n_mel_frames,
                 int                  n_mels,
                 EncoderOutputs     & out,
-                int                  max_layers = -1);
+                int                  max_layers = -1,
+                bool                 capture_intermediates = true);
 
 std::vector<int32_t> ctc_greedy_decode(const float * logits,
                                        int           n_frames,
