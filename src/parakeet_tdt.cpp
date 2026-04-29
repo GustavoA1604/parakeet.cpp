@@ -339,30 +339,52 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
 // count. Result is ggml_cpy'd straight into rt.enc_proj_persist[:T] so
 // per-step joint reads can ggml_get_rows on the persistent buffer
 // without any host roundtrip.
+//
+// Each call allocates its OWN ggml_context (`g.ctx`) sized for the
+// ~32 graph nodes this builder produces.  Previous design parented
+// these on `rt.gctx`, and the LRU eviction below freed only the
+// gallocr — which leaked ~32 gctx slots per evicted entry.  Owning
+// the metadata locally and freeing it at eviction keeps streaming
+// callers (Mode 3 with varying right-lookahead-ms → many distinct
+// T_enc) bounded by the LRU cap regardless of distinct-T churn.
 TdtRuntimeWeights::EncProjGraph build_enc_proj_graph(TdtRuntimeWeights & rt, int T) {
     TdtRuntimeWeights::EncProjGraph g{};
     g.T = T;
 
     const int H_joint = rt.H_joint;
     const int D_enc   = rt.D_enc;
-    ggml_context * gctx = rt.gctx;
 
-    g.enc_in = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, D_enc, T);
+    // ~32 graph slots is enough for: 1 input tensor + 1 mul_mat + 1 add +
+    // 1 view + 1 cpy + scratch ≈ 6 nodes.  Round up to 64 for headroom.
+    const size_t graph_slots = 64;
+    const size_t local_overhead = ggml_tensor_overhead() * graph_slots
+                                + ggml_graph_overhead_custom(graph_slots, false);
+    ggml_init_params local_p = {};
+    local_p.mem_size   = local_overhead;
+    local_p.mem_buffer = nullptr;
+    local_p.no_alloc   = true;
+    g.ctx = ggml_init(local_p);
+    if (!g.ctx) {
+        std::fprintf(stderr, "tdt: enc_proj ggml_init failed for T=%d\n", T);
+        return g;
+    }
+
+    g.enc_in = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, D_enc, T);
     ggml_set_name(g.enc_in, "enc_proj.enc_in");
     ggml_set_input(g.enc_in);
 
-    ggml_tensor * proj = ggml_mul_mat(gctx, rt.weights->joint_enc_w, g.enc_in);
-    proj = ggml_add(gctx, proj, rt.weights->joint_enc_b);
+    ggml_tensor * proj = ggml_mul_mat(g.ctx, rt.weights->joint_enc_w, g.enc_in);
+    proj = ggml_add(g.ctx, proj, rt.weights->joint_enc_b);
 
-    ggml_tensor * dst_view = ggml_view_2d(gctx, rt.enc_proj_persist,
+    ggml_tensor * dst_view = ggml_view_2d(g.ctx, rt.enc_proj_persist,
                                            H_joint, T,
                                            (size_t) H_joint * sizeof(float),
                                            0);
-    g.out = ggml_cpy(gctx, proj, dst_view);
+    g.out = ggml_cpy(g.ctx, proj, dst_view);
     ggml_set_name(g.out, "enc_proj.out_persist");
     ggml_set_output(g.out);
 
-    g.cg = ggml_new_graph_custom(gctx, /*size*/ 32, /*grads*/ false);
+    g.cg = ggml_new_graph_custom(g.ctx, /*size*/ 32, /*grads*/ false);
     ggml_build_forward_expand(g.cg, g.out);
 
     g.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rt.backend));
@@ -370,9 +392,19 @@ TdtRuntimeWeights::EncProjGraph build_enc_proj_graph(TdtRuntimeWeights & rt, int
         std::fprintf(stderr, "tdt: failed to allocate enc_proj graph for T=%d\n", T);
         if (g.alloc) ggml_gallocr_free(g.alloc);
         g.alloc = nullptr;
+        ggml_free(g.ctx);
+        g.ctx = nullptr;
     }
 
     return g;
+}
+
+void free_enc_proj_graph(TdtRuntimeWeights::EncProjGraph & g) {
+    if (g.alloc) { ggml_gallocr_free(g.alloc); g.alloc = nullptr; }
+    if (g.ctx)   { ggml_free(g.ctx);           g.ctx   = nullptr; }
+    g.cg = nullptr;
+    g.enc_in = nullptr;
+    g.out = nullptr;
 }
 
 const TdtRuntimeWeights::EncProjGraph * get_enc_proj_graph(TdtRuntimeWeights & rt, int T) {
@@ -380,9 +412,9 @@ const TdtRuntimeWeights::EncProjGraph * get_enc_proj_graph(TdtRuntimeWeights & r
         if (g.T == T) return &g;
     }
     if (rt.enc_proj_cache.size() >= TdtRuntimeWeights::k_enc_proj_cache_max) {
-        // Evict the oldest cached entry.
-        auto & victim = rt.enc_proj_cache.front();
-        if (victim.alloc) ggml_gallocr_free(victim.alloc);
+        // LRU evict: free both the gallocr's backend buffer AND the
+        // local ggml_context that owns the cgraph + tensor metadata.
+        free_enc_proj_graph(rt.enc_proj_cache.front());
         rt.enc_proj_cache.erase(rt.enc_proj_cache.begin());
     }
     rt.enc_proj_cache.push_back(build_enc_proj_graph(rt, T));
@@ -453,7 +485,7 @@ TdtRuntimeWeights & TdtRuntimeWeights::operator=(TdtRuntimeWeights && o) noexcep
 
 TdtRuntimeWeights::~TdtRuntimeWeights() {
     for (auto & g : enc_proj_cache) {
-        if (g.alloc) ggml_gallocr_free(g.alloc);
+        free_enc_proj_graph(g);
     }
     enc_proj_cache.clear();
     if (alloc_lstm_joint) { ggml_gallocr_free(alloc_lstm_joint); alloc_lstm_joint = nullptr; }

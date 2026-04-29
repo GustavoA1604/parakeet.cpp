@@ -135,6 +135,17 @@ struct TdtRuntimeWeights {
     ggml_tensor *  lj_logits_out      = nullptr;  // f32[V_out]
 
     struct EncProjGraph {
+        // Each cached graph owns its own ggml_context for the cgraph + tensor
+        // metadata.  Previous design parented these on `gctx` (the long-lived
+        // runtime context), and the LRU eviction below freed only the gallocr
+        // — which leaks ~32 graph slots from gctx per evicted entry.  Mode 1
+        // (single T_enc per call) hits this once and is fine; Mode 3 streaming
+        // with varying right-lookahead-ms can chew through the gctx slot pool
+        // and silently fail-to-allocate after ~30 distinct T_enc values.
+        // Owning the metadata locally and freeing it at eviction keeps Mode 3
+        // bounded by the LRU cap regardless of how many distinct T_enc values
+        // a session sees.
+        ggml_context * ctx    = nullptr;
         ggml_cgraph *  cg     = nullptr;
         ggml_gallocr_t alloc  = nullptr;
         ggml_tensor *  enc_in = nullptr;
