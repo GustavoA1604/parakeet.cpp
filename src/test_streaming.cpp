@@ -281,6 +281,49 @@ int main(int argc, char ** argv) {
                 "[test-streaming] PASS Mode 3 cancel: cancelled after %d callback(s)\n", callbacks);
         }
 
+        // Phase 13 -- opt-in energy-VAD on CTC/TDT. Default is off; flip
+        // it on, feed the wav, assert at least one Speaking transition.
+        {
+            StreamingOptions sopts;
+            sopts.sample_rate        = 16000;
+            sopts.chunk_ms           = 2000;
+            sopts.left_context_ms    = 2000;
+            sopts.right_lookahead_ms = 1000;
+            sopts.enable_energy_vad  = true;
+            int n_vad_events      = 0;
+            int n_speaking_events = 0;
+            sopts.on_event = [&](const StreamEvent & ev) {
+                if (ev.type == StreamEventType::VadStateChanged) {
+                    ++n_vad_events;
+                    if (ev.vad_state == VadState::Speaking) ++n_speaking_events;
+                }
+            };
+            auto sess = engine.stream_start(sopts,
+                [&](const StreamingSegment &) { });
+            unsigned rng = 0xCAFEBABEu;
+            size_t i = 0;
+            while (i < pcm.size()) {
+                rng = rng * 1103515245u + 12345u;
+                size_t burst = 512 + (rng % 3500);
+                if (i + burst > pcm.size()) burst = pcm.size() - i;
+                sess->feed_pcm_f32(pcm.data() + i, (int) burst);
+                i += burst;
+            }
+            sess->finalize();
+            if (n_speaking_events == 0) {
+                std::fprintf(stderr,
+                    "[test-streaming] FAIL energy-VAD: no Speaking events fired on a "
+                    "wav with audible speech (got %d total VadStateChanged events)\n",
+                    n_vad_events);
+                ++failures;
+            } else {
+                std::fprintf(stderr,
+                    "[test-streaming] PASS energy-VAD: %d VadStateChanged events "
+                    "(%d Speaking transitions)\n",
+                    n_vad_events, n_speaking_events);
+            }
+        }
+
     } while (0);
 
     if (failures == 0) {

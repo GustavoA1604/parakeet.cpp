@@ -127,6 +127,17 @@ int main(int argc, char ** argv) {
         std::string mode2_text;
         int seg_count       = 0;
         int eou_boundary_seg = -1;
+        int eou_events       = 0;
+
+        sopts.on_event = [&](const StreamEvent & ev) {
+            if (ev.type == StreamEventType::EndOfTurn) {
+                ++eou_events;
+                if (opts.verbose) {
+                    std::fprintf(stderr, "  [mode2 EVT EndOfTurn] @ %.2fs chunk=%d eot_conf=%.2f\n",
+                                 ev.timestamp_s, ev.chunk_index, ev.eot_confidence);
+                }
+            }
+        };
 
         engine.transcribe_stream(opts.wav_path, sopts,
             [&](const StreamingSegment & s) {
@@ -155,10 +166,17 @@ int main(int argc, char ** argv) {
                                  "no segment had is_eou_boundary=true (jfk.wav should "
                                  "produce a terminal <EOU>)\n", chunk_ms);
             ++failures;
+        } else if (eou_events == 0) {
+            std::fprintf(stderr, "[test-eou-streaming] FAIL Mode 2 chunk_ms=%d: "
+                                 "is_eou_boundary fired on chunk %d but no "
+                                 "StreamEventType::EndOfTurn event was emitted\n",
+                         chunk_ms, eou_boundary_seg);
+            ++failures;
         } else {
             std::fprintf(stderr, "[test-eou-streaming] PASS Mode 2 chunk_ms=%d: "
-                                 "%d segments, EOU on chunk %d, text byte-equal\n",
-                         chunk_ms, seg_count, eou_boundary_seg);
+                                 "%d segments, EOU on chunk %d, %d EndOfTurn event(s), "
+                                 "text byte-equal\n",
+                         chunk_ms, seg_count, eou_boundary_seg, eou_events);
         }
     }
 
@@ -210,10 +228,12 @@ int main(int argc, char ** argv) {
         // Mode 3 rolls the encoder per chunk over a sliding `[left + chunk +
         // right]` window WITHOUT persistent cache state, so the encoder loses
         // the "long-context model state" the EOU head needs to confidently fire
-        // <EOU> at the very end. The transcript still matches; the next slice
-        // (cache-aware streaming encoder) will carry per-layer K/V + conv state
-        // across chunks and recover bit-equal Mode-2 EOU detection. For now we
-        // only assert text parity within the chunk-boundary jitter band.
+        // <EOU> at the very end. The transcript still matches; tail-jitter
+        // tolerance is by design. Driving the streaming-trained EOU weights
+        // through NeMo's chunked-limited cache_aware_stream_step to recover
+        // byte-equal Mode-2 EOU detection was prototyped + rejected on quality
+        // grounds (see PROGRESS.md §8.5 case (A)) -- it produces NeMo's
+        // streaming transcript, not the offline one.
         const auto distance = mode3_text.size() < ref.text.size()
                                   ? ref.text.size() - mode3_text.size()
                                   : mode3_text.size() - ref.text.size();
@@ -229,8 +249,8 @@ int main(int argc, char ** argv) {
         } else {
             std::fprintf(stderr, "[test-eou-streaming] PASS Mode 3 chunk=%dms left=%dms "
                                  "right=%dms: %d segments (text=%zu B vs ref %zu B; "
-                                 "EOU boundary chunk=%d -- approximate without "
-                                 "cache-aware streaming)\n",
+                                 "EOU boundary chunk=%d -- rolling-encoder Mode 3 "
+                                 "is approximate by design; see PROGRESS.md §8.5)\n",
                          chunk_ms, left_ms, right_ms,
                          seg_count, mode3_text.size(), ref.text.size(),
                          eou_boundary_seg);

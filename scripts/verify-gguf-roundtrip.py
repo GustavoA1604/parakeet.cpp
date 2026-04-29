@@ -158,6 +158,43 @@ def build_expected_ctc(sd: dict, n_layers: int):
     return out
 
 
+def build_expected_sortformer(sd: dict, n_layers: int, tf_n_layers: int):
+    out = _build_encoder_expected(sd, n_layers,
+                                  conv_norm_type='batch_norm', use_bias=True)
+    out['sortformer.encoder_proj.weight'] = _np32(sd['sortformer_modules.encoder_proj.weight'])
+    out['sortformer.encoder_proj.bias']   = _np32(sd['sortformer_modules.encoder_proj.bias'])
+
+    for i in range(tf_n_layers):
+        k = f'transformer_encoder.layers.{i}'
+        p = f'sortformer.transformer.blk.{i}'
+
+        out[f'{p}.attn.q.weight']   = _np32(sd[f'{k}.first_sub_layer.query_net.weight'])
+        out[f'{p}.attn.q.bias']     = _np32(sd[f'{k}.first_sub_layer.query_net.bias'])
+        out[f'{p}.attn.k.weight']   = _np32(sd[f'{k}.first_sub_layer.key_net.weight'])
+        out[f'{p}.attn.k.bias']     = _np32(sd[f'{k}.first_sub_layer.key_net.bias'])
+        out[f'{p}.attn.v.weight']   = _np32(sd[f'{k}.first_sub_layer.value_net.weight'])
+        out[f'{p}.attn.v.bias']     = _np32(sd[f'{k}.first_sub_layer.value_net.bias'])
+        out[f'{p}.attn.out.weight'] = _np32(sd[f'{k}.first_sub_layer.out_projection.weight'])
+        out[f'{p}.attn.out.bias']   = _np32(sd[f'{k}.first_sub_layer.out_projection.bias'])
+
+        out[f'{p}.ln1.weight']      = _np32(sd[f'{k}.layer_norm_1.weight'])
+        out[f'{p}.ln1.bias']        = _np32(sd[f'{k}.layer_norm_1.bias'])
+
+        out[f'{p}.ffn.in.weight']   = _np32(sd[f'{k}.second_sub_layer.dense_in.weight'])
+        out[f'{p}.ffn.in.bias']     = _np32(sd[f'{k}.second_sub_layer.dense_in.bias'])
+        out[f'{p}.ffn.out.weight']  = _np32(sd[f'{k}.second_sub_layer.dense_out.weight'])
+        out[f'{p}.ffn.out.bias']    = _np32(sd[f'{k}.second_sub_layer.dense_out.bias'])
+
+        out[f'{p}.ln2.weight']      = _np32(sd[f'{k}.layer_norm_2.weight'])
+        out[f'{p}.ln2.bias']        = _np32(sd[f'{k}.layer_norm_2.bias'])
+
+    out['sortformer.head.first_hidden_to_hidden.weight'] = _np32(sd['sortformer_modules.first_hidden_to_hidden.weight'])
+    out['sortformer.head.first_hidden_to_hidden.bias']   = _np32(sd['sortformer_modules.first_hidden_to_hidden.bias'])
+    out['sortformer.head.single_hidden_to_spks.weight']  = _np32(sd['sortformer_modules.single_hidden_to_spks.weight'])
+    out['sortformer.head.single_hidden_to_spks.bias']    = _np32(sd['sortformer_modules.single_hidden_to_spks.bias'])
+    return out
+
+
 def build_expected_eou(sd: dict, n_layers: int):
     out = _build_encoder_expected(sd, n_layers,
                                   conv_norm_type='layer_norm', use_bias=False)
@@ -202,10 +239,13 @@ def main():
 
     arch = None
     n_layers = 0
+    tf_n_layers = 0
     model_type = "ctc"
     for field in reader.fields.values():
         if field.name == "general.architecture":
             arch = bytes(field.parts[field.data[0]]).decode()
+        elif field.name == "parakeet.sortformer.tf_n_layers":
+            tf_n_layers = int(field.parts[field.data[0]][0])
         elif field.name == "parakeet.encoder.n_layers":
             n_layers = int(field.parts[field.data[0]][0])
         elif field.name == "parakeet.model.type":
@@ -219,6 +259,12 @@ def main():
         expected = build_expected_eou(sd, n_layers)
     elif model_type == "ctc":
         expected = build_expected_ctc(sd, n_layers)
+    elif model_type == "sortformer":
+        if tf_n_layers <= 0:
+            print(f"[verify] sortformer GGUF missing parakeet.sortformer.tf_n_layers metadata",
+                  file=sys.stderr)
+            return 3
+        expected = build_expected_sortformer(sd, n_layers, tf_n_layers)
     else:
         print(f"[verify] no expected-tensor map implemented for type {model_type!r}",
               file=sys.stderr)

@@ -4,7 +4,9 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
+#endif
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -77,7 +79,9 @@ struct ParakeetCtcModel::Impl {
     gguf_context         * gguf           = nullptr;
     ggml_context         * ctx            = nullptr;
     ggml_backend_t         backend_cpu    = nullptr;
+#ifdef GGML_USE_BLAS
     ggml_backend_t         backend_blas   = nullptr;
+#endif
     ggml_backend_t         backend_gpu    = nullptr;
     ggml_backend_t         backend_active = nullptr;
     ggml_backend_buffer_t  weights_buffer = nullptr;
@@ -92,7 +96,9 @@ struct ParakeetCtcModel::Impl {
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         if (ctx)            ggml_free(ctx);
         if (gguf)           gguf_free(gguf);
+#ifdef GGML_USE_BLAS
         if (backend_blas)   ggml_backend_free(backend_blas);
+#endif
         if (backend_gpu)    ggml_backend_free(backend_gpu);
         if (backend_cpu)    ggml_backend_free(backend_cpu);
     }
@@ -206,10 +212,12 @@ int load_from_gguf(const std::string & gguf_path,
     }
     ggml_backend_cpu_set_n_threads(impl->backend_cpu, resolved_threads);
 
+#ifdef GGML_USE_BLAS
     impl->backend_blas = ggml_backend_blas_init();
     if (impl->backend_blas && resolved_threads > 0) {
         ggml_backend_blas_set_n_threads(impl->backend_blas, resolved_threads);
     }
+#endif
 
     impl->backend_gpu    = init_gpu_backend(n_gpu_layers, verbose);
     impl->backend_active = impl->backend_gpu ? impl->backend_gpu : impl->backend_cpu;
@@ -548,10 +556,12 @@ int load_from_gguf(const std::string & gguf_path,
         out_model.tdt.joint_out_b  = require_tensor(impl->ctx, "tdt.joint.out.bias");
     }
 
+#ifdef GGML_USE_BLAS
     if (impl->backend_blas) {
         ggml_backend_free(impl->backend_blas);
         impl->backend_blas = nullptr;
     }
+#endif
 
     out_model.impl = impl;
 
@@ -1154,8 +1164,13 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         const int left  = enc.att_context_left;
         const int right = enc.att_context_right;
         const int chunk = right + 1;
-        g.att_mask_host.assign((size_t) T * T,
-                               -std::numeric_limits<float>::infinity());
+        // Use a large finite "very negative" sentinel rather than -inf:
+        // Apple Clang at -O3 emits `-Wnan-infinity-disabled` because some
+        // FP optimisations treat infinity as UB, which empirically
+        // corrupts the chunked-limited mask on the EOU offline encoder
+        // (CTC / TDT use full attention so they're unaffected). Softmax
+        // with -1e30 saturates to ~0 just like -inf, with no UB risk.
+        g.att_mask_host.assign((size_t) T * T, -1.0e30f);
         for (int i = 0; i < T; ++i) {
             const int c          = i / chunk;
             const int win_start  = c * chunk - left;

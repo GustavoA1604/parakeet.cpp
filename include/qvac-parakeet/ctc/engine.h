@@ -116,6 +116,64 @@ struct EngineResult {
     int encoder_frames   = 0;
 };
 
+// =============================================================================
+//  Phase 13 -- cross-engine VAD / EndOfTurn events (StreamEvent)
+//
+//  Streaming sessions (`StreamSession` for ASR Mode 3, `SortformerStreamSession`
+//  for live diarization) can optionally fire small-shape `StreamEvent` calls
+//  in addition to the per-chunk `StreamingSegment` / `StreamingDiarizationSegment`
+//  callbacks they already emit. Sources, gated on the engine type loaded:
+//
+//    - **EOU** ASR (`parakeet_realtime_eou_120m-v1`): native `<EOU>` token
+//      fires `StreamEventType::EndOfTurn` with `eot_confidence = 1.0`.
+//    - **Sortformer** diarization: per-chunk threshold-crossings of
+//      `max(speaker_probs)` fire `StreamEventType::VadStateChanged`
+//      (Speaking / Silent), with `speaker_id = argmax` when entering Speaking.
+//    - **CTC / TDT** ASR (no native VAD source in the model): opt-in
+//      energy-VAD fallback when `StreamingOptions::enable_energy_vad = true`.
+//
+//  Both `on_segment` (existing) and `on_event` (new) coexist; consumers that
+//  ignore events keep the same behaviour as before. The event API is
+//  intentionally shaped to mirror what whisper.cpp's eventual streaming API
+//  will emit so consumers can write engine-agnostic event handling.
+//
+enum class VadState : int {
+    Unknown  = 0,
+    Speaking = 1,
+    Silent   = 2,
+};
+
+enum class StreamEventType : int {
+    VadStateChanged = 1,
+    EndOfTurn       = 2,
+};
+
+struct StreamEvent {
+    StreamEventType type  = StreamEventType::VadStateChanged;
+
+    // Wall-clock seconds since the streaming session started feeding samples.
+    // For chunk-aligned events this is the chunk's emit-end time; for
+    // sample-level events (energy-VAD transitions) it is the transition
+    // sample boundary in seconds.
+    double timestamp_s = 0.0;
+
+    // Index of the chunk that produced the event, when known. -1 when the
+    // event was synthesised between chunks (e.g. an energy-VAD silence
+    // transition during long quiet inputs).
+    int    chunk_index = -1;
+
+    // VadStateChanged fields
+    VadState vad_state  = VadState::Unknown;
+    int      speaker_id = -1;     // argmax speaker on entering Speaking; -1 otherwise
+    float    vad_score  = 0.0f;   // 0..1; provenance-specific (max speaker prob, RMS, ...)
+
+    // EndOfTurn fields
+    float    eot_confidence    = 0.0f;  // 0..1; for EOU = 1.0 when `<EOU>` fired
+    int      speaker_id_at_turn = -1;
+};
+
+using StreamEventCallback = std::function<void(const StreamEvent &)>;
+
 struct StreamingOptions {
     int sample_rate  = 16000;
     int chunk_ms     = 1000;
@@ -124,6 +182,27 @@ struct StreamingOptions {
     int right_lookahead_ms = 2000;
 
     bool emit_partials = false;
+
+    // Phase 13 -- per-event callback (independent of `on_segment`).
+    // Defaults to `nullptr` (no events emitted; back-compat with existing
+    // consumers).
+    StreamEventCallback on_event = nullptr;
+
+    // Energy-VAD fallback. When true, CTC / TDT sessions will compute a
+    // simple RMS-thresholded VAD over the input PCM and fire
+    // `StreamEventType::VadStateChanged` events on transitions. Always-on
+    // for sessions whose underlying engine (EOU, Sortformer) has its own
+    // native VAD source -- those engines' events take priority. Default
+    // off; opt-in for CTC/TDT consumers that want VadState events.
+    bool  enable_energy_vad = false;
+
+    // Energy-VAD knobs (dB-scale; applies only when enable_energy_vad).
+    // Defaults are tuned for clean 16 kHz mono speech: speech enters above
+    // -35 dBFS RMS over a 30 ms window, falls back to silent after 200 ms
+    // of below-threshold audio.
+    float energy_vad_threshold_db = -35.0f;
+    int   energy_vad_window_ms    = 30;
+    int   energy_vad_hangover_ms  = 200;
 };
 
 struct DiarizationOptions {
@@ -164,6 +243,13 @@ struct SortformerStreamingOptions {
     int   min_segment_ms  = 200;
 
     bool  emit_partials   = true;
+
+    // Phase 13 -- per-event callback (independent of `on_segment`).
+    // Sortformer fires `StreamEventType::VadStateChanged` events at
+    // chunk granularity using `max(speaker_probs) > threshold` as the
+    // VAD signal, and reports the dominant speaker_id on entering
+    // Speaking. Defaults to `nullptr` (back-compat).
+    StreamEventCallback on_event = nullptr;
 };
 
 using SortformerSegmentCallback =

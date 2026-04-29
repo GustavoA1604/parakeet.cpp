@@ -6,6 +6,7 @@
 #include "parakeet_sortformer.h"
 #include "mel_preprocess.h"
 #include "sentencepiece_bpe.h"
+#include "energy_vad.h"
 
 #include <atomic>
 #include <chrono>
@@ -370,18 +371,32 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
 
         const double win_decode_ms = ms_since(t_win);
 
+        const double seg_end_s = static_cast<double>(end) * frame_stride_ms / 1000.0;
         if (on_segment) {
             StreamingSegment seg;
             seg.text        = win_text;
             seg.token_ids   = win_tokens;
             seg.start_s     = static_cast<double>(start) * frame_stride_ms / 1000.0;
-            seg.end_s       = static_cast<double>(end)   * frame_stride_ms / 1000.0;
+            seg.end_s       = seg_end_s;
             seg.chunk_index = chunk_index;
             seg.is_final    = true;
             seg.is_eou_boundary = eou_boundaries_in_chunk > 0;
             seg.encoder_ms  = first_segment ? encoder_ms : 0.0;
             seg.decode_ms   = win_decode_ms;
             on_segment(seg);
+        }
+
+        // Phase 13: EOU sessions also emit `EndOfTurn` events out of
+        // Mode 2, mirroring the Mode 3 wiring in `process_window`.
+        if (opts.on_event && eou_boundaries_in_chunk > 0) {
+            StreamEvent ev;
+            ev.type           = StreamEventType::EndOfTurn;
+            ev.timestamp_s    = seg_end_s;
+            ev.chunk_index    = chunk_index;
+            ev.eot_confidence = 1.0f;
+            for (int i = 0; i < eou_boundaries_in_chunk; ++i) {
+                opts.on_event(ev);
+            }
         }
 
         ++chunk_index;
@@ -616,6 +631,11 @@ struct StreamSession::Impl {
     bool finalized = false;
     bool cancelled = false;
 
+    // Phase 13 -- energy-VAD fallback for CTC/TDT (only constructed if
+    // opts.enable_energy_vad and the engine has no native VAD source).
+    std::unique_ptr<EnergyVad> energy_vad;
+    int64_t total_pcm_seen = 0;
+
     void process_window(const float * window_samples, int window_n,
                         int center_start_sample,
                         int center_end_sample,
@@ -724,19 +744,37 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
 
     const double decode_ms = ms_since(t_dec);
 
+    const double chunk_start_s = static_cast<double>(emitted_samples) / sr;
+    const double chunk_end_s   = static_cast<double>(emitted_samples +
+                                                     (center_end_sample - center_start_sample)) / sr;
     if (on_segment) {
         StreamingSegment seg;
         seg.text        = win_text;
         seg.token_ids   = win_tokens;
-        seg.start_s     = static_cast<double>(emitted_samples) / sr;
-        seg.end_s       = static_cast<double>(emitted_samples +
-                                              (center_end_sample - center_start_sample)) / sr;
+        seg.start_s     = chunk_start_s;
+        seg.end_s       = chunk_end_s;
         seg.chunk_index = chunk_index;
         seg.is_final    = true;
         seg.is_eou_boundary = eou_boundaries_in_chunk > 0;
         seg.encoder_ms  = encoder_ms;
         seg.decode_ms   = decode_ms;
         on_segment(seg);
+    }
+
+    // Phase 13: fire `EndOfTurn` event(s) for EOU sessions when the
+    // decoder emitted at least one `<EOU>` token in this chunk. Confidence
+    // is fixed at 1.0 because the model emitted the boundary token (a
+    // discrete signal); future engines (e.g. whisper.cpp's NER-style
+    // turn-detection heuristic) will populate a real 0..1 confidence.
+    if (opts.on_event && eou_boundaries_in_chunk > 0) {
+        StreamEvent ev;
+        ev.type           = StreamEventType::EndOfTurn;
+        ev.timestamp_s    = chunk_end_s;
+        ev.chunk_index    = chunk_index;
+        ev.eot_confidence = 1.0f;
+        for (int i = 0; i < eou_boundaries_in_chunk; ++i) {
+            opts.on_event(ev);
+        }
     }
 
     emitted_samples += (center_end_sample - center_start_sample);
@@ -804,6 +842,26 @@ const StreamingOptions & StreamSession::options() const {
     return pimpl_->opts;
 }
 
+// Phase 13 helper: feed `n_samples` of f32 PCM into the energy-VAD (if any)
+// and fire a single `VadStateChanged` event when its state transitions.
+// `start_sample` is the absolute sample index where these samples begin.
+static void stream_drive_energy_vad(StreamSession::Impl & impl,
+                                    const float * samples, int n_samples,
+                                    int64_t start_sample) {
+    if (!impl.energy_vad || !impl.opts.on_event) return;
+    EnergyVad::Transition tr = impl.energy_vad->process(samples, n_samples,
+                                                        start_sample);
+    if (tr.to_state == EnergyVad::State::Unknown) return;
+    StreamEvent ev;
+    ev.type        = StreamEventType::VadStateChanged;
+    ev.timestamp_s = (double) tr.at_sample / (double) impl.opts.sample_rate;
+    ev.chunk_index = -1;
+    ev.vad_state   = (tr.to_state == EnergyVad::State::Speaking)
+                         ? VadState::Speaking : VadState::Silent;
+    ev.vad_score   = tr.rms;
+    impl.opts.on_event(ev);
+}
+
 void StreamSession::feed_pcm_f32(const float * samples, int n_samples) {
     if (!pimpl_) throw std::runtime_error("StreamSession: moved-from session");
     if (pimpl_->finalized) {
@@ -811,6 +869,9 @@ void StreamSession::feed_pcm_f32(const float * samples, int n_samples) {
     }
     if (pimpl_->cancelled) return;
     if (!samples || n_samples <= 0) return;
+    stream_drive_energy_vad(*pimpl_, samples, n_samples,
+                            pimpl_->total_pcm_seen);
+    pimpl_->total_pcm_seen += n_samples;
     pimpl_->pending.insert(pimpl_->pending.end(), samples, samples + n_samples);
     pimpl_->try_emit_chunks();
 }
@@ -828,6 +889,9 @@ void StreamSession::feed_pcm_i16(const int16_t * samples, int n_samples) {
     for (int i = 0; i < n_samples; ++i) {
         pimpl_->pending[prev + i] = static_cast<float>(samples[i]) * inv;
     }
+    stream_drive_energy_vad(*pimpl_, pimpl_->pending.data() + prev, n_samples,
+                            pimpl_->total_pcm_seen);
+    pimpl_->total_pcm_seen += n_samples;
     pimpl_->try_emit_chunks();
 }
 
@@ -879,6 +943,18 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     if (pimpl_->model.model_type == ParakeetModelType::TDT) {
         tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, impl->tdt_state);
     }
+    // Phase 13: spin up the energy-VAD only for engines without a native
+    // VAD source (CTC and TDT). EOU's `<EOU>` token already drives
+    // `OnEndOfTurn` directly out of `process_window`; Sortformer is
+    // handled by SortformerStreamSession, not StreamSession.
+    if (opts.enable_energy_vad &&
+        pimpl_->model.model_type != ParakeetModelType::EOU) {
+        impl->energy_vad = std::make_unique<EnergyVad>(
+            sr,
+            opts.energy_vad_window_ms,
+            opts.energy_vad_hangover_ms,
+            opts.energy_vad_threshold_db);
+    }
     if (pimpl_->model.model_type == ParakeetModelType::EOU) {
         eou_init_state(pimpl_->eou_rt, impl->eou_state);
     }
@@ -904,6 +980,12 @@ struct SortformerStreamSession::Impl {
     bool cancelled = false;
 
     std::vector<StreamingDiarizationSegment> last_pending;
+
+    // Phase 13 -- VAD state tracking across chunks. We treat
+    // `max(speaker_probs) > opts.threshold` (the same threshold the
+    // diarization head uses) as the speaking signal. Initial state is
+    // `Unknown` so the first chunk always produces a transition.
+    VadState vad_state = VadState::Unknown;
 
     void try_emit_chunks();
     void process_chunk(int64_t window_start_sample,
@@ -961,6 +1043,54 @@ void SortformerStreamSession::Impl::process_chunk(int64_t window_start_sample,
         for (const auto & seg : emitted) on_segment(seg);
     }
     last_pending = std::move(emitted);
+
+    // Phase 13: per-chunk VAD state from the speaker-prob tensor. A frame
+    // is "speaking" iff any speaker's prob exceeds opts.threshold; the
+    // chunk is "speaking" iff at least one frame in the *emit* range
+    // (not the full window, which can include carry-over from earlier
+    // history) is speaking. The dominant speaker is the argmax across
+    // the speaker dimension of the per-chunk-mean probability.
+    if (opts.on_event) {
+        const int num_spks = diar.num_spks;
+        const int n_frames = diar.n_frames;
+        const double frame_stride_s = diar.frame_stride_s > 0.0
+                                          ? diar.frame_stride_s : 0.08;
+        bool   any_speaking = false;
+        int    dominant_spk = -1;
+        float  best_score   = 0.0f;
+        std::vector<double> spk_score_sum(num_spks, 0.0);
+        int    spk_count = 0;
+        for (int t = 0; t < n_frames; ++t) {
+            const double frame_t_s = window_offset_s + frame_stride_s * t;
+            if (frame_t_s < emit_lo_s || frame_t_s >= emit_hi_s) continue;
+            ++spk_count;
+            for (int s = 0; s < num_spks; ++s) {
+                const float p = diar.speaker_probs[(size_t) t * num_spks + s];
+                spk_score_sum[s] += p;
+                if (p > opts.threshold) any_speaking = true;
+                if (p > best_score) best_score = p;
+            }
+        }
+        if (any_speaking) {
+            double best_mean = -1.0;
+            for (int s = 0; s < num_spks; ++s) {
+                const double mean = spk_score_sum[s] / std::max(1, spk_count);
+                if (mean > best_mean) { best_mean = mean; dominant_spk = s; }
+            }
+        }
+        const VadState new_state = any_speaking ? VadState::Speaking : VadState::Silent;
+        if (new_state != vad_state) {
+            StreamEvent ev;
+            ev.type        = StreamEventType::VadStateChanged;
+            ev.timestamp_s = emit_lo_s;
+            ev.chunk_index = chunk_index;
+            ev.vad_state   = new_state;
+            ev.speaker_id  = (new_state == VadState::Speaking) ? dominant_spk : -1;
+            ev.vad_score   = best_score;
+            opts.on_event(ev);
+            vad_state = new_state;
+        }
+    }
 
     emitted_samples = emit_end_sample;
     ++chunk_index;

@@ -1183,7 +1183,10 @@ strategy in Python on top of the NeMo offline model: each chunk feeds
 `[left_context + chunk + right_lookahead]` into the offline encoder,
 slices out the center frames, runs CTC greedy with a stateful
 `prev_token` carried across chunks. This mirrors what the eventual C++
-streaming path does (modulo the future Phase 8.5 KV-cache optimisation).
+streaming path does (modulo the indefinitely-deferred Phase 8.5
+KV-cache-on-offline-weights optimisation; see §8.5 for why this is
+distinct from chunked-limited streaming inference and why the latter
+is rejected).
 
 Sweep results on `test/samples/jfk.wav` (11 s clean speech) and
 `LastQuestion_long_EN.raw` (5.5 min sci-fi narration with proper nouns,
@@ -1319,25 +1322,111 @@ Metal Q8_0), default config `chunk_ms=2000, left=10000, right=2000`:
 - First-segment latency: `chunk_ms + right_lookahead_ms` ≈ 4 s wall
   (matches Python reference).
 
-### Phase 8.5 — KV cache / conv state (pending)
+### Phase 8.5 — KV cache / conv state (deferred indefinitely; not the same as chunked-limited streaming inference)
 
-Same `StreamSession` public API, swap the internal loop: keep
-per-layer `K`, `V`, and depthwise-conv left-state tensors around as
-backend buffers, slid forward each chunk. Each encoder call then only
-computes over new-chunk + right-lookahead frames instead of the full
-`(left + chunk + right)` window. Projected wins:
+> **Important distinction — read this before touching streaming
+> internals.** Two superficially-similar designs have been proposed
+> (and one of them has been attempted twice) on this project, and
+> they have very different quality implications. Conflating them is
+> what makes this corner trip-hazardous.
+
+#### (A) Chunked-limited streaming inference on a chunked-limited-trained checkpoint
+
+What NeMo's `cache_aware_stream_step` actually does. Each query
+attends only to a fixed lookback window; per-chunk encoder cost
+drops to `O(chunk)`; per-layer `(lookback, d_model)` K/V cache plus
+`(d_model, kernel-1)` depthwise-conv state slide forward each call.
+Looks like an attractive perf win on paper.
+
+**This shape has been evaluated twice on this project and rejected
+both times on quality grounds.**
+
+- **Round 1 — Phase 8.0** evaluated
+  `stt_en_fastconformer_hybrid_large_streaming_multi`, the only
+  NeMo cache-aware streaming Conformer family available at the time
+  and the same family that powers `qvac-lib-infer-parakeet`'s
+  legacy `'eou'` modelType. Real-world quality landed at ~2× WER
+  vs `parakeet-ctc-0.6b` offline (the user's own production
+  confirmed this). Phase 8 therefore chose the rolling-encoder
+  Mode 3 design instead.
+- **Round 2 — Phase 12.x exploration** ported
+  `nvidia/parakeet_realtime_eou_120m-v1` (same model family, newer
+  120 M variant) as the EOU engine in Phase 12.5 on the rolling-
+  encoder Mode 3, and scoped a true cache-aware fast path as the
+  follow-up. A bit-equal C++ port of NeMo's
+  `cache_aware_stream_step` was prototyped on a working branch:
+  per-layer K/V cache, depthwise-conv state, chunked-limited
+  streaming attention mask, generalised Transformer-XL `rel_shift`
+  for `T_q != T_kv`. Numerical parity vs NeMo was clean — worst rel
+  `1.85e-3` over 44 chunks of `jfk.wav` — but decoded end-to-end
+  through `eou_decode_window`, the result reproduced exactly NeMo's
+  streaming transcript, which is **not** the offline transcript:
+
+  ```
+  Mode 2 / offline:   "and so my fellow americans ask not what your
+                       country can do for you ask what you can do
+                       for your country<EOU>"
+  cache-aware
+    (NeMo + ours):    "that's all i've held america ask not what
+                       your country can do for you ask what you can
+                       do for your country"
+  ```
+
+  Same quality cliff Phase 8.0 had already documented two years
+  earlier on the same model family. NeMo's own cache-aware
+  streaming RNN-T over the same 88 encoder frames also fails to
+  emit any `<EOU>` token on `jfk.wav`, so the cache-aware path
+  doesn't even win on `<EOU>` boundary detection vs the rolling
+  encoder. **The branch was reverted** before any of it landed on
+  `main`; this section exists so a third iteration of the project
+  doesn't redo the same loop.
+
+**Bottom line for (A): cache-aware streaming inference on a
+chunked-limited-trained ASR checkpoint is a quality regression in
+this project's context (clean speech, offline-quality transcripts
+as the bar). It will not be implemented. If a future requirement
+explicitly trades early-utterance accuracy for bounded compute
+(low-power voice agent, very long-form streaming), revisit this
+decision with that requirement on the table — but assume by default
+that re-running this exploration will produce the same numbers.**
+
+#### (B) KV cache / depthwise-conv state on the offline-trained CTC / TDT weights
+
+The original scope of "Phase 8.5", and a *different* design from
+(A) despite the surface-level similarity. Same offline-trained
+weights, same full attention pattern as training, just amortised
+across chunks: keep per-layer `K`, `V`, and depthwise-conv
+left-state tensors as backend buffers, slid forward each chunk;
+each encoder call computes only over new-chunk + right-lookahead
+frames instead of the full `(left + chunk + right)` window. Pure
+compute-layout refactor — **accuracy unchanged**. Projected wins
+on the original §8.1 Python reference:
 
 - Per-chunk compute: down from `O(left + chunk + right)` to
   `O(chunk + right)`, i.e. ~5× on the default config
   (2 + 2 vs 10 + 2 + 2).
-- Total wall on the 5.5 min clip: down from 35 s to ~10-15 s (ballpark
-  close to the offline 15 s baseline).
-- Accuracy unchanged — this is a pure compute-layout refactor.
+- Total wall on the 5.5 min clip: down from 35 s to ~10-15 s
+  (close to the offline 15 s baseline).
+- Accuracy unchanged.
 
-Requires graph changes (persistent cache tensors for attention + conv
-module, streaming attention mask with `att_context_size` plumbing
-already used by NeMo's own cache-aware export path), plus a per-stage
-parity harness vs the §8.1 Python reference. Out of scope for this PR.
+Crucially, the streaming graph for (B) is **not** the same shape
+as the chunked-limited graph from (A). Different attention mask
+(no chunked-limit), different cache-size policy (sliding window
+without a quality-coupled lookback), different validation fixtures
+(parity vs offline forward, not vs `cache_aware_stream_step`). Any
+future attempt at (B) should treat it as a fresh design exercise,
+not as a retrofit of any (A) prototype recovered from git history.
+
+Requires graph changes (persistent cache tensors for attention +
+conv module), per-stage parity harness vs the §8.1 Python reference,
+and a sliding-window cache-eviction policy.
+
+**Status: deferred indefinitely.** No current owner. Not on the
+critical path of any shipping feature. Pick up only when a concrete
+consumer needs the per-chunk compute reduction and is willing to
+pay the engineering cost. The §8.1 Python reference and the rolling-
+encoder Mode 3 implementation in §8.4-8.7 remain the source of truth
+for streaming-quality expectations on CTC / TDT.
 
 ## Phase 9 — multi-model support _(done; ships parakeet-ctc-1.1b alongside 0.6B)_
 
@@ -2099,8 +2188,63 @@ the eventual destination; 11.11.1 is what ships today.
   form bottleneck on Sortformer's 18-layer TF (T^2 cost dominates).
   See §5.4 for the prior Accelerate sched-assertion investigation on
   the f32 GGUF -- worth re-checking with the q8_0 path.
-- **Quantised (q8_0 / q4_0) Sortformer GGUFs**. Converter handles
-  these via the universal dequant path; needs a sweep + parity check.
+
+### Phase 11.12 — quantised Sortformer GGUFs  _(done)_
+
+Both Sortformer checkpoints (`diar_sortformer_4spk-v1` offline and
+`diar_streaming_sortformer_4spk-v2` streaming-trained) now ship at
+`q8_0` and `q4_0` via the universal `add_2d` quantisation path in
+`scripts/convert-nemo-to-gguf.py`. No converter changes needed --
+Sortformer's encoder shares the FastConformer graph with CTC/EOU,
+and the transformer encoder + diarization head are 2D linear layers
+that already flow through `add_2d`.
+
+Sizes:
+
+| GGUF                             | f16     | q8_0    | q4_0    |
+|----------------------------------|---------|---------|---------|
+| sortformer-4spk-v1               | 263 MiB | 141 MiB | 75 MiB  |
+| sortformer-streaming-4spk-v2     | 251 MiB | 134 MiB | 72 MiB  |
+
+`scripts/verify-gguf-roundtrip.py` gained `build_expected_sortformer`
+covering the encoder + `sortformer.encoder_proj` + 18 transformer
+blocks (`attn.{q,k,v,out}`, `ln{1,2}`, `ffn.{in,out}`) + the
+two-layer diarization head. All 6 GGUFs (2 models × 3 tiers) PASS
+the roundtrip gate (worst rel `1.15e-1` on `parakeet-ctc-0.6b.q4_0`-
+class q4 weights, well within the `2^-3 = 0.125` quant gate).
+
+`test-sortformer-parity` was extended with `--enc-rel-tol` and
+`--probs-abs-tol` flags so each quant tier can pass at appropriate
+gates (defaults still f16 = 5e-3 / 5e-2). Per-tier numbers on
+`jfk.wav` (single-speaker, 11 s):
+
+| GGUF                                     | enc rel  | probs max_abs |
+|------------------------------------------|----------|---------------|
+| sortformer-4spk-v1.f16                   | 1.6e-3   | 8.7e-4        |
+| sortformer-4spk-v1.q8_0                  | 2.7e-2   | 2.7e-2        |
+| sortformer-4spk-v1.q4_0                  | 3.2e-1   | 1.3e-1        |
+| sortformer-streaming-4spk-v2.f16         | 5.0e-2   | 5.1e-2        |
+| sortformer-streaming-4spk-v2.q8_0        | 5.2e-2   | 5.4e-2        |
+| sortformer-streaming-4spk-v2.q4_0        | 2.2e-1   | 2.0e-1        |
+
+(v2's f16 baseline is already worse than v1's because the
+streaming-trained encoder's offline forward in our C++ graph diverges
+from NeMo's offline forward -- this is a structural property of the
+streaming-trained checkpoint when run offline, not a quantisation
+regression. v2 q8/q4 inflate within the same factor band as v1.)
+
+User-facing diarization output is identical across all three tiers
+of v2 on `jfk.wav` (`[0.24-2.40] [3.36-4.56] [5.44-11.04]`,
+all speaker_0). v1's three tiers also produce the same three
+segments, with q4 boundaries shifted by at most ~80 ms (one encoder
+frame) vs f16 -- well within the post-processing `min_segment_ms`
+band.
+
+**Recommendation:** prefer q8_0 for general use (1.9× smaller than
+f16 with negligible quality impact); use q4_0 when memory is tight
+(3.5× smaller than f16, marginally noisier individual speaker
+probabilities but identical thresholded segments on shipping
+fixtures).
 
 ## Phase 12 — EOU end-of-utterance streaming ASR  _(in progress; 12.0 + 12.1 shipped)_
 
@@ -2131,11 +2275,19 @@ NeMo PyTorch as the parity oracle (no onnxruntime in the dev loop).
 | Joint | RNNT-Joint, encoder_hidden=512 -> 640, pred_hidden=640 -> 640, ReLU, output dim **1027** = 1024 BPE + `<EOU>` (id 1024) + `<EOB>` (id 1025) + blank (id 1026) |
 | Latency | NVIDIA card cites 80 ms (p50) / 280 ms (p90) / 320 ms (p95) end-of-turn detection on TTS-augmented DialogStudio |
 
-So EOU is **TDT minus durations + streaming knobs + LayerNorm in the
-conv module**; encoder graph is ~95 % shared with the existing CTC/TDT
-encoder, with three deltas (LN-vs-fused-BN in conv module, chunked-
-limited attention masking + per-chunk KV cache state, depthwise-conv
-left state). The decoder + joint mirror TDT minus the duration head.
+So EOU is **TDT minus durations + LayerNorm in the conv module +
+two attention/conv shape switches**; encoder graph is ~95 % shared
+with the existing CTC/TDT encoder, with three shipping deltas
+(LN-vs-fused-BN in conv module, chunked-limited attention mask
+applied as a static offline mask via `ggml_soft_max_ext`, asymmetric
+`(L=k-1, R=s-1)` causal padding in the dw_striding subsampler).
+NeMo's own streaming forward additionally maintains per-chunk KV
+cache state and depthwise-conv left state for `cache_aware_stream_step`;
+this project deliberately does **not** ship that path -- see §8.5
+case (A) for why driving streaming-trained Parakeet checkpoints
+through chunked-limited streaming inference is a quality regression
+on the targets this repo cares about. The decoder + joint mirror
+TDT minus the duration head.
 
 **API target.** The binding's JS surface for EOU today (`index.d.ts`)
 is intentionally minimal: just the same generic transcription pipeline
@@ -2447,7 +2599,7 @@ boundaries `eou_decode_window` recorded, joins with `\n`, returns
 the result as `EouDecodeResult.text`. `eou_count` is exposed for
 later wiring into the planned cross-engine `OnEndOfTurn` event.
 
-### Phase 12.5 — streaming push API (Modes 2 + 3)  _(done; cache-aware fast path deferred to Phase 12.x)_
+### Phase 12.5 — streaming push API (Modes 2 + 3)  _(done; rolling-encoder Mode 3 is the chosen design -- chunked-limited streaming inference rejected, see §8.5)_
 
 Public API additions in `include/qvac-parakeet/ctc/engine.h`:
 
@@ -2495,15 +2647,17 @@ new auto-detection logic was required.
 - Mode 2 `is_eou_boundary` fires on at least one segment (the
   trailing `<EOU>` on `jfk.wav`);
 - Mode 3 transcript size matches the reference within a 20 % tail
-  jitter band (the cache-aware fast path will tighten this to
-  byte-equal in the deferred slice).
+  jitter band. Chasing byte-equality on Mode 3 via cache-aware
+  streaming inference was explored and rejected -- see §8.5 case (A)
+  for the full rationale -- so the rolling-encoder tail-jitter band
+  is the assertion the test will keep.
 
 Passes on both `parakeet-eou-120m-v1.gguf` (f16) and
 `parakeet-eou-120m-v1.q8_0.gguf`. Existing `test-streaming` (CTC /
 TDT byte-equality + WER tolerance) and `test-sortformer-streaming`
 both still pass after the `StreamSession::Impl` plumbing changes.
 
-#### Mode 3 caveat + Phase 12.x optimisation runway
+#### Mode 3 caveat — chosen design, not a workaround
 
 Mode 3 today re-runs the **offline** encoder per chunk over a
 sliding `[left + chunk + right_lookahead]` window without persistent
@@ -2511,16 +2665,22 @@ KV / conv-state cache across chunks. The transcript matches Mode 2
 byte-equally on `jfk.wav`, but `<EOU>` boundary detection is
 approximate: the trailing chunk doesn't carry the long-context
 encoder state the EOU head needs to confidently fire `<EOU>` on
-end-of-utterance. This is exactly the trade-off documented when the
-slice was scoped: the public API is shaped to absorb a true
-cache-aware encoder graph (per-layer `(70, d_model)` K/V cache +
-`(d_model, kernel-1)` depthwise-conv state, sliding forward by
-`chunk_enc_frames` per call) without changing the public surface,
-and the Phase 8.5 KV-cache groundwork that was scoped for CTC / TDT
-will land here first. Tracked as the deferred Phase 12.x
-"cache-aware streaming encoder" todo. Per-chunk encoder cost on
-Mode 3 today is `O(left + chunk + right_lookahead)` ms;
-cache-aware will reduce it to `O(chunk + right_lookahead)`.
+end-of-utterance.
+
+This is the **chosen design**, not a deferred workaround. The
+obvious alternative -- driving the streaming-trained EOU 120m-v1
+weights through NeMo's `cache_aware_stream_step` to recover
+"per-chunk `O(chunk)` compute and persistent encoder state" --
+was prototyped during the Phase 12.x exploration and rejected; see
+§8.5 case (A) for the full rationale. Short version: same model
+family Phase 8.0 already evaluated, same ~2× early-utterance WER
+cliff, same `<EOU>` token disappearing entirely in the cache-aware
+output (NeMo's own `cache_aware_stream_step` over `jfk.wav`
+produces 0 `<EOU>` tokens; we reproduced that bit-for-bit). Per-
+chunk encoder cost on Mode 3 today is `O(left + chunk +
+right_lookahead)`; trading that off for the chunked-limited
+streaming-inference path is a quality regression and is not on the
+roadmap.
 
 ### Phase 12.6 — download script + roundtrip verifier  _(done)_
 
@@ -2533,33 +2693,159 @@ matches the source NeMo state-dict at f32 bit-exactness for the f32
 slots and within a per-tier rel gate for the quant slots
 (2^-10 for f16, 2^-7 for q8_0, 2^-4 for q5_0, 2^-3 for q4_0).
 
-### Phase 12.x — pending follow-ups
+### Phase 12.x — follow-ups
 
-- **Cache-aware streaming encoder graph.** Eliminates Mode 3's
-  `O(left + chunk + right_lookahead)` per-chunk cost and recovers
-  bit-equal Mode-2 `<EOU>` boundary detection. Closes the long-
-  outstanding Phase 8.5 KV-cache scope. Per-layer `(70, d_model)`
-  K/V cache and `(d_model, kernel-1)` depthwise-conv state, both
-  sliding forward by `chunk_enc_frames` (= 2 frames per 25-mel-frame
-  chunk). The streaming graph can then be re-applied to CTC / TDT
-  Mode 3 as a 6x compute reduction on long-form audio (per the
-  Phase 8.5 estimate). API stays the same; only the internal
-  encoder-graph dispatch changes.
-- **Quantised Sortformer GGUFs.** Same converter path as EOU's
-  q8_0 / q4_0 work; needs a sweep + parity check (also tracked
-  under §11.x).
-- **Cross-engine VadState + EndOfTurn events.** The
-  `is_eou_boundary` + `eot_confidence` slots in `StreamingSegment`
-  were specifically shaped for this: a follow-up phase will land a
-  `StreamEvent` umbrella across qvac-parakeet.cpp + whisper.cpp
-  with `OnVadState` / `OnEndOfTurn` callbacks, sourcing from
-  whichever engines are loaded (EOU's `<EOU>` -> `OnEndOfTurn`,
-  Sortformer's any-speaker prob -> `OnVadState`, energy-VAD
-  fallback otherwise). No new model port needed, no Silero
-  dependency -- per the design discussion before Phase 12.0
-  started.
+#### Rejected (do not attempt again without new evidence)
 
-## Phase 13 — TDT decoder Metal port  _(done)_
+- **Cache-aware streaming encoder graph for EOU 120m-v1
+  (and any other chunked-limited-trained Parakeet checkpoint).**
+  Prototyped on a working branch during the Phase 12.x exploration:
+  bit-equal NeMo's `cache_aware_stream_step` (worst rel `1.85e-3`
+  over 44 chunks of `jfk.wav`), end-to-end transcript bit-equal
+  NeMo's *streaming* output -- which is structurally distinct
+  from, and meaningfully worse than, NeMo's offline output (~2×
+  early-utterance WER, no `<EOU>` token emitted). Reverted before
+  landing. Same quality cliff Phase 8.0 documented two years
+  earlier on `streaming_multi`; the EOU 120m-v1 family is the same
+  cache-aware streaming Conformer family with a slightly newer
+  120 M variant. **Will not be implemented.** See §8.5 case (A)
+  for the full rationale and numbers.
+
+#### Pending (no current owner)
+
+(All Phase 12.x follow-ups have either shipped or been formally
+rejected; see Phase 13 below for the cross-engine event API.)
+
+## Phase 13 -- cross-engine StreamEvent API (VadState / EndOfTurn)  _(done)_
+
+Voice-agent UX (turn detection, barge-in, hold-the-mic-open) needs
+two signals we already had hooks for but no API on top of: VAD
+state transitions and end-of-turn boundaries. Phase 13 lands a
+small public `StreamEvent` surface that streaming sessions can
+emit alongside the existing per-segment callbacks. The shape is
+explicitly designed to be the same as what whisper.cpp's
+streaming API will eventually emit, so consumers (notably the
+`qvac-lib-infer-parakeet` binding) can write engine-agnostic event
+handling once.
+
+### Public types
+
+```cpp
+enum class VadState { Unknown, Speaking, Silent };
+enum class StreamEventType { VadStateChanged, EndOfTurn };
+
+struct StreamEvent {
+    StreamEventType type;
+    double  timestamp_s;
+    int     chunk_index;
+
+    // VadStateChanged
+    VadState vad_state;
+    int      speaker_id;     // argmax on entering Speaking; -1 otherwise
+    float    vad_score;      // 0..1; provenance-specific
+
+    // EndOfTurn
+    float    eot_confidence;
+    int      speaker_id_at_turn;
+};
+
+using StreamEventCallback = std::function<void(const StreamEvent&)>;
+```
+
+`StreamingOptions::on_event` and `SortformerStreamingOptions::on_event`
+default to `nullptr` (back-compat: existing consumers unaffected).
+`StreamingOptions` also gains `enable_energy_vad` (default off) plus
+`energy_vad_threshold_db = -35.0f`, `energy_vad_window_ms = 30`,
+`energy_vad_hangover_ms = 200` knobs for the CTC/TDT fallback.
+
+### Event sources
+
+| Engine     | Event                  | Trigger                                                                                              |
+|------------|------------------------|------------------------------------------------------------------------------------------------------|
+| EOU        | `EndOfTurn`            | `<EOU>` token decoded in this chunk; `eot_confidence = 1.0`. Mode 2 + Mode 3.                        |
+| Sortformer | `VadStateChanged`      | Per-chunk `max(speaker_probs) > threshold` (the same threshold the diarization head uses), with hysteresis (state retained across chunks). `speaker_id = argmax mean(speaker_probs)` on entering Speaking. |
+| CTC / TDT  | `VadStateChanged`      | Energy-VAD on raw PCM (sliding RMS window, dBFS threshold + hangover). Only fires when consumer opts in via `enable_energy_vad`.                                                                          |
+
+EOU's `EndOfTurn` is fired from both `Engine::transcribe_stream`
+(Mode 2) and `StreamSession::process_window` (Mode 3) so the event
+shape is identical regardless of which streaming entry point the
+consumer drives.
+
+### Implementation
+
+- `include/qvac-parakeet/ctc/engine.h` -- new public types +
+  `on_event` slots on both options structs + the `enable_energy_vad`
+  knobs. Adding fields with defaults to a struct is forward-compatible
+  for current consumers.
+
+- `src/energy_vad.{h,cpp}` -- internal helper. Sliding RMS over a
+  configurable ms window of mono f32 PCM, with hysteresis: enter
+  Speaking immediately on threshold-crossing; fall back to Silent
+  only after `hangover_ms` of below-threshold audio. Default
+  `-35 dBFS / 30 ms / 200 ms` is tuned for clean 16 kHz mono speech.
+  Not exposed in the public headers (would force the binding to
+  pin to our implementation; shape may evolve).
+
+- `src/parakeet_engine.cpp`:
+  - `StreamSession::Impl` gains a `unique_ptr<EnergyVad>` member
+    that is constructed only when `opts.enable_energy_vad` and the
+    underlying engine has no native VAD source (constructed for
+    CTC/TDT, skipped for EOU). The VAD is driven from a small
+    `stream_drive_energy_vad()` helper invoked from both
+    `feed_pcm_f32` and `feed_pcm_i16`.
+  - `SortformerStreamSession::Impl` gains a `vad_state` field
+    (initial `Unknown`, transitions on each chunk's emit-range
+    speaker probabilities). Fires `VadStateChanged` on transitions
+    only -- no per-chunk repeat events.
+  - Mode-2 and Mode-3 EOU paths each fire `EndOfTurn` events on
+    chunks where `eou_boundaries_in_chunk > 0`.
+
+### Tests
+
+- `test-streaming` (CTC + TDT) gained an opt-in energy-VAD
+  invocation that asserts at least one Speaking transition fires
+  on `jfk.wav`. Default-off path (sweep above) keeps emitting zero
+  events, confirming back-compat.
+- `test-eou-streaming` Mode-2 path now asserts that
+  `is_eou_boundary` and `EndOfTurn` event count are consistent
+  (boundary fires => at least one event fires). On `jfk.wav` chunk
+  size 1500 ms: 1 `EndOfTurn` event, matching the single trailing
+  `<EOU>` boundary.
+- `test-sortformer-streaming` asserts at least one `VadStateChanged`
+  event on a wav with audible speech and at least one Speaking
+  transition. Default fixture (`two-speakers-16k.wav`) skips when
+  missing; on `jfk.wav` (single speaker, 11 s) the test fires one
+  `Speaking` transition on chunk 0 with `speaker_id = 0`, which is
+  the expected shape.
+
+Numbers on `jfk.wav` (sanity check):
+
+| Test                              | Events fired                                      |
+|-----------------------------------|---------------------------------------------------|
+| test-streaming + energy-VAD (CTC) | 9 VadStateChanged (6 Speaking transitions)         |
+| test-streaming + energy-VAD (TDT) | 9 VadStateChanged (6 Speaking transitions)         |
+| test-eou-streaming Mode 2         | 1 EndOfTurn at chunk 7 (the trailing `<EOU>`)      |
+| test-sortformer-streaming v1.f16  | 1 VadStateChanged @ 0.00 s -> Speaking, speaker 0 |
+| test-sortformer-streaming v1.q8   | identical to f16                                   |
+| test-sortformer-streaming v2.q4   | 1 VadStateChanged @ 0.00 s -> Speaking, speaker 0 |
+
+### Shape decisions
+
+- **Single struct + enum, not separate event types.** Keeps the
+  callback signature trivial (`void(const StreamEvent&)`) which
+  maps cleanly through the binding's N-API ABI without per-type
+  wrappers. Costs a few unused fields per event; cheap.
+- **Engines fire what they natively know.** EOU has the `<EOU>`
+  token and fires only `EndOfTurn`; Sortformer has speaker probs
+  and fires only `VadStateChanged`; CTC/TDT have neither so they
+  fire `VadStateChanged` from energy-VAD when explicitly enabled.
+  No engine pretends to fire events it doesn't have a real signal
+  for, and no Silero / external VAD dependency is added.
+- **Default off.** Both `on_event = nullptr` and
+  `enable_energy_vad = false` are the defaults. No behavioural
+  change for existing consumers; opt-in only.
+
+## Phase 14 — TDT decoder Metal port  _(done)_
 
 Phase 10 brought up TDT (Token-and-Duration Transducer) end-to-end on
 CPU with the encoder also offloadable to Metal, but the **decoder
@@ -2567,11 +2853,10 @@ itself bypassed ggml entirely**: at load time the LSTM prediction net
 + joint MLP were dequantised to host `std::vector<float>` and the
 greedy emission loop ran scalar `gemv_f32` per emission step. Even
 with a Metal-accelerated encoder, the decoder owned ~48 % of total
-inference time on the M4 Air (76 ms of 159 ms on a 20 s clip). Phase
-13 ports the decoder to ggml graphs on `backend_active` so it runs
+inference time on the M4 Air (76 ms of 159 ms on a 20 s clip). Phase 14 ports the decoder to ggml graphs on `backend_active` so it runs
 end-to-end on Metal alongside the encoder.
 
-### 13.1 — graph design
+### 14.1 — graph design
 
 Two fixed-shape per-step graphs plus one window-shape graph, all
 allocated against `model.backend_active()` (Metal / CUDA / Vulkan
@@ -2594,12 +2879,12 @@ when compiled and `--n-gpu-layers > 0`, else CPU):
     this matmul out of the per-step joint graph cuts ~250 small
     `gemv(640, 1024)` calls per window down to one large `gemm` —
     cheap on Metal where matmul kernels are compute-bound, expensive
-    on CPU where it loses cache locality (see §13.2 fallback).
+    on CPU where it loses cache locality (see §14.2 fallback).
   - All three graphs use `ggml_set_input` / `ggml_set_output` and
     upload host inputs each step via `ggml_backend_tensor_set`,
     pulling outputs back via `ggml_backend_tensor_get`. The
     `argmax` over token + duration logits stays on host (~32 KB
-    `tensor_get` per step is cheap on unified memory; see §13.5
+    `tensor_get` per step is cheap on unified memory; see §14.5
     Phase 4 gate decision).
 
 `TdtRuntimeWeights` carries both the GPU-graph scaffolding
@@ -2611,7 +2896,7 @@ free the gallocrs, contexts, and any cached enc_proj graphs on
 runtime teardown; the backend pointer itself is owned by
 `ParakeetCtcModel::Impl`.
 
-### 13.2 — CPU fallback
+### 14.2 — CPU fallback
 
 The straightforward "all paths through ggml" design regressed CPU
 decode by **~6x** (76 ms -> 480 ms median) because per-step graph
@@ -2631,7 +2916,7 @@ without reuse, while the per-step gemv keeps the encoder-frame
 slice in cache through both `joint_enc` and the surrounding
 `joint_pred` / `joint_out` calls.
 
-### 13.3 — parity gate
+### 14.3 — parity gate
 
 `test-tdt-decoder-parity` (`src/test_tdt_decoder_parity.cpp`,
 linked under `QVAC_PARAKEET_BUILD_TESTS`) runs the same WAV through
@@ -2653,7 +2938,7 @@ reference token-ID stream from `scripts/dump-tdt-reference.py`
 (extended in this phase to write `token_ids.npy` alongside the
 existing `transcript.txt`).
 
-### 13.4 — bench
+### 14.4 — bench
 
 `sample-16k.wav` (20.13 s of audio), `--bench-warmup 5
 --bench-runs 15`, M4 Air, q8_0:
@@ -2681,7 +2966,7 @@ implementation that shipped in Phase 10); the new graph path is
 only exercised on Metal / CUDA / Vulkan builds where
 `backend_active` is non-CPU.
 
-### 13.5 — encoder→decoder handoff (gated, not landed)
+### 14.5 — encoder→decoder handoff (gated, not landed)
 
 The original plan considered keeping `encoder_out` resident on the
 backend so the TDT decoder could run directly off the GPU tensor
@@ -2701,7 +2986,7 @@ essentially memcpy at ~50 GB/s and cannot deliver the threshold).
 Skipped, with the engine-side API kept simple — `EncoderOutputs`
 stays host-side, matching CTC + EOU + Sortformer.
 
-### 13.6 — bench-JSON backend label
+### 14.6 — bench-JSON backend label
 
 Pre-existing bug surfaced by this phase: `main.cpp`'s
 `--bench-json` writer hardcoded `"backend": "ggml-cpu"` regardless
@@ -2712,15 +2997,15 @@ plus the runtime `n_gpu_layers` flag, and an `n_gpu_layers` field
 was added to the JSON so post-hoc sweeps can disambiguate same-
 binary CPU vs GPU runs.
 
-### 13.7 — remaining work
+### 14.7 — remaining work
 
   - **CUDA / Vulkan validation.** The graph code path is generic
     over `backend_active`; both backends should "just work" because
     every op used (`get_rows`, `mul_mat`, `add`, `sigmoid`, `tanh`,
     `mul`, `concat`, `cont`) is supported on CUDA and Vulkan in
-    the pinned ggml. Not validated on hardware in Phase 13 — needs
+    the pinned ggml. Not validated on hardware in Phase 14 — needs
     a follow-up bench run.
-  - **Mode 3 streaming bench.** Phase 13 measured Mode 1 (one-shot
+  - **Mode 3 streaming bench.** Phase 14 measured Mode 1 (one-shot
     `tdt_greedy_decode` over the full window) only. The streaming
     `StreamSession::process_window` calls into the same
     `tdt_decode_window` so the per-step Metal speed-up should
@@ -2733,9 +3018,9 @@ binary CPU vs GPU runs.
     "RTF (Metal)" column for that row in the README's Supported
     checkpoints table.
 
-## Phase 14 — fused LSTM+joint + persistent decoder state (Metal)
+## Phase 15 — fused LSTM+joint + persistent decoder state (Metal)
 
-Phase 13 ported the TDT decoder to ggml graphs and shipped on Metal
+Phase 14 ported the TDT decoder to ggml graphs and shipped on Metal
 with two `compute_graph` dispatches per non-blank emission step
 (joint, then LSTM). Profiling on M3 Ultra showed the dominant cost
 per step is **the Metal command-buffer commit + wait latency, not
@@ -2746,14 +3031,14 @@ the readback or the kernel work itself**:
                                                     ~ commit ~150 us + GPU ~25 us + bookkeeping
 ```
 
-Phase 14 collapses the per-non-blank dispatch pair into a single
+Phase 15 collapses the per-non-blank dispatch pair into a single
 fused graph. The LSTM update writes h / c / pred in place into a
 persistent backend buffer via `ggml_cpy`; the joint mat-muls take
 the `pred_cpy` node as their input so gallocr orders the LSTM
 update strictly before the joint reads inside one Metal command
 buffer.
 
-### 14.1 — persistent decoder state
+### 15.1 — persistent decoder state
 
 `TdtRuntimeWeights` gains a dedicated `persist_buffer` allocated
 via `ggml_backend_alloc_ctx_tensors` that holds:
@@ -2771,7 +3056,7 @@ projection — it's `ggml_cpy`'d straight into the persistent slab
 and the joint network reads rows via `ggml_get_rows` on a
 host-supplied frame index.
 
-### 14.2 — three fixed-shape graphs
+### 15.2 — three fixed-shape graphs
 
 A `build_lstm_body` helper is shared between two of them so the
 LSTM math stays numerically identical across init and the fused
@@ -2794,11 +3079,11 @@ emissions defer the LSTM update so the next iteration fuses it
 with the next frame's joint forward via `g_lstm_joint`.
 Streaming windows flush any deferred update at end-of-window.
 
-### 14.3 — bench (Metal, M3 Ultra, sample-16k.wav, 20.1 s, 95 tokens)
+### 15.3 — bench (Metal, M3 Ultra, sample-16k.wav, 20.1 s, 95 tokens)
 
 3-warmup + 10-timed runs, averaged across 3 invocations:
 
-| Stage          | Phase 13 base | Phase 14 fused | Δ        |
+| Stage          | Phase 14 base | Phase 15 fused | Δ        |
 |----------------|--------------:|---------------:|---------:|
 | mel ms         |        14.4   |          14.6  |  noise   |
 | encoder ms     |        68.5   |          68.6  |  noise   |
@@ -2821,7 +3106,7 @@ numerically equivalent to the sequential path because:
      so gallocr cannot alias them with intermediate `h_new` /
      `c_new` and there are no read-before-write hazards.
 
-### 14.4 — what didn't work
+### 15.4 — what didn't work
 
 **Batched-joint over K consecutive frames** *(prototyped, reverted)*
 
@@ -2833,7 +3118,7 @@ back to phase-13-ish numbers:
 
 | Variant   | decode ms (3-run mean) |
 |-----------|-----------------------:|
-| Phase 14  |                  43.0  |
+| Phase 15  |                  43.0  |
 | K = 4     |                  43.8  |
 | K = 8     |                  43.2  |
 
@@ -2846,13 +3131,13 @@ even though only ~1.6 are consumed before a non-blank). Reverted
 the prototype rather than ship neutral code; phase 14's fused
 LSTM+joint is the local optimum on this hardware.
 
-### 14.5 — remaining work
+### 15.5 — remaining work
 
-  - **CUDA / Vulkan validation.** Same plumbing as Phase 13:
+  - **CUDA / Vulkan validation.** Same plumbing as Phase 14:
     `g_lstm_joint` and the persistent-state buffer should "just
     work" on any backend that already supports `ggml_cpy`,
     `ggml_get_rows`, `ggml_backend_alloc_ctx_tensors`. Worth
     benchmarking — backends with higher dispatch overhead
-    (CUDA) could see proportionally larger Phase 14 wins.
-  - **TDT 1.1B sweep.** Same caveat as Phase 13; the relative
+    (CUDA) could see proportionally larger Phase 15 wins.
+  - **TDT 1.1B sweep.** Same caveat as Phase 14; the relative
     win should hold but absolute numbers shift.

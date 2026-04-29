@@ -113,6 +113,22 @@ int run_basic(const std::string & gguf_path, const std::string & wav_path) {
     sopts.threshold      = 0.5f;
     sopts.min_segment_ms = 200;
 
+    int n_vad_events       = 0;
+    int n_speaking_events  = 0;
+    sopts.on_event = [&](const StreamEvent & ev) {
+        if (ev.type == StreamEventType::VadStateChanged) {
+            ++n_vad_events;
+            if (ev.vad_state == VadState::Speaking) ++n_speaking_events;
+            std::fprintf(stderr,
+                "[sf-stream-test] EVT VadStateChanged @ %.2fs chunk=%d -> %s "
+                "speaker_id=%d score=%.3f\n",
+                ev.timestamp_s, ev.chunk_index,
+                ev.vad_state == VadState::Speaking ? "Speaking" :
+                ev.vad_state == VadState::Silent   ? "Silent"   : "Unknown",
+                ev.speaker_id, ev.vad_score);
+        }
+    };
+
     auto session = engine.diarize_start(sopts, on_seg);
 
     std::mt19937 rng(0xC0FFEE);
@@ -166,6 +182,25 @@ int run_basic(const std::string & gguf_path, const std::string & wav_path) {
         std::fprintf(stderr, "[sf-stream-test] FAIL: max_end=%.3f << audio=%.3f (lost segments?)\n",
                      max_end, audio_s);
         return 6;
+    }
+
+    // Phase 13: at least one VadStateChanged event should fire on a
+    // wav that contains speech. We don't gate the exact count -- on
+    // single-speaker fixtures it's commonly just two (Unknown ->
+    // Speaking on chunk 0, possibly Speaking -> Silent on the trailing
+    // silence chunk) -- but zero events on a wav with audible speech
+    // means the event plumbing is broken.
+    if (n_vad_events == 0) {
+        std::fprintf(stderr,
+            "[sf-stream-test] FAIL: no VadStateChanged events on a wav "
+            "with audible speech (Phase 13 plumbing broken?)\n");
+        return 9;
+    }
+    if (n_speaking_events == 0) {
+        std::fprintf(stderr,
+            "[sf-stream-test] FAIL: no Speaking transitions among %d "
+            "VadStateChanged events\n", n_vad_events);
+        return 10;
     }
 
     {

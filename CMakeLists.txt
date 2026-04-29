@@ -19,6 +19,26 @@ option(QVAC_PARAKEET_BUILD_EXAMPLES    "qvac-parakeet: build standalone examples
 option(QVAC_PARAKEET_INSTALL           "qvac-parakeet: generate install rules"                                 ON)
 option(QVAC_PARAKEET_USE_SYSTEM_GGML   "qvac-parakeet: use system-installed GGML library"                      OFF)
 
+if (CMAKE_CROSSCOMPILING)
+    if (NOT DEFINED GGML_NATIVE OR GGML_NATIVE)
+        message(STATUS "qvac-parakeet: cross-compiling to ${CMAKE_SYSTEM_NAME} -- "
+                       "forcing GGML_NATIVE=OFF (ggml's ARM feature probes use try_run() "
+                       "which CMake refuses in cross-compile mode). The EOU q8_0 precision "
+                       "caveat from native macOS/Linux builds does not apply: mobile prebuilds "
+                       "are per-arch and use the armv8-a baseline.")
+        set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
+
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Android")
+    if (NOT DEFINED GGML_BLAS OR GGML_BLAS)
+        set(GGML_BLAS OFF CACHE BOOL "" FORCE)
+    endif()
+    if (NOT DEFINED GGML_ACCELERATE OR GGML_ACCELERATE)
+        set(GGML_ACCELERATE OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
+
 if (NOT TARGET ggml)
     if (QVAC_PARAKEET_USE_SYSTEM_GGML)
         find_package(ggml CONFIG REQUIRED)
@@ -41,6 +61,7 @@ set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_sortformer.cpp
     src/mel_preprocess.cpp
     src/sentencepiece_bpe.cpp
+    src/energy_vad.cpp
 )
 
 if (QVAC_PARAKEET_BUILD_LIBRARY)
@@ -69,6 +90,9 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
     endif()
     if (GGML_VULKAN)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_VULKAN)
+    endif()
+    if (GGML_BLAS)
+        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_BLAS)
     endif()
 
     set_target_properties(qvac-parakeet PROPERTIES
@@ -144,7 +168,8 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
         src/mel_preprocess.cpp
-        src/sentencepiece_bpe.cpp)
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml)
     target_include_directories(test-tdt-encoder-parity PRIVATE include src ggml/include)
 
@@ -156,7 +181,8 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
         src/mel_preprocess.cpp
-        src/sentencepiece_bpe.cpp)
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
     target_link_libraries(test-tdt-decoder-parity PRIVATE ggml)
     target_include_directories(test-tdt-decoder-parity PRIVATE include src ggml/include)
 
@@ -168,7 +194,8 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
         src/mel_preprocess.cpp
-        src/sentencepiece_bpe.cpp)
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
     target_link_libraries(test-sortformer-parity PRIVATE ggml)
     target_include_directories(test-sortformer-parity PRIVATE include src ggml/include)
 endif()
