@@ -118,21 +118,30 @@ struct TdtRuntimeWeights {
 
     // (2) Joint-only graph: used after a blank emission (pred unchanged
     //     from previous iteration). Reads pred_persist + enc_proj_persist
-    //     [frame_idx], writes logits to host.
+    //     [frame_idx]; emits token + dur argmax i32 indices instead of
+    //     full logits to keep PCIe-class backends from paying the
+    //     V_out * 4 B readback per step (~32 KB at V_out = 8198, fine on
+    //     Apple unified memory at ~17 us / call but order-of-magnitude
+    //     worse on a discrete GPU bus; one int32 per step is the right
+    //     shape for both).  Token argmax is over logits[0:V_plus_1],
+    //     duration argmax is over logits[V_plus_1:V_plus_1+num_durations].
     ggml_cgraph *  g_joint     = nullptr;
     ggml_gallocr_t alloc_joint = nullptr;
     ggml_tensor *  joint_frame_idx_in = nullptr;  // i32[1]
-    ggml_tensor *  joint_logits_out   = nullptr;  // f32[V_out]
+    ggml_tensor *  joint_token_out    = nullptr;  // i32[1] — token argmax
+    ggml_tensor *  joint_dur_out      = nullptr;  // i32[1] — duration argmax
 
     // (3) Fused LSTM + joint graph: used after a non-blank emission.
     //     LSTM updates h/c/pred from the last emitted token, then joint
     //     reads the *fresh* pred and enc_proj_persist[frame_idx] in the
     //     same compute_graph (one command-buffer commit instead of two).
+    //     Same on-device argmax as g_joint.
     ggml_cgraph *  g_lstm_joint     = nullptr;
     ggml_gallocr_t alloc_lstm_joint = nullptr;
     ggml_tensor *  lj_token_in        = nullptr;  // i32[1]
     ggml_tensor *  lj_frame_idx_in    = nullptr;  // i32[1]
-    ggml_tensor *  lj_logits_out      = nullptr;  // f32[V_out]
+    ggml_tensor *  lj_token_out       = nullptr;  // i32[1] — token argmax
+    ggml_tensor *  lj_dur_out         = nullptr;  // i32[1] — duration argmax
 
     struct EncProjGraph {
         // Each cached graph owns its own ggml_context for the cgraph + tensor

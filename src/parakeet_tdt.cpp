@@ -223,11 +223,24 @@ LstmBodyOuts build_lstm_body(TdtRuntimeWeights & rt,
 // up-to-date pred — pred_persist for the joint-only graph, or the
 // `pred_cpy` node returned by build_lstm_body for the fused graph (so
 // gallocr orders LSTM-cpy → joint-read correctly within one compute_graph).
-ggml_tensor * build_joint_body(const TdtRuntimeWeights & rt,
+//
+// Returns the (token_argmax, dur_argmax) pair as i32[1] tensors that
+// the host reads out per step.  Logits stay on the backend; only 2 ×
+// 4 B comes back to the host instead of V_out × 4 B (~32 KB at V_out
+// = 8198).  On Apple unified memory the difference is small (the 32 KB
+// readback is ~17 us); on a discrete GPU PCIe bus it's an
+// order-of-magnitude saving per emission step (~250 / call).
+struct JointBodyOuts {
+    ggml_tensor * token_argmax;  // i32[1], over logits[0 : V_plus_1]
+    ggml_tensor * dur_argmax;    // i32[1], over logits[V_plus_1 : V_plus_1 + num_durations]
+};
+JointBodyOuts build_joint_body(const TdtRuntimeWeights & rt,
                                ggml_context * gctx,
                                ggml_tensor * pred_src,
                                ggml_tensor * frame_idx_in) {
     const int H_joint = rt.H_joint;
+    const int V_p1    = rt.V_plus_1;
+    const int D_n     = rt.num_durations;
 
     // pred_proj = W_pred @ pred + b_pred
     ggml_tensor * pred_proj = ggml_mul_mat(gctx, rt.weights->joint_pred_w, pred_src);
@@ -241,10 +254,32 @@ ggml_tensor * build_joint_body(const TdtRuntimeWeights & rt,
     ggml_tensor * hidden = ggml_add(gctx, enc_proj_row, pred_proj);
     hidden = ggml_relu(gctx, hidden);
 
-    // logits = W_out @ hidden + b_out
+    // logits = W_out @ hidden + b_out -> shape (V_out, 1)
     ggml_tensor * logits = ggml_mul_mat(gctx, rt.weights->joint_out_w, hidden);
     logits = ggml_add(gctx, logits, rt.weights->joint_out_b);
-    return logits;
+
+    // ggml_argmax requires a matrix (ne[2] = ne[3] = 1) and reduces along
+    // ne[0].  Carve token / duration halves out of the contiguous (V_out,
+    // 1) logits tensor as ggml_view_2d slices, force contiguity (the
+    // duration slice has a non-zero offset, so its base pointer differs
+    // from the logits buffer's start, but its single row is otherwise
+    // contiguous; Metal's argmax kernel walks rows by nb01 anyway), then
+    // argmax each.
+    ggml_tensor * tok_logits = ggml_view_2d(gctx, logits,
+                                            V_p1, 1,
+                                            (size_t) V_p1 * sizeof(float),
+                                            (size_t) 0);
+    ggml_tensor * dur_logits = ggml_view_2d(gctx, logits,
+                                            D_n, 1,
+                                            (size_t) D_n * sizeof(float),
+                                            (size_t) V_p1 * sizeof(float));
+    tok_logits = ggml_cont(gctx, tok_logits);
+    dur_logits = ggml_cont(gctx, dur_logits);
+
+    JointBodyOuts outs{};
+    outs.token_argmax = ggml_argmax(gctx, tok_logits);  // i32[1]
+    outs.dur_argmax   = ggml_argmax(gctx, dur_logits);  // i32[1]
+    return outs;
 }
 
 // (1) Init-only LSTM graph. Used once per call (tdt_init_state) to seed
@@ -276,7 +311,9 @@ void build_lstm_graph(TdtRuntimeWeights & rt) {
 // (2) Joint-only graph. Used after a blank emission, when pred_persist
 //     is unchanged from the previous step. Pred is read straight from the
 //     persistent buffer, enc_proj_row is sliced via ggml_get_rows on a
-//     host-supplied frame index — only 4 B uploaded per step.
+//     host-supplied frame index — only 4 B uploaded per step.  Token +
+//     duration argmax are computed on-device so the readback is 2 × 4 B
+//     (i32 indices) instead of V_out × 4 B (~32 KB) full logits.
 void build_joint_graph(TdtRuntimeWeights & rt) {
     ggml_context * gctx = rt.gctx;
 
@@ -284,13 +321,17 @@ void build_joint_graph(TdtRuntimeWeights & rt) {
     ggml_set_name(rt.joint_frame_idx_in, "joint.frame_idx_in");
     ggml_set_input(rt.joint_frame_idx_in);
 
-    ggml_tensor * logits = build_joint_body(rt, gctx, rt.pred_persist, rt.joint_frame_idx_in);
-    rt.joint_logits_out = logits;
-    ggml_set_name(rt.joint_logits_out, "joint.logits");
-    ggml_set_output(rt.joint_logits_out);
+    JointBodyOuts outs = build_joint_body(rt, gctx, rt.pred_persist, rt.joint_frame_idx_in);
+    rt.joint_token_out = outs.token_argmax;
+    rt.joint_dur_out   = outs.dur_argmax;
+    ggml_set_name(rt.joint_token_out, "joint.token_argmax");
+    ggml_set_name(rt.joint_dur_out,   "joint.dur_argmax");
+    ggml_set_output(rt.joint_token_out);
+    ggml_set_output(rt.joint_dur_out);
 
-    rt.g_joint = ggml_new_graph_custom(gctx, /*size*/ 64, /*grads*/ false);
-    ggml_build_forward_expand(rt.g_joint, rt.joint_logits_out);
+    rt.g_joint = ggml_new_graph_custom(gctx, /*size*/ 96, /*grads*/ false);
+    ggml_build_forward_expand(rt.g_joint, rt.joint_token_out);
+    ggml_build_forward_expand(rt.g_joint, rt.joint_dur_out);
 }
 
 // (3) Fused LSTM + joint graph. Used after a non-blank emission.
@@ -319,18 +360,22 @@ void build_lstm_joint_graph(TdtRuntimeWeights & rt) {
     LstmBodyOuts lstm_outs = build_lstm_body(rt, gctx, rt.lj_token_in);
     // Use the pred_cpy node (not pred_persist directly) so the joint mat_muls
     // depend on the LSTM update finishing first.
-    ggml_tensor * logits = build_joint_body(rt, gctx, lstm_outs.pred_cpy, rt.lj_frame_idx_in);
-    rt.lj_logits_out = logits;
-    ggml_set_name(rt.lj_logits_out, "lstm_joint.logits");
-    ggml_set_output(rt.lj_logits_out);
+    JointBodyOuts joint_outs = build_joint_body(rt, gctx, lstm_outs.pred_cpy, rt.lj_frame_idx_in);
+    rt.lj_token_out = joint_outs.token_argmax;
+    rt.lj_dur_out   = joint_outs.dur_argmax;
+    ggml_set_name(rt.lj_token_out, "lstm_joint.token_argmax");
+    ggml_set_name(rt.lj_dur_out,   "lstm_joint.dur_argmax");
+    ggml_set_output(rt.lj_token_out);
+    ggml_set_output(rt.lj_dur_out);
     // Mark the LSTM cpy nodes as outputs too so gallocr keeps them alive
     // (their memory IS h_persist / c_persist; without the output flag the
     // gallocr might prune them as dead-end intermediate writes).
     ggml_set_output(lstm_outs.h_cpy);
     ggml_set_output(lstm_outs.c_cpy);
 
-    rt.g_lstm_joint = ggml_new_graph_custom(gctx, /*size*/ 320, /*grads*/ false);
-    ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_logits_out);
+    rt.g_lstm_joint = ggml_new_graph_custom(gctx, /*size*/ 384, /*grads*/ false);
+    ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_token_out);
+    ggml_build_forward_expand(rt.g_lstm_joint, rt.lj_dur_out);
     ggml_build_forward_expand(rt.g_lstm_joint, lstm_outs.h_cpy);
     ggml_build_forward_expand(rt.g_lstm_joint, lstm_outs.c_cpy);
 }
@@ -472,12 +517,14 @@ TdtRuntimeWeights & TdtRuntimeWeights::operator=(TdtRuntimeWeights && o) noexcep
     g_joint      = o.g_joint;        o.g_joint = nullptr;
     alloc_joint  = o.alloc_joint;    o.alloc_joint = nullptr;
     joint_frame_idx_in = o.joint_frame_idx_in; o.joint_frame_idx_in = nullptr;
-    joint_logits_out   = o.joint_logits_out;   o.joint_logits_out = nullptr;
+    joint_token_out    = o.joint_token_out;    o.joint_token_out = nullptr;
+    joint_dur_out      = o.joint_dur_out;      o.joint_dur_out = nullptr;
     g_lstm_joint     = o.g_lstm_joint;     o.g_lstm_joint = nullptr;
     alloc_lstm_joint = o.alloc_lstm_joint; o.alloc_lstm_joint = nullptr;
     lj_token_in     = o.lj_token_in;     o.lj_token_in = nullptr;
     lj_frame_idx_in = o.lj_frame_idx_in; o.lj_frame_idx_in = nullptr;
-    lj_logits_out   = o.lj_logits_out;   o.lj_logits_out = nullptr;
+    lj_token_out    = o.lj_token_out;    o.lj_token_out = nullptr;
+    lj_dur_out      = o.lj_dur_out;      o.lj_dur_out = nullptr;
     enc_proj_cache = std::move(o.enc_proj_cache);
     o.enc_proj_cache.clear();
     return *this;
@@ -648,11 +695,15 @@ bool run_lstm_init_step(TdtRuntimeWeights & rt, int token_id) {
 }
 
 // Joint-only step (used after a blank emission). pred_persist is unchanged
-// from the previous step; only enc_proj_persist[frame_idx] varies.
+// from the previous step; only enc_proj_persist[frame_idx] varies.  The
+// graph runs token + duration argmax on-device, so the host reads
+// 2 × 4 B (i32 indices) instead of V_out × 4 B (~32 KB) of logits per
+// step.  On Apple unified memory the difference is small; on a discrete
+// GPU PCIe bus it's an order-of-magnitude saving per emission.
 bool run_joint_step(TdtRuntimeWeights & rt,
                     int frame_idx,
-                    float * logits_out) {
-    const int V_out = rt.V_out;
+                    int * tok_out,
+                    int * dur_out) {
     const int32_t fi = (int32_t) frame_idx;
     ggml_backend_tensor_set(rt.joint_frame_idx_in, &fi, 0, sizeof(int32_t));
 
@@ -661,19 +712,23 @@ bool run_joint_step(TdtRuntimeWeights & rt,
         return false;
     }
 
-    ggml_backend_tensor_get(rt.joint_logits_out, logits_out, 0, (size_t) V_out * sizeof(float));
+    int32_t tok_val = 0, dur_val = 0;
+    ggml_backend_tensor_get(rt.joint_token_out, &tok_val, 0, sizeof(int32_t));
+    ggml_backend_tensor_get(rt.joint_dur_out,   &dur_val, 0, sizeof(int32_t));
+    *tok_out = (int) tok_val;
+    *dur_out = (int) dur_val;
     return true;
 }
 
 // Fused LSTM-then-joint step (used after a non-blank emission). One
 // command-buffer commit instead of two: LSTM updates pred_persist via
 // ggml_cpy, joint mat_muls depend on the cpy node so they read the fresh
-// pred in the same graph.
+// pred in the same graph.  Same on-device argmax shape as run_joint_step.
 bool run_lstm_joint_step(TdtRuntimeWeights & rt,
                          int token_id,
                          int frame_idx,
-                         float * logits_out) {
-    const int V_out = rt.V_out;
+                         int * tok_out,
+                         int * dur_out) {
     const int32_t tok = (int32_t) token_id;
     const int32_t fi  = (int32_t) frame_idx;
     ggml_backend_tensor_set(rt.lj_token_in,     &tok, 0, sizeof(int32_t));
@@ -684,7 +739,11 @@ bool run_lstm_joint_step(TdtRuntimeWeights & rt,
         return false;
     }
 
-    ggml_backend_tensor_get(rt.lj_logits_out, logits_out, 0, (size_t) V_out * sizeof(float));
+    int32_t tok_val = 0, dur_val = 0;
+    ggml_backend_tensor_get(rt.lj_token_out, &tok_val, 0, sizeof(int32_t));
+    ggml_backend_tensor_get(rt.lj_dur_out,   &dur_val, 0, sizeof(int32_t));
+    *tok_out = (int) tok_val;
+    *dur_out = (int) dur_val;
     return true;
 }
 
@@ -793,28 +852,35 @@ int tdt_decode_window(const ParakeetCtcModel & model,
         state.carry_frames -= t;
     }
 
-    // Phase 14 state machine: when we just emitted a non-blank token, the
+    // Phase 15 state machine: when we just emitted a non-blank token, the
     // *next* iteration must run the fused LSTM+joint graph (one commit)
     // to update pred_persist before joint reads it. Blank emissions leave
     // pred_persist untouched, so the next iteration uses joint-only.
+    //
+    // GPU path returns token + dur argmax i32 indices straight from the
+    // graph (8 B per step instead of V_out * 4 B logits readback); CPU
+    // fallback path stays scalar argmax over the full host-side logits
+    // buffer.
     int  pending_lstm_token = -1;  // < 0 means "no pending LSTM update"
     while (t < n_frames) {
+        int best_token = 0;
+        int best_dur_idx = 0;
         if (W.use_graphs) {
             if (pending_lstm_token >= 0) {
-                if (!run_lstm_joint_step(W, pending_lstm_token, t, logits.data())) return 7;
+                if (!run_lstm_joint_step(W, pending_lstm_token, t, &best_token, &best_dur_idx)) return 7;
                 pending_lstm_token = -1;
             } else {
-                if (!run_joint_step(W, t, logits.data())) return 8;
+                if (!run_joint_step(W, t, &best_token, &best_dur_idx)) return 8;
             }
         } else {
             const float * enc_frame = encoder_out_window + (size_t) t * D_enc;
             host_joint_step(W, enc_frame, state.pred_out.data(),
                             scratch_joint_hidden, logits);
+            best_token   = argmax_f32(logits.data(), V_p1);
+            best_dur_idx = argmax_f32(logits.data() + V_p1, D_n);
         }
         ++out_steps;
 
-        const int best_token   = argmax_f32(logits.data(), V_p1);
-        const int best_dur_idx = argmax_f32(logits.data() + V_p1, D_n);
         const int best_dur     = model.tdt_durations.empty()
                                    ? best_dur_idx
                                    : model.tdt_durations[best_dur_idx];
