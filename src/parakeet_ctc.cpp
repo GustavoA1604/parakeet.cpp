@@ -1683,11 +1683,19 @@ void ctc_greedy_decode_window(const float * logits,
 
     int32_t prev = inout_prev_token;
     for (int t = start_frame; t < end_frame; ++t) {
-        const float * row = logits + static_cast<size_t>(t) * vocab_size;
+        const float * __restrict row = logits + static_cast<size_t>(t) * vocab_size;
         int32_t best       = 0;
         float   best_score = row[0];
+        // The argmax-with-index reduction has a loop-carried dep on
+        // `best_score` / `best` so it doesn't auto-vectorise as cleanly
+        // as a plain reduction. `__restrict` + the explicit read into a
+        // register at least lets the compiler use a fused max-with-mask
+        // pattern on AVX2 / AVX-512. Same shape as the gemv treatment in
+        // parakeet_tdt.cpp::gemv_f32.
+        #pragma GCC ivdep
         for (int i = 1; i < vocab_size; ++i) {
-            if (row[i] > best_score) { best_score = row[i]; best = i; }
+            const float v = row[i];
+            if (v > best_score) { best_score = v; best = i; }
         }
         if (best != blank_id && best != prev) {
             out_tokens.push_back(best);

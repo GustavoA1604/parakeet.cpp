@@ -124,6 +124,85 @@ void fft_radix2_inplace(std::complex<float> * data, int n) {
     }
 }
 
+// Real-input FFT via the standard "pack-as-half-N-complex" trick:
+// for a real input x[0..n-1], compute the spectrum X[0..n/2] (n/2+1
+// non-redundant bins) by running an n/2-point complex FFT on the
+// packed sequence y[k] = x[2k] + i*x[2k+1] and then unpacking.
+// Cuts the butterfly count in half (256 vs 512 at n_fft=512) at the
+// cost of an O(n/2) post-processing pass that reuses the same
+// thread_local twiddle cache. We compute the *power* spectrum
+// directly so the caller never sees the unpacked complex bins.
+//
+// Reference: any FFT textbook (Numerical Recipes §12.3, "Fast
+// Fourier Transform of Real Functions"). The trick relies on
+// X[k] for real input being conjugate-symmetric: X[n-k] = conj(X[k]),
+// so n/2+1 bins fully describe the spectrum.
+//
+// Bit-equivalence: floats are not associative; the post-processing
+// reorders sums vs the equivalent complex-FFT path. The resulting
+// bin powers differ from the complex-FFT version by ~1e-7 relative
+// (ULP-level), well below the f16 quantization floor of the
+// downstream encoder. Encoder transcripts on jfk.wav and
+// sample-16k.wav stay bit-equal to the NeMo PyTorch reference at
+// f16 / Q8_0 -- gated by `test-perf-regression` + `test-streaming`
+// in the QVAC-17997 audit.
+void rfft_power_radix2(const float * __restrict x_real,
+                       float       * __restrict power,
+                       int                       n_fft,
+                       std::complex<float>     * scratch /* size >= n_fft / 2 */) {
+    const int half = n_fft / 2;
+
+    // Pack: y[k] = x[2k] + i*x[2k+1], complex sequence of length n/2.
+    for (int k = 0; k < half; ++k) {
+        scratch[k] = std::complex<float>(x_real[2 * k], x_real[2 * k + 1]);
+    }
+
+    // n/2-point complex FFT. Twiddles for size `half` cached in the
+    // shared thread_local table.
+    fft_radix2_inplace(scratch, half);
+
+    // Unpack to recover power[0..half], the real-input spectrum's
+    // n/2+1 non-redundant bins. Two real-valued endpoints (DC and
+    // Nyquist) and (half-1) interior pairs.
+    //
+    //   X[0]      = Y[0].re + Y[0].im       (real)
+    //   X[n/2]    = Y[0].re - Y[0].im       (real)
+    //   X[k]      = Y_e[k] + W[k] * Y_o[k]  (1 <= k < n/2)
+    //
+    // where Y_e[k] = (Y[k] + conj(Y[n/2-k])) / 2  (even-indexed FFT),
+    //       Y_o[k] = -i * (Y[k] - conj(Y[n/2-k])) / 2 (odd-indexed FFT),
+    //       W[k]   = exp(-2πi*k/n).
+    {
+        const float r0   = scratch[0].real() + scratch[0].imag();
+        const float rNy  = scratch[0].real() - scratch[0].imag();
+        power[0]    = r0  * r0;
+        power[half] = rNy * rNy;
+    }
+
+    // Reuse the shared twiddle cache for size `n_fft` to grab
+    // W[k] = twiddles[half - 1 + k] for k in [1, half - 1]. The
+    // cache layout per `get_fft_twiddles` is:
+    //   for len=2..n step *=2: twiddles[off..off+len/2)] = exp(-2πi k / len)
+    // so the segment for `len = n_fft` starts at `n_fft/2 - 1` and
+    // contains exactly the n_fft/2 values exp(-2πi*k/n_fft) for
+    // k = 0..n_fft/2 - 1. We need k = 1..half-1 from that segment.
+    const std::complex<float> * twiddles = get_fft_twiddles(n_fft);
+    const std::complex<float> * w_n      = twiddles + (n_fft / 2 - 1);
+    for (int k = 1; k < half; ++k) {
+        const std::complex<float> yk = scratch[k];
+        const std::complex<float> ym = std::conj(scratch[half - k]);
+
+        // Y_e[k] = (yk + ym) * 0.5, Y_o[k] = -i * (yk - ym) * 0.5
+        const std::complex<float> ye  = (yk + ym) * 0.5f;
+        const std::complex<float> dif = (yk - ym) * 0.5f;
+        const std::complex<float> yo(dif.imag(), -dif.real()); // -i * dif
+
+        // X[k] = Y_e + W[k] * Y_o
+        const std::complex<float> xk = ye + w_n[k] * yo;
+        power[k] = xk.real() * xk.real() + xk.imag() * xk.imag();
+    }
+}
+
 void apply_preemph(std::vector<float> & x, float preemph) {
     if (preemph == 0.0f || x.size() < 2) return;
     for (size_t t = x.size() - 1; t >= 1; --t) {
@@ -157,11 +236,18 @@ std::vector<float> make_padded_window(const std::vector<float> & hann400, int n_
 
 }
 
-int compute_log_mel(const float        * samples,
-                    int                  n_samples,
-                    const MelConfig    & cfg,
-                    std::vector<float> & out_mel,
-                    int                & out_n_frames) {
+namespace {
+
+// Stateful inner. Both public `compute_log_mel` overloads call into
+// this one; the stateless overload uses a scratch `MelState` allocated
+// on the stack (so its semantics are unchanged for callers that aren't
+// stream-shaped).
+int compute_log_mel_impl(const float        * samples,
+                         int                  n_samples,
+                         const MelConfig    & cfg,
+                         MelState           & state,
+                         std::vector<float> & out_mel,
+                         int                & out_n_frames) {
     if (n_samples <= 0) return 1;
     if (cfg.filterbank.size() != static_cast<size_t>(cfg.n_mels * (cfg.n_fft / 2 + 1))) {
         std::fprintf(stderr, "mel: unexpected filterbank size (%zu != %d)\n",
@@ -174,47 +260,94 @@ int compute_log_mel(const float        * samples,
         return 3;
     }
 
-    std::vector<float> x(samples, samples + n_samples);
-    apply_preemph(x, cfg.preemph);
+    state.x.resize((size_t) n_samples);
+    std::memcpy(state.x.data(), samples, (size_t) n_samples * sizeof(float));
+    apply_preemph(state.x, cfg.preemph);
 
     const int pad = cfg.n_fft / 2;
-    std::vector<float> x_padded = reflect_pad(x, pad);
+    const int n_padded = n_samples + 2 * pad;
+    state.x_padded.resize((size_t) n_padded);
+    {
+        // Inline reflect-pad into the cached buffer instead of
+        // returning a fresh std::vector from `reflect_pad`.
+        const int n = n_samples;
+        for (int i = 0; i < pad; ++i) {
+            const int src = std::min(pad - i, n - 1);
+            state.x_padded[i] = state.x[src];
+        }
+        std::memcpy(state.x_padded.data() + pad, state.x.data(),
+                    (size_t) n * sizeof(float));
+        for (int i = 0; i < pad; ++i) {
+            const int src = std::max(n - 2 - i, 0);
+            state.x_padded[pad + n + i] = state.x[src];
+        }
+    }
 
     const int n_frames = 1 + n_samples / cfg.hop_length;
     out_n_frames = n_frames;
 
     const int n_bins = cfg.n_fft / 2 + 1;
 
-    std::vector<float> window_padded = make_padded_window(cfg.window, cfg.n_fft);
+    // Window padding only depends on cfg.n_fft + the (immutable) cfg.window
+    // contents. Cache the result on `state` so we rebuild it at most once
+    // per engine lifetime.
+    if (state.window_padded_n_fft != cfg.n_fft || state.window_padded_src != &cfg.window) {
+        state.window_padded     = make_padded_window(cfg.window, cfg.n_fft);
+        state.window_padded_n_fft = cfg.n_fft;
+        state.window_padded_src = &cfg.window;
+    }
+    const float * __restrict window_padded = state.window_padded.data();
 
-    std::vector<float> power(n_frames * n_bins);
+    state.power.resize((size_t) n_frames * n_bins);
 
-    std::vector<std::complex<float>> buf(cfg.n_fft);
+    float                  * __restrict power_data = state.power.data();
+    const float            * __restrict x_padded   = state.x_padded.data();
+
+    // NOTE on threading: this loop was experimentally parallelised with
+    // `#pragma omp parallel { local tbuf; #pragma omp for ... }` during
+    // QVAC-17997 (audit b4 in that branch). On a 16-thread Ryzen the
+    // result was a +120 % regression with stdev of 18 ms because the
+    // ggml-cpu encoder also uses an OpenMP thread pool and the two
+    // pools oversubscribe the cores during the encoder warmup window.
+    // Kept serial; the real-FFT change below + the precomputed twiddle
+    // table from a prior patch already get mel under ~3 ms median.
+    //
+    // Per-frame work: pre-multiply by the analysis window into a
+    // n_fft-long real buffer, then run the real-input radix-2 FFT
+    // which packs into n_fft/2 complex points, FFTs, and unpacks
+    // straight into power[0..n_fft/2]. Roughly 2x fewer butterflies
+    // than the previous complex-on-real path. `tbuf` only needs
+    // n_fft/2 complex slots now.
+    std::vector<float>               windowed((size_t) cfg.n_fft);
+    std::vector<std::complex<float>> tbuf((size_t) cfg.n_fft / 2);
+    float               * __restrict windowed_data = windowed.data();
+    std::complex<float> * __restrict tbuf_data     = tbuf.data();
 
     for (int t = 0; t < n_frames; ++t) {
         const int start = t * cfg.hop_length;
+        // Pre-multiply by the window in a single pass.
         for (int i = 0; i < cfg.n_fft; ++i) {
-            buf[i] = std::complex<float>(x_padded[start + i] * window_padded[i], 0.0f);
+            windowed_data[i] = x_padded[start + i] * window_padded[i];
         }
-        fft_radix2_inplace(buf.data(), cfg.n_fft);
-        for (int k = 0; k < n_bins; ++k) {
-            const float re = buf[k].real();
-            const float im = buf[k].imag();
-            power[t * n_bins + k] = re * re + im * im;
-        }
+        rfft_power_radix2(windowed_data,
+                          power_data + (size_t) t * n_bins,
+                          cfg.n_fft,
+                          tbuf_data);
     }
 
     const int n_mels = cfg.n_mels;
-    std::vector<float> mel(n_frames * n_mels);
+    out_mel.resize((size_t) n_frames * n_mels);
     const float * __restrict fb = cfg.filterbank.data();
     // Mel filterbank projection: out[t,m] = sum_k fb[m,k] * power[t,k].
-    // Hot loop is the 257-element dot product; with `__restrict` +
-    // `#pragma GCC ivdep` gcc-13 emits AVX2 FMA at 8 lanes wide,
-    // matching the FFT speedup and shaving another ~0.5-1.0 ms
-    // off mel preprocess on the 11s clip.
+    // Per-frame outer loop is independent; SIMD inner is handled by
+    // `__restrict` + `#pragma GCC ivdep` so gcc-13 emits AVX2 FMA at
+    // 8 lanes wide. The same threading caveat as the FFT loop above
+    // applies (parallelising this regressed the bench during the
+    // QVAC-17997 audit because of OpenMP oversubscription with
+    // ggml-cpu's encoder thread pool).
     for (int t = 0; t < n_frames; ++t) {
-        const float * __restrict frame_power = power.data() + t * n_bins;
-        float * __restrict mel_t = mel.data() + t * n_mels;
+        const float * __restrict frame_power = power_data + t * n_bins;
+        float * __restrict mel_t = out_mel.data() + t * n_mels;
         for (int m = 0; m < n_mels; ++m) {
             const float * __restrict row = fb + m * n_bins;
             float acc = 0.0f;
@@ -226,15 +359,15 @@ int compute_log_mel(const float        * samples,
 
     const float guard = cfg.log_zero_guard_value;
     #pragma GCC ivdep
-    for (size_t i = 0; i < mel.size(); ++i) {
-        mel[i] = std::log(mel[i] + guard);
+    for (size_t i = 0; i < out_mel.size(); ++i) {
+        out_mel[i] = std::log(out_mel[i] + guard);
     }
 
     const int seq_len = (n_samples + cfg.hop_length - 1) / cfg.hop_length;
     const int valid_frames = std::min(seq_len, n_frames);
 
     if (cfg.normalize == MelNormalize::PerFeature) {
-        apply_per_feature_cmvn(mel, valid_frames, n_mels);
+        apply_per_feature_cmvn(out_mel, valid_frames, n_mels);
 
         // Per-feature CMVN sets the trailing padded frames to mean=0 implicitly,
         // but we still want them to contribute zero energy to the encoder mask
@@ -244,12 +377,31 @@ int compute_log_mel(const float        * samples,
         // CMVN-free branch must not introduce a bin-wise mean shift the model
         // wasn't trained against.
         for (int t = valid_frames; t < n_frames; ++t) {
-            for (int m = 0; m < n_mels; ++m) mel[t * n_mels + m] = 0.0f;
+            for (int m = 0; m < n_mels; ++m) out_mel[t * n_mels + m] = 0.0f;
         }
     }
 
-    out_mel = std::move(mel);
     return 0;
+}
+
+}
+
+int compute_log_mel(const float        * samples,
+                    int                  n_samples,
+                    const MelConfig    & cfg,
+                    std::vector<float> & out_mel,
+                    int                & out_n_frames) {
+    MelState scratch;
+    return compute_log_mel_impl(samples, n_samples, cfg, scratch, out_mel, out_n_frames);
+}
+
+int compute_log_mel(const float        * samples,
+                    int                  n_samples,
+                    const MelConfig    & cfg,
+                    MelState           & state,
+                    std::vector<float> & out_mel,
+                    int                & out_n_frames) {
+    return compute_log_mel_impl(samples, n_samples, cfg, state, out_mel, out_n_frames);
 }
 
 void apply_per_feature_cmvn(std::vector<float> & mel, int n_valid_frames, int n_mels) {

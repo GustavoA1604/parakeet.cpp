@@ -18,6 +18,18 @@ option(QVAC_PARAKEET_BUILD_TESTS       "qvac-parakeet: build per-stage numerical
 option(QVAC_PARAKEET_BUILD_EXAMPLES    "qvac-parakeet: build standalone examples (live-mic, ...)"              ${QVAC_PARAKEET_STANDALONE_DEFAULT})
 option(QVAC_PARAKEET_INSTALL           "qvac-parakeet: generate install rules"                                 ON)
 option(QVAC_PARAKEET_USE_SYSTEM_GGML   "qvac-parakeet: use system-installed GGML library"                      OFF)
+option(QVAC_PARAKEET_CCACHE            "qvac-parakeet: use ccache as compiler launcher if available"           ON)
+
+# ccache shaves ~30 % off iterative rebuild time on developer machines.
+# Opt-out via -DQVAC_PARAKEET_CCACHE=OFF for clean reproducibility runs.
+if (QVAC_PARAKEET_CCACHE)
+    find_program(QVAC_PARAKEET_CCACHE_PROGRAM ccache)
+    if (QVAC_PARAKEET_CCACHE_PROGRAM)
+        message(STATUS "qvac-parakeet: using ccache at ${QVAC_PARAKEET_CCACHE_PROGRAM}")
+        set(CMAKE_C_COMPILER_LAUNCHER   "${QVAC_PARAKEET_CCACHE_PROGRAM}")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${QVAC_PARAKEET_CCACHE_PROGRAM}")
+    endif()
+endif()
 
 if (CMAKE_CROSSCOMPILING)
     if (NOT DEFINED GGML_NATIVE OR GGML_NATIVE)
@@ -101,6 +113,21 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_OPENCL)
     endif()
 
+    # `PARAKEET_EXPERIMENTAL_FLASH_ATTN` historically gates the
+    # rel-pos MHA fused-attention path in `parakeet_ctc.cpp`. Off by
+    # default during the QVAC-17997 audit because flipping it on CPU
+    # measurably changed the rel-pos BD computation order (cast-to-f16
+    # mask before softmax) and risked transcript drift on the
+    # bit-equal-NeMo gate. Surfaced as an opt-in CMake flag so first
+    # Adreno bring-up can A/B it -- ggml-opencl supports
+    # `flash_attn_ext` for head_dim in {40,64,80,96,112,128,192,256},
+    # which covers every parakeet target except Sortformer's
+    # tf_d_model=192/8=24 transformer head. See FINDINGS §5 row "A2".
+    option(QVAC_PARAKEET_FLASH_ATTN "qvac-parakeet: enable experimental fused flash-attn in MHA (off by default; bench-validate per backend before shipping)" OFF)
+    if (QVAC_PARAKEET_FLASH_ATTN)
+        target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
+    endif()
+
     set_target_properties(qvac-parakeet PROPERTIES
         POSITION_INDEPENDENT_CODE ON
         EXPORT_NAME qvac-parakeet
@@ -152,6 +179,9 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         if (GGML_OPENCL)
             target_compile_definitions(${target} PRIVATE GGML_USE_OPENCL)
         endif()
+        if (QVAC_PARAKEET_FLASH_ATTN)
+            target_compile_definitions(${target} PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
+        endif()
     endfunction()
 
     add_executable(test-mel
@@ -196,6 +226,27 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     add_executable(test-perf-regression src/test_perf_regression.cpp)
     target_link_libraries(test-perf-regression PRIVATE qvac-parakeet)
     target_include_directories(test-perf-regression PRIVATE include src ggml/include)
+
+    # Internal regression gate for the round-2 mel preprocess sweep
+    # (real-FFT, MelState reuse). Pure unit test -- no GGUF needed.
+    add_executable(test-mel-fft-parity
+        src/test_mel_fft_parity.cpp
+        src/mel_preprocess.cpp)
+    target_link_libraries(test-mel-fft-parity PRIVATE ggml)
+    target_include_directories(test-mel-fft-parity PRIVATE ggml/include src include)
+    qvac_parakeet_apply_backend_defs(test-mel-fft-parity)
+
+    # Regression gate for the round-1 capture_intermediates flag.
+    # Asserts run_encoder(capture=true) and (capture=false) produce
+    # bit-equal encoder_out + logits on a CTC GGUF.
+    add_executable(test-encoder-capture-parity
+        src/test_encoder_capture_parity.cpp
+        src/parakeet_ctc.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp)
+    target_link_libraries(test-encoder-capture-parity PRIVATE ggml)
+    target_include_directories(test-encoder-capture-parity PRIVATE ggml/include src include)
+    qvac_parakeet_apply_backend_defs(test-encoder-capture-parity)
 
     add_executable(test-tdt-encoder-parity
         src/test_tdt_encoder_parity.cpp
