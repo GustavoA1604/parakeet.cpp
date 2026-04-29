@@ -36,6 +36,13 @@ struct Opts {
     int n_gpu_layers = 0;
     double max_enc_ms = 0.0;
     double cache_hit_ratio_max = 1.10; // warm enc_ms must be ≤ 1.10x median
+    // QVAC-17997 round-3 additions: catch FFT-specific regressions
+    // (mel jumps from ~2.8 ms back toward ~5.5 ms if A1 real-FFT
+    // breaks) and Adreno cold-start regressions (warmup_1 enc_ms
+    // ≫ steady-state median if the kernel binary cache patch
+    // regresses or `clBuildProgram` hot path resurfaces).
+    double max_mel_ms = 0.0;
+    double max_cold_overhead_ratio = 0.0; // 0 = disabled
 };
 
 void usage(const char * argv0) {
@@ -51,7 +58,15 @@ void usage(const char * argv0) {
         "  --threads N          CPU threads (0 = HW concurrency)\n"
         "  --n-gpu-layers N     pass-through to Engine\n"
         "  --max-enc-ms F       fail if any timed run's encoder_ms exceeds this\n"
-        "  --cache-hit-ratio F  fail if any timed encoder_ms exceeds median*F (default 1.10)\n",
+        "  --cache-hit-ratio F  fail if any timed encoder_ms exceeds median*F (default 1.10)\n"
+        "  --max-mel-ms F       fail if any timed run's mel_ms exceeds this (catches\n"
+        "                       FFT regressions specifically; mel runs host-side on\n"
+        "                       every backend, so the budget is the same on Adreno)\n"
+        "  --max-cold-overhead-ratio F  fail if first warmup's enc_ms exceeds median*F.\n"
+        "                       0 = disabled (default). Useful on Adreno + GGML_OPENCL_CACHE_DIR\n"
+        "                       to assert the kernel binary cache cuts cold-start to within\n"
+        "                       F\u00d7 of warm; suggested 1.5\u20132.0x when the cache is warm\n"
+        "                       across processes.\n",
         argv0);
 }
 
@@ -70,6 +85,8 @@ int main(int argc, char ** argv) {
         else if (a == "--n-gpu-layers" && i + 1 < argc)       o.n_gpu_layers = std::atoi(argv[++i]);
         else if (a == "--max-enc-ms" && i + 1 < argc)         o.max_enc_ms = std::atof(argv[++i]);
         else if (a == "--cache-hit-ratio" && i + 1 < argc)    o.cache_hit_ratio_max = std::atof(argv[++i]);
+        else if (a == "--max-mel-ms" && i + 1 < argc)         o.max_mel_ms = std::atof(argv[++i]);
+        else if (a == "--max-cold-overhead-ratio" && i + 1 < argc) o.max_cold_overhead_ratio = std::atof(argv[++i]);
         else if (a == "--help" || a == "-h")                  { usage(argv[0]); return 0; }
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); usage(argv[0]); return 2; }
     }
@@ -90,7 +107,16 @@ int main(int argc, char ** argv) {
 
     std::string reference_text;
     std::vector<double> enc_ms;
+    std::vector<double> mel_ms;
     enc_ms.reserve(o.n_runs);
+    mel_ms.reserve(o.n_runs);
+
+    // Track the first warmup's enc_ms separately for the cold-start
+    // overhead gate (--max-cold-overhead-ratio). On Adreno + warm
+    // GGML_OPENCL_CACHE_DIR this should be close to median; on a
+    // cold cache it'll be the multi-second outlier the
+    // ggml-opencl-program-binary-cache.patch is meant to eliminate.
+    double first_warmup_enc_ms = -1.0;
 
     const auto run_once = [&](int idx, bool is_warmup) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -98,11 +124,13 @@ int main(int argc, char ** argv) {
         const double total_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - t0).count() / 1000.0;
         const double enc = res.encoder_ms > 0.0 ? res.encoder_ms : total_ms;
-        std::fprintf(stderr, "[test-perf-regression] %s %d/%d  enc=%.2fms total=%.2fms\n",
+        const double mel = res.preprocess_ms;
+        std::fprintf(stderr, "[test-perf-regression] %s %d/%d  mel=%.2fms enc=%.2fms total=%.2fms\n",
                      is_warmup ? "warmup" : "run", idx, is_warmup ? o.n_warmup : o.n_runs,
-                     enc, total_ms);
+                     mel, enc, total_ms);
         if (idx == 1 && is_warmup) {
             reference_text = res.text;
+            first_warmup_enc_ms = enc;
             if (!o.expected_text.empty() && res.text != o.expected_text) {
                 std::fprintf(stderr,
                     "[test-perf-regression] FAIL: transcript mismatch\n"
@@ -117,7 +145,10 @@ int main(int argc, char ** argv) {
                 idx, reference_text.c_str(), res.text.c_str());
             std::exit(1);
         }
-        if (!is_warmup) enc_ms.push_back(enc);
+        if (!is_warmup) {
+            enc_ms.push_back(enc);
+            mel_ms.push_back(mel);
+        }
     };
 
     for (int i = 1; i <= o.n_warmup; ++i) run_once(i, true);
@@ -128,29 +159,56 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    std::vector<double> sorted = enc_ms;
-    std::sort(sorted.begin(), sorted.end());
-    const double median = sorted[sorted.size() / 2];
-    const double max_v  = sorted.back();
-    const double min_v  = sorted.front();
-    const double mean   = std::accumulate(sorted.begin(), sorted.end(), 0.0) / sorted.size();
+    auto stats = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return std::tuple<double, double, double, double>(
+            std::accumulate(v.begin(), v.end(), 0.0) / v.size(),  // mean
+            v[v.size() / 2],                                       // median
+            v.front(),                                             // min
+            v.back());                                             // max
+    };
+    auto [enc_mean, enc_median, enc_min, enc_max] = stats(enc_ms);
+    auto [mel_mean, mel_median, mel_min, mel_max] = stats(mel_ms);
 
     std::fprintf(stderr,
         "[test-perf-regression] enc_ms summary  mean=%.2f  median=%.2f  min=%.2f  max=%.2f\n",
-        mean, median, min_v, max_v);
+        enc_mean, enc_median, enc_min, enc_max);
+    std::fprintf(stderr,
+        "[test-perf-regression] mel_ms summary  mean=%.2f  median=%.2f  min=%.2f  max=%.2f\n",
+        mel_mean, mel_median, mel_min, mel_max);
 
-    if (o.max_enc_ms > 0.0 && max_v > o.max_enc_ms) {
+    if (o.max_enc_ms > 0.0 && enc_max > o.max_enc_ms) {
         std::fprintf(stderr,
             "[test-perf-regression] FAIL: max enc_ms %.2f > ceiling %.2f\n",
-            max_v, o.max_enc_ms);
+            enc_max, o.max_enc_ms);
         return 1;
     }
-    const double ratio = max_v / median;
+    if (o.max_mel_ms > 0.0 && mel_max > o.max_mel_ms) {
+        std::fprintf(stderr,
+            "[test-perf-regression] FAIL: max mel_ms %.2f > ceiling %.2f "
+            "(FFT regression in mel preprocess?)\n",
+            mel_max, o.max_mel_ms);
+        return 1;
+    }
+    const double ratio = enc_max / enc_median;
     if (ratio > o.cache_hit_ratio_max) {
         std::fprintf(stderr,
             "[test-perf-regression] FAIL: max/median = %.2fx > %.2fx (cache miss in steady state?)\n",
             ratio, o.cache_hit_ratio_max);
         return 1;
+    }
+    if (o.max_cold_overhead_ratio > 0.0 && first_warmup_enc_ms > 0.0) {
+        const double cold_ratio = first_warmup_enc_ms / enc_median;
+        if (cold_ratio > o.max_cold_overhead_ratio) {
+            std::fprintf(stderr,
+                "[test-perf-regression] FAIL: warmup_1/median = %.2fx > %.2fx "
+                "(kernel binary cache regressed? GGML_OPENCL_CACHE_DIR not set?)\n",
+                cold_ratio, o.max_cold_overhead_ratio);
+            return 1;
+        }
+        std::fprintf(stderr,
+            "[test-perf-regression] cold-overhead: warmup_1=%.2fms median=%.2fms ratio=%.2fx (limit %.2fx)\n",
+            first_warmup_enc_ms, enc_median, cold_ratio, o.max_cold_overhead_ratio);
     }
 
     std::fprintf(stderr, "[test-perf-regression] PASS  transcript: \"%s\"\n",
