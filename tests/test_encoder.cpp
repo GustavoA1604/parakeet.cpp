@@ -83,24 +83,27 @@ void compute_parity(const std::vector<float> & a, const std::vector<float> & b,
 int main(int argc, char ** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: %s <parakeet-ctc.gguf> <reference-dir>\n"
+            "usage: %s <parakeet-ctc.gguf> <reference-dir> [n_gpu_layers]\n"
             "\n"
             "walks through per-stage reference tensors produced by\n"
             "scripts/dump-ctc-reference.py and asserts parity for each stage.\n"
             "\n"
             "stages checked:\n"
-            "  1. subsampling_out.npy   (n_enc_frames, d_model) f32\n",
+            "  1. subsampling_out.npy   (n_enc_frames, d_model) f32\n"
+            "\n"
+            "n_gpu_layers: 0 (default) = CPU, >0 = GPU backend if compiled in.\n",
             argv[0]);
         return 2;
     }
 
     const std::string gguf_path = argv[1];
     const std::string ref_dir   = argv[2];
+    const int n_gpu_layers = (argc >= 4) ? std::atoi(argv[3]) : 0;
 
     using namespace qvac_parakeet::ctc;
 
     ParakeetCtcModel model;
-    if (int rc = load_from_gguf(gguf_path, model, 0, 0, true); rc != 0) return rc;
+    if (int rc = load_from_gguf(gguf_path, model, 0, n_gpu_layers, true); rc != 0) return rc;
 
     std::vector<float> ref_mel;
     std::vector<int64_t> mel_shape;
