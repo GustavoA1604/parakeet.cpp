@@ -17,6 +17,13 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+static int parakeet_setenv(const char * name, const char * value, int /*overwrite*/) {
+    return _putenv_s(name, value);
+}
+#define setenv parakeet_setenv
+#endif
+
 namespace {
 
 void print_usage(const char * argv0) {
