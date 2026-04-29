@@ -180,10 +180,17 @@ std::string get_str(const gguf_context * g, const std::string & k, const std::st
 std::vector<float> read_filterbank_to_vector(ggml_tensor * t) {
     const size_t n_elts = ggml_nelements(t);
     std::vector<float> out(n_elts);
-    if (t->type == GGML_TYPE_F32) {
-        std::memcpy(out.data(), t->data, n_elts * sizeof(float));
-    } else {
+    if (t->type != GGML_TYPE_F32) {
         throw std::runtime_error("preproc tensor type must be f32");
+    }
+    // Use the backend-aware accessor so this works on CUDA / Vulkan where
+    // t->data is a device pointer (memcpy from a device pointer would
+    // segfault).  CPU/Metal backends with host-mapped buffers are handled
+    // by the same path (it falls through to a memcpy).
+    if (t->buffer != nullptr) {
+        ggml_backend_tensor_get(t, out.data(), 0, n_elts * sizeof(float));
+    } else {
+        std::memcpy(out.data(), t->data, n_elts * sizeof(float));
     }
     return out;
 }
