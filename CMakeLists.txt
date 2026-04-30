@@ -16,20 +16,31 @@ option(QVAC_PARAKEET_BUILD_LIBRARY     "qvac-parakeet: build the static qvac-par
 option(QVAC_PARAKEET_BUILD_EXECUTABLES "qvac-parakeet: build the qvac-parakeet CLI"                            ${QVAC_PARAKEET_STANDALONE_DEFAULT})
 option(QVAC_PARAKEET_BUILD_TESTS       "qvac-parakeet: build per-stage numerical validation harnesses"         ${QVAC_PARAKEET_STANDALONE_DEFAULT})
 option(QVAC_PARAKEET_BUILD_EXAMPLES    "qvac-parakeet: build standalone examples (live-mic, ...)"              ${QVAC_PARAKEET_STANDALONE_DEFAULT})
+option(QVAC_PARAKEET_BUILD_TOOLS       "qvac-parakeet: build optional dev/CI tools (probe-opencl, ...)"        OFF)
 option(QVAC_PARAKEET_INSTALL           "qvac-parakeet: generate install rules"                                 ON)
 option(QVAC_PARAKEET_USE_SYSTEM_GGML   "qvac-parakeet: use system-installed GGML library"                      OFF)
 option(QVAC_PARAKEET_CCACHE            "qvac-parakeet: use ccache as compiler launcher if available"           ON)
 
 # ccache shaves ~30 % off iterative rebuild time on developer machines.
 # Opt-out via -DQVAC_PARAKEET_CCACHE=OFF for clean reproducibility runs.
+# Scoped to qvac-parakeet's own targets via the helper below; ggml has
+# its own GGML_CCACHE option which we leave alone so the two launchers
+# don't double-up on the ggml subdirectory.
 if (QVAC_PARAKEET_CCACHE)
     find_program(QVAC_PARAKEET_CCACHE_PROGRAM ccache)
     if (QVAC_PARAKEET_CCACHE_PROGRAM)
-        message(STATUS "qvac-parakeet: using ccache at ${QVAC_PARAKEET_CCACHE_PROGRAM}")
-        set(CMAKE_C_COMPILER_LAUNCHER   "${QVAC_PARAKEET_CCACHE_PROGRAM}")
-        set(CMAKE_CXX_COMPILER_LAUNCHER "${QVAC_PARAKEET_CCACHE_PROGRAM}")
+        message(STATUS "qvac-parakeet: using ccache at ${QVAC_PARAKEET_CCACHE_PROGRAM} (qvac-parakeet targets only; ggml uses GGML_CCACHE)")
     endif()
 endif()
+
+function(qvac_parakeet_apply_ccache target)
+    if (QVAC_PARAKEET_CCACHE_PROGRAM)
+        set_target_properties(${target} PROPERTIES
+            C_COMPILER_LAUNCHER   "${QVAC_PARAKEET_CCACHE_PROGRAM}"
+            CXX_COMPILER_LAUNCHER "${QVAC_PARAKEET_CCACHE_PROGRAM}"
+        )
+    endif()
+endfunction()
 
 if (CMAKE_CROSSCOMPILING)
     if (NOT DEFINED GGML_NATIVE OR GGML_NATIVE)
@@ -79,6 +90,7 @@ set(QVAC_PARAKEET_LIB_SOURCES
 if (QVAC_PARAKEET_BUILD_LIBRARY)
     add_library(qvac-parakeet STATIC ${QVAC_PARAKEET_LIB_SOURCES})
     add_library(qvac-parakeet::qvac-parakeet ALIAS qvac-parakeet)
+    qvac_parakeet_apply_ccache(qvac-parakeet)
 
     target_include_directories(qvac-parakeet
         PUBLIC
@@ -107,7 +119,7 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_VULKAN)
     endif()
     # GGML_USE_BLAS already surfaced above (matches upstream 8da4939's
-    # placement; the QVAC-17997 wire-up originally re-added it before
+    # placement; the OpenCL wire-up originally re-added it before
     # GGML_USE_CUDA which is now redundant after the rebase).
     if (GGML_OPENCL)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_OPENCL)
@@ -115,14 +127,14 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
 
     # `PARAKEET_EXPERIMENTAL_FLASH_ATTN` historically gates the
     # rel-pos MHA fused-attention path in `parakeet_ctc.cpp`. Off by
-    # default during the QVAC-17997 audit because flipping it on CPU
+    # default during the optimization audit because flipping it on CPU
     # measurably changed the rel-pos BD computation order (cast-to-f16
     # mask before softmax) and risked transcript drift on the
     # bit-equal-NeMo gate. Surfaced as an opt-in CMake flag so first
     # Adreno bring-up can A/B it -- ggml-opencl supports
     # `flash_attn_ext` for head_dim in {40,64,80,96,112,128,192,256},
     # which covers every parakeet target except Sortformer's
-    # tf_d_model=192/8=24 transformer head. See FINDINGS §5 row "A2".
+    # tf_d_model=192/8=24 transformer head.
     option(QVAC_PARAKEET_FLASH_ATTN "qvac-parakeet: enable experimental fused flash-attn in MHA (off by default; bench-validate per backend before shipping)" OFF)
     if (QVAC_PARAKEET_FLASH_ATTN)
         target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
@@ -154,6 +166,7 @@ if (QVAC_PARAKEET_BUILD_EXECUTABLES)
     target_link_libraries(qvac-parakeet-cli PRIVATE qvac-parakeet)
     target_include_directories(qvac-parakeet-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     set_target_properties(qvac-parakeet-cli PROPERTIES OUTPUT_NAME qvac-parakeet)
+    qvac_parakeet_apply_ccache(qvac-parakeet-cli)
 endif()
 
 if (QVAC_PARAKEET_BUILD_TESTS)
@@ -182,6 +195,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         if (QVAC_PARAKEET_FLASH_ATTN)
             target_compile_definitions(${target} PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
         endif()
+        qvac_parakeet_apply_ccache(${target})
     endfunction()
 
     add_executable(test-mel
@@ -214,18 +228,22 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     add_executable(test-streaming src/test_streaming.cpp)
     target_link_libraries(test-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-streaming PRIVATE include src ggml/include)
+    qvac_parakeet_apply_ccache(test-streaming)
 
     add_executable(test-eou-streaming src/test_eou_streaming.cpp)
     target_link_libraries(test-eou-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-eou-streaming PRIVATE include src ggml/include)
+    qvac_parakeet_apply_ccache(test-eou-streaming)
 
     add_executable(test-sortformer-streaming src/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
+    qvac_parakeet_apply_ccache(test-sortformer-streaming)
 
     add_executable(test-perf-regression src/test_perf_regression.cpp)
     target_link_libraries(test-perf-regression PRIVATE qvac-parakeet)
     target_include_directories(test-perf-regression PRIVATE include src ggml/include)
+    qvac_parakeet_apply_ccache(test-perf-regression)
 
     # Internal regression gate for the round-2 mel preprocess sweep
     # (real-FFT, MelState reuse). Pure unit test -- no GGUF needed.
@@ -288,6 +306,7 @@ if (QVAC_PARAKEET_BUILD_EXAMPLES)
     target_link_libraries(live-mic PRIVATE qvac-parakeet)
     target_include_directories(live-mic PRIVATE include examples)
     target_compile_options(live-mic PRIVATE -Wno-deprecated-declarations)
+    qvac_parakeet_apply_ccache(live-mic)
 
     add_executable(live-mic-attributed
         examples/live-mic-attributed.cpp
@@ -295,6 +314,7 @@ if (QVAC_PARAKEET_BUILD_EXAMPLES)
     target_link_libraries(live-mic-attributed PRIVATE qvac-parakeet)
     target_include_directories(live-mic-attributed PRIVATE include examples)
     target_compile_options(live-mic-attributed PRIVATE -Wno-deprecated-declarations)
+    qvac_parakeet_apply_ccache(live-mic-attributed)
 
     if (APPLE)
         find_library(COREAUDIO_LIBRARY CoreAudio REQUIRED)
@@ -317,6 +337,22 @@ if (QVAC_PARAKEET_BUILD_EXAMPLES)
         foreach (tgt live-mic live-mic-attributed)
             target_link_libraries(${tgt} PRIVATE winmm ole32)
         endforeach()
+    endif()
+endif()
+
+if (QVAC_PARAKEET_BUILD_TOOLS)
+    if (NOT GGML_OPENCL)
+        message(STATUS "qvac-parakeet: QVAC_PARAKEET_BUILD_TOOLS requested but GGML_OPENCL=OFF; skipping probe-opencl")
+    else()
+        find_package(OpenCL QUIET)
+        if (NOT OpenCL_FOUND)
+            message(WARNING "qvac-parakeet: QVAC_PARAKEET_BUILD_TOOLS requested but OpenCL headers/loader not found; skipping probe-opencl")
+        else()
+            add_executable(probe-opencl scripts/probe-opencl.cpp)
+            target_link_libraries(probe-opencl PRIVATE OpenCL::OpenCL)
+            target_compile_definitions(probe-opencl PRIVATE CL_TARGET_OPENCL_VERSION=300)
+            qvac_parakeet_apply_ccache(probe-opencl)
+        endif()
     endif()
 endif()
 

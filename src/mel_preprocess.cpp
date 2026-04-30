@@ -145,7 +145,7 @@ void fft_radix2_inplace(std::complex<float> * data, int n) {
 // downstream encoder. Encoder transcripts on jfk.wav and
 // sample-16k.wav stay bit-equal to the NeMo PyTorch reference at
 // f16 / Q8_0 -- gated by `test-perf-regression` + `test-streaming`
-// in the QVAC-17997 audit.
+// in the optimization audit.
 void rfft_power_radix2(const float * __restrict x_real,
                        float       * __restrict power,
                        int                       n_fft,
@@ -305,7 +305,7 @@ int compute_log_mel_impl(const float        * samples,
 
     // NOTE on threading: this loop was experimentally parallelised with
     // `#pragma omp parallel { local tbuf; #pragma omp for ... }` during
-    // QVAC-17997 (audit b4 in that branch). On a 16-thread Ryzen the
+    // the optimization audit. On a 16-thread Ryzen the
     // result was a +120 % regression with stdev of 18 ms because the
     // ggml-cpu encoder also uses an OpenMP thread pool and the two
     // pools oversubscribe the cores during the encoder warmup window.
@@ -343,7 +343,7 @@ int compute_log_mel_impl(const float        * samples,
     // `__restrict` + `#pragma GCC ivdep` so gcc-13 emits AVX2 FMA at
     // 8 lanes wide. The same threading caveat as the FFT loop above
     // applies (parallelising this regressed the bench during the
-    // QVAC-17997 audit because of OpenMP oversubscription with
+    // optimization audit because of OpenMP oversubscription with
     // ggml-cpu's encoder thread pool).
     for (int t = 0; t < n_frames; ++t) {
         const float * __restrict frame_power = power_data + t * n_bins;

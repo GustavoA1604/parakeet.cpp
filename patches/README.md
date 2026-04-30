@@ -1,18 +1,15 @@
-# ggml patches for qvac-parakeet.cpp
+# ggml patches for parakeet.cpp
 
 `ggml` is vendored as a pristine upstream clone (see the top-level
 [`README.md`](../README.md) and [`scripts/setup-ggml.sh`](../scripts/setup-ggml.sh)),
 so any fixes we need in it live here as standalone patches and are
-applied after the clone. The shape mirrors
-[`chatterbox.cpp/patches/`](../../qvac-17872-findings/chatterbox.cpp/patches/README.md)
-exactly so contributors familiar with that repo see a 1:1 equivalent
-here.
+applied after the clone.
 
 Two patches ship today:
 
 1. [`ggml-opencl-allow-non-adreno.patch`](#ggml-opencl-allow-non-adrenopatch)
    — lets the OpenCL backend bring up on commodity desktop GPUs
-   (NVIDIA, AMD, Apple) so `qvac-parakeet.cpp` can be built and parity-
+   (NVIDIA, AMD, Apple) so `parakeet.cpp` can be built and parity-
    tested with `-DGGML_OPENCL=ON` outside Adreno-only environments.
    No-op on real Adreno targets (the patch only relaxes the rejection
    of unknown GPU vendors and the assertion in
@@ -20,10 +17,9 @@ Two patches ship today:
 2. [`ggml-opencl-program-binary-cache.patch`](#ggml-opencl-program-binary-cachepatch)
    — adds a persistent on-disk cache for compiled OpenCL kernel
    binaries, removing the multi-second `clBuildProgram` wave at every
-   cold start. Mirrors the `ggml-vulkan-pipeline-cache.patch` from
-   QVAC-17872. Honours `$GGML_OPENCL_CACHE_DIR` (the same env var the
-   QVAC `qvac-lib-infer-llamacpp-llm` Android addon already plumbs),
-   with `$XDG_CACHE_HOME/ggml/opencl` → `$HOME/.cache/ggml/opencl`
+   cold start. Honours `$GGML_OPENCL_CACHE_DIR` (the same env var the
+   `qvac-lib-infer-llamacpp-llm` Android addon already plumbs), with
+   `$XDG_CACHE_HOME/ggml/opencl` → `$HOME/.cache/ggml/opencl`
    fallbacks. Opt-out via `GGML_OPENCL_CACHE_DIR=""`.
 
 `scripts/setup-ggml.sh` applies every `patches/ggml-*.patch` in
@@ -94,30 +90,36 @@ backend.
 Base commit: `58c38058` (`sync : llama.cpp`, 2026-04-09).
 
 Fixes two gaps in `ggml-opencl` that make `-DGGML_OPENCL=ON` builds of
-`qvac-parakeet.cpp` impossible to bring up outside an Adreno-only
+`parakeet.cpp` impossible to bring up outside an Adreno-only
 environment:
 
 | Symptom                                                                                                | Root cause in `ggml-opencl`                                                                                                                                                                                                                                                                                            | What this patch does                                                                                                                                                                                                          |
 |--------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Every NVIDIA / AMD / Apple OpenCL device is dropped at init with `Unsupported GPU: <device-name>`      | `ggml_cl2_init()` whitelists `Adreno` / `Qualcomm` / `Intel` and returns `nullptr` for everything else. Even with `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`, a non-Adreno GPU never reaches the generic kernels.                                                                                                           | Replace the hard reject with a `WARN` and let the device through with `GPU_FAMILY::UNKNOWN`. All Adreno-specific code paths are already gated on `gpu_family == ADRENO`, so the generic OpenCL kernels just take over.        |
+| Every NVIDIA / AMD / Apple OpenCL device is dropped at init with `Unsupported GPU: <device-name>`      | `ggml_cl2_init()` whitelists `Adreno` / `Qualcomm` / `Intel` and returns `nullptr` for everything else. Even with `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`, a non-Adreno GPU never reaches the generic kernels.                                                                                                           | Default behaviour is byte-equal to upstream (still returns `nullptr`). Set `GGML_OPENCL_ALLOW_UNKNOWN_GPU=1` to opt the device through with `GPU_FAMILY::UNKNOWN`; we additionally require `cl_intel_required_subgroup_size` *or* `cl_qcom_reqd_sub_group_size` (the matmul-vec kernels need one to define `N_DST`/`N_SIMDGROUP`/`N_SIMDWIDTH`), so AMD/NVIDIA still fall back to host instead of crashing in `clBuildProgram`. |
 | `qvac-parakeet --n-gpu-layers 1` aborts with `GGML_ASSERT(index < ggml_backend_opencl_reg_device_count(reg))` when zero usable devices were found | `ggml_backend_opencl_init()` calls `ggml_backend_reg_dev_get(reg, 0)` unconditionally. When the device discovery cleared the list (e.g. only an unsupported GPU was present), `dev_get(0)` asserts and the host process aborts. parakeet's `init_gpu_backend()` cascade expects a nullable result so it can fall back. | Check `ggml_backend_reg_dev_count(reg) == 0` before `dev_get` and return `nullptr` on empty. Also propagate `nullptr` when `ggml_cl2_init()` rejects the device, so the host-side fallback path actually runs.                |
 
 The patch is **strictly additive** for real Adreno targets:
 `gpu_family == ADRENO` is computed exactly as before, the Adreno
 shuffle / large-buffer paths still trigger when (and only when) the
-device is Adreno, and `-DGGML_OPENCL_USE_ADRENO_KERNELS=ON` (the
-default) still hard-fails on non-Adreno devices so production Android
+device is Adreno, and without `GGML_OPENCL_ALLOW_UNKNOWN_GPU=1` the
+non-Adreno reject path is byte-equal to upstream so production Android
 builds get the same compile-time guarantees as before.
 
 The intended audience for the patch is:
 
-  * `qvac-parakeet.cpp` developers running CI on commodity desktop
-    hardware (NVIDIA RTX, AMD Radeon, Apple Silicon) who need to
-    sanity-check that the OpenCL graph builds and produces the same
-    transcripts as CPU before shipping to Android Adreno consumers.
-  * Anyone who wants to reproduce the parity numbers in
-    [`qvac-17997-findings/FINDINGS.md`](../../FINDINGS.md) without an
-    Adreno device.
+  * `parakeet.cpp` developers running CI on Intel iGPU desktop
+    hardware (the matmul-vec kernels gate on
+    `cl_intel_required_subgroup_size`, so Intel iGPU is the only
+    desktop class that can actually execute the OpenCL kernels;
+    AMD/NVIDIA users get a clean CPU fallback instead of crashing
+    inside `clBuildProgram`).
+  * Anyone who wants to reproduce the OpenCL backend's mel/encoder
+    parity numbers (see commit messages on the `open-cl` branch)
+    without an Adreno device.
+
+Opt-in is gated behind `GGML_OPENCL_ALLOW_UNKNOWN_GPU=1` so misconfigured
+production builds still get the same explicit `Unsupported GPU` error
+upstream returned, instead of a silent "running with an untested GPU".
 
 It is **not** intended to ship a fast OpenCL path on NVIDIA / AMD /
 Apple desktops (CUDA / Vulkan / Metal are far better suited there);
@@ -190,11 +192,10 @@ overwrites the bad blob.
 ### Measured impact
 
 This patch is **not benchmarked on a real Adreno device** in the
-QVAC-17997 work because the test workstation is NVIDIA-only and
-NVIDIA's OpenCL driver lacks the fp16 / OpenCL C 2.0 features
+current development cycle because the test workstation is NVIDIA-only
+and NVIDIA's OpenCL driver lacks the fp16 / OpenCL C 2.0 features
 ggml-opencl mandates -- the kernels never compile at all on this
-box, so there's nothing to cache. Expected impact mirrors the
-QVAC-17872 Vulkan pipeline-cache patch:
+box, so there's nothing to cache. Expected impact:
 
   * **Cold start (no cache)**: same as upstream -- multi-second
     shader compile wave on Adreno.
@@ -202,10 +203,9 @@ QVAC-17872 Vulkan pipeline-cache patch:
     `clBuildProgram` wave; typical Adreno saving is multiple
     seconds per process.
 
-Once Adreno hardware is available for the QVAC-17997 follow-up
-(see `inputFilesForAI/qvac-17997-findings/FINDINGS.md` §5.1), the
-expected bench shape is identical to chatterbox.cpp's QVAC-17872
-table on RTX 5090 + Vulkan: cold ≫ ggml-warm ≈ both-warm.
+Once Adreno hardware is available for follow-up benchmarking, the
+expected bench shape is the standard pipeline-cache curve:
+cold ≫ ggml-warm ≈ both-warm.
 
 ## Dropping the patches
 
@@ -213,6 +213,5 @@ If upstream ggml-opencl decides to relax the GPU-vendor whitelist
 itself, or ships its own kernel binary cache, delete the patch
 file(s) and remove the corresponding entry from the `PATCHES=(…)`
 glob in `scripts/setup-ggml.sh`. The C++ side of parakeet uses
-only ops that ggml-opencl already supports natively (see
-`qvac-17997-findings/FINDINGS.md` §3 for the per-op coverage
-audit), so nothing else needs to change.
+only ops that ggml-opencl already supports natively (per the
+op-coverage audit), so nothing else needs to change.

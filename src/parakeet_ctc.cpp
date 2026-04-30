@@ -152,7 +152,39 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
 #endif
 #ifdef GGML_USE_OPENCL
     if (auto * b = ggml_backend_opencl_init()) {
-        if (verbose) std::fprintf(stderr, "parakeet: using OpenCL backend\n");
+        const ggml_backend_dev_t dev = ggml_backend_get_device(b);
+        const char * name = dev ? ggml_backend_dev_name(dev)        : nullptr;
+        const char * desc = dev ? ggml_backend_dev_description(dev) : nullptr;
+        auto is_adreno_6xx = [](const char * s) -> bool {
+            if (!s) return false;
+            if (!strstr(s, "Adreno")) return false;
+            for (const char * q = s; *q; ++q) {
+                if (*q == '6' && q[1] >= '0' && q[1] <= '9' && q[2] >= '0' && q[2] <= '9') {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (is_adreno_6xx(name) || is_adreno_6xx(desc)) {
+            const char * reported = name ? name : (desc ? desc : "unknown");
+            if (verbose) std::fprintf(stderr,
+                "parakeet: OpenCL device '%s' is Adreno 6xx; "
+                "forcing CPU fallback (7xx/8xx/X1E supported, set "
+                "QVAC_PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
+                reported);
+            const char * override_env = getenv("QVAC_PARAKEET_ALLOW_ADRENO_6XX");
+            if (!override_env || override_env[0] != '1') {
+                ggml_backend_free(b);
+                return nullptr;
+            }
+            if (verbose) std::fprintf(stderr,
+                "parakeet: QVAC_PARAKEET_ALLOW_ADRENO_6XX=1 set; "
+                "keeping OpenCL backend on '%s' anyway\n", reported);
+        }
+        if (verbose) {
+            std::fprintf(stderr, "parakeet: using OpenCL backend (%s)\n",
+                         name ? name : (desc ? desc : "unknown"));
+        }
         return b;
     }
 #endif

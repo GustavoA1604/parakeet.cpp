@@ -1,12 +1,12 @@
 // Tiny standalone probe for OpenCL device extensions / FP16 support /
-// subgroup support / OpenCL C version. Used by qvac-17997 to triage why
+// subgroup support / OpenCL C version. Used to triage why
 // ggml-opencl's device-init refuses NVIDIA / AMD / etc. on a given box
 // without having to install the full clinfo package.
 //
 //   cc -DCL_TARGET_OPENCL_VERSION=300 scripts/probe-opencl.cpp -lOpenCL -lstdc++ -o /tmp/probe-opencl
 //   /tmp/probe-opencl
 //
-// Not part of the build; standalone tool.
+// Built only when -DQVAC_PARAKEET_BUILD_TOOLS=ON.
 
 #include <CL/cl.h>
 #include <cstdio>

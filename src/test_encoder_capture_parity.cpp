@@ -1,5 +1,5 @@
-// Internal regression gate for the round-1 capture_intermediates flag
-// (QVAC-17997). The flag was added on `run_encoder()` to let the
+// Internal regression gate for the round-1 capture_intermediates
+// flag. The flag was added on `run_encoder()` to let the
 // production transcribe / diarize / streaming paths skip 7 host-bound
 // `ggml_backend_tensor_get` round-trips per inference. The shipped
 // behaviour relies on the invariant:

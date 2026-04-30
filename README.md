@@ -1,4 +1,4 @@
-# qvac-parakeet.cpp
+# parakeet.cpp
 
 **Parakeet** (NVIDIA, CC-BY-4.0 FastConformer ASR family) ported to
 [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference on CPU
@@ -113,8 +113,8 @@ See `scripts/` for one-shot helpers.
 ## 1. Clone and build
 
 ```bash
-git clone <this-repo> qvac-parakeet.cpp
-cd qvac-parakeet.cpp
+git clone <this-repo> parakeet.cpp
+cd parakeet.cpp
 
 # Clone ggml at the pinned commit. The same pin is used for every
 # backend (CPU, Metal, CUDA, Vulkan); no engine- or backend-specific
@@ -132,7 +132,7 @@ is `CUDA -> Metal -> Vulkan -> OpenCL -> CPU`, so a single binary
 built with multiple backends compiled in will use the first available
 one and there is no runtime backend switch -- the expectation is one
 backend per build. The `OpenCL` slot is the most recently shipped
-backend (QVAC-17997) and is primarily for **Android Adreno**
+backend and is primarily for **Android Adreno**
 deployments (Snapdragon 7+ / 8 series); see [`patches/README.md`](patches/README.md)
 for the small ggml-opencl patch parakeet ships and how it relates to
 the Adreno-only upstream design.
@@ -502,7 +502,7 @@ drop-in swap.
 
 The Node binding at [qvac-lib-infer-parakeet](https://github.com/qvac/qvac-lib-infer-parakeet)
 is the intended consumer for `StreamSession`; check its README for
-the `qvac-parakeet.cpp` version it currently links against.
+the `parakeet.cpp` version it currently links against.
 
 ### Streaming — EOU (`<EOU>` end-of-utterance token)
 
@@ -948,7 +948,7 @@ has the full round-by-round journal):
   `cache_aware_stream_step` was prototyped + rejected on quality
   grounds (PROGRESS.md §8.5 case (A)).
 
-Next: vcpkg port for `qvac-parakeet.cpp` + the
+Next: vcpkg port for `parakeet.cpp` + the
 `qvac-lib-infer-parakeet` binding swap to consume this library
 instead of onnxruntime; Accelerate BLAS for the TDT/EOU decoder's
 LSTM + joint gemvs and Sortformer's transformer attention;
@@ -958,7 +958,7 @@ flash-attn; Phase 11.11.2 Sortformer streaming (NeMo-style spkcache).
 ## Repository layout
 
 ```
-qvac-parakeet.cpp/
+parakeet.cpp/
   ggml/                          pristine ggml clone (not tracked; populated
                                    by scripts/setup-ggml.sh, or skipped entirely
                                    when building with -DQVAC_PARAKEET_USE_SYSTEM_GGML=ON)

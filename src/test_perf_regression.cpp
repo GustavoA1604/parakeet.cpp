@@ -1,4 +1,4 @@
-// Light-weight perf-regression smoke for QVAC-17997's audit/optimization pass.
+// Light-weight perf-regression smoke for the audit/optimization pass.
 // Runs the public Engine::transcribe() path N times and asserts:
 //   1. Every run produces the byte-equal reference transcript.
 //   2. The encoder graph cache hits after the first call (subsequent
@@ -36,11 +36,11 @@ struct Opts {
     int n_gpu_layers = 0;
     double max_enc_ms = 0.0;
     double cache_hit_ratio_max = 1.10; // warm enc_ms must be ≤ 1.10x median
-    // QVAC-17997 round-3 additions: catch FFT-specific regressions
-    // (mel jumps from ~2.8 ms back toward ~5.5 ms if A1 real-FFT
-    // breaks) and Adreno cold-start regressions (warmup_1 enc_ms
-    // ≫ steady-state median if the kernel binary cache patch
-    // regresses or `clBuildProgram` hot path resurfaces).
+    // Round-3 additions: catch FFT-specific regressions (mel jumps
+    // from ~2.8 ms back toward ~5.5 ms if the real-FFT path breaks)
+    // and Adreno cold-start regressions (warmup_1 enc_ms ≫ steady-
+    // state median if the kernel binary cache patch regresses or
+    // `clBuildProgram` hot path resurfaces).
     double max_mel_ms = 0.0;
     double max_cold_overhead_ratio = 0.0; // 0 = disabled
 };

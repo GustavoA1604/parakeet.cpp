@@ -1,5 +1,5 @@
-// Internal regression gate for the round-2 mel preprocess sweep
-// (QVAC-17997). Three sections:
+// Internal regression gate for the round-2 mel preprocess sweep.
+// Three sections:
 //
 //   1. Real-FFT power-spectrum parity: rebuild the textbook radix-2
 //      complex FFT on real input here in the test, run both the

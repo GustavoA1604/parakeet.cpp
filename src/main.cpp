@@ -78,7 +78,8 @@ void print_usage(const char * argv0) {
         "                                     Adreno-only knob to allow >256 MB single\n"
         "                                     allocations when cl_qcom_large_buffer is\n"
         "                                     exposed by the driver. Required for 0.6B+\n"
-        "                                     Q8_0 GGUFs on Adreno per FINDINGS \u00a75.3.\n"
+        "                                     Q8_0 GGUFs on Adreno (the model weights\n"
+        "                                     exceed the 256 MB single-allocation cap).\n"
         "  --verbose            print per-stage wall times and shapes to stderr\n"
         "\n"
         "  --stream             enable streaming. Without --stream-duplex this is Mode 2:\n"
@@ -248,13 +249,13 @@ struct ExtraCliOpts {
     int         attributed_min_segment_ms = 200;
     int         attributed_pad_segment_ms = 0;
 
-    // QVAC-17997 round-3: surface ggml-opencl's runtime knobs through the
-    // CLI so bench scripts can A/B them without `env VAR=… ./binary`. All
-    // four are read by ggml-opencl via getenv() and (for the cache dir)
-    // by `patches/ggml-opencl-program-binary-cache.patch`. Applied via
-    // `setenv()` BEFORE any qvac_parakeet API call so the backend init
-    // cascade picks them up. Empty string for any field => leave the
-    // existing process-env value untouched (do not setenv).
+    // OpenCL CLI surface: ggml-opencl's runtime knobs are exposed through
+    // CLI flags so bench scripts can A/B them without `env VAR=… ./binary`.
+    // All four are read by ggml-opencl via getenv() and (for the cache
+    // dir) by `patches/ggml-opencl-program-binary-cache.patch`. Applied
+    // via `setenv()` BEFORE any qvac_parakeet API call so the backend
+    // init cascade picks them up. Empty string for any field => leave
+    // the existing process-env value untouched (do not setenv).
     std::string opencl_cache_dir;
     std::string opencl_platform;     // GGML_OPENCL_PLATFORM
     std::string opencl_device;       // GGML_OPENCL_DEVICE
