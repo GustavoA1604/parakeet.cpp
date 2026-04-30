@@ -53,7 +53,6 @@ struct Engine::Impl {
     EouRuntimeWeights   eou_rt;
     bool                eou_ready = false;
 
-    SortformerRuntimeWeights sortformer_rt;
     bool                     sortformer_ready = false;
 
     // Reusable mel preprocess scratch buffers. Engine APIs are
@@ -93,9 +92,6 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
         pimpl_->eou_ready = true;
     }
     if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
-        if (sortformer_prepare_runtime(pimpl_->model, pimpl_->sortformer_rt) != 0) {
-            throw std::runtime_error("Engine: sortformer_prepare_runtime failed");
-        }
         pimpl_->sortformer_ready = true;
     }
 }
@@ -497,12 +493,19 @@ static DiarizationResult engine_impl_diarize_helper(Engine::Impl & impl,
     SortformerDiarizationOptions sopts;
     sopts.threshold = opts.threshold;
     SortformerDiarizationResult dres;
-    if (int rc = sortformer_diarize(impl.model, impl.sortformer_rt,
-                                    enc_out.encoder_out.data(),
-                                    enc_out.n_enc_frames, enc_out.d_model,
-                                    sopts, dres); rc != 0) {
+
+    ggml_backend_t active_backend = model_active_backend(impl.model);
+    if (!active_backend) {
+        throw std::runtime_error("diarize: no active ggml backend");
+    }
+
+    int diarize_rc = sortformer_diarize_ggml(impl.model,
+                                             enc_out.encoder_out.data(),
+                                             enc_out.n_enc_frames, enc_out.d_model,
+                                             active_backend, sopts, dres);
+    if (diarize_rc != 0) {
         throw std::runtime_error("diarize: sortformer_diarize failed (rc=" +
-                                 std::to_string(rc) + ")");
+                                 std::to_string(diarize_rc) + ")");
     }
 
     DiarizationResult result;

@@ -669,6 +669,11 @@ std::string model_active_backend_name(const ParakeetCtcModel & m) {
     return name ? std::string(name) : std::string("CPU");
 }
 
+ggml_backend_t model_active_backend(ParakeetCtcModel & m) {
+    if (!m.impl) return nullptr;
+    return m.impl->backend_active;
+}
+
 void print_model_summary(const ParakeetCtcModel & m) {
     const char * mt = "ctc";
     if (m.model_type == ParakeetModelType::TDT)        mt = "tdt";

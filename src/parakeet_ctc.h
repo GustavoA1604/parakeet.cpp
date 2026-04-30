@@ -16,6 +16,7 @@
 struct ggml_context;
 struct ggml_tensor;
 struct gguf_context;
+struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 
 namespace qvac_parakeet {
@@ -319,6 +320,7 @@ void print_model_summary(const ParakeetCtcModel & m);
 
 bool        model_has_gpu_backend(const ParakeetCtcModel & m);
 std::string model_active_backend_name(const ParakeetCtcModel & m);
+ggml_backend_t model_active_backend(ParakeetCtcModel & m);
 
 int run_subsampling(ParakeetCtcModel   & model,
                     const float        * mel,

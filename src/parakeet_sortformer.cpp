@@ -1,275 +1,231 @@
 #include "parakeet_sortformer.h"
-#include "parakeet_log.h"
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstring>
-#include <stdexcept>
+#include <vector>
 
 namespace qvac_parakeet {
 
 namespace {
 
-void dequant(const ggml_tensor * t, std::vector<float> & out) {
-    if (!t) throw std::runtime_error("sortformer_prepare_runtime: missing tensor");
-    const size_t n = (size_t) ggml_nelements(t);
-    out.resize(n);
-    if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-        return;
-    }
-    const auto * tr = ggml_get_type_traits(t->type);
-    if (!tr || !tr->to_float)
-        throw std::runtime_error(std::string("sortformer_prepare_runtime: no to_float for type ") + ggml_type_name(t->type));
-    const size_t nbytes = ggml_nbytes(t);
-    std::vector<uint8_t> host_raw(nbytes);
-    ggml_backend_tensor_get(t, host_raw.data(), 0, nbytes);
-    tr->to_float(host_raw.data(), out.data(), (int64_t) n);
-}
-
-inline float sigmoidf(float x) { return 1.0f / (1.0f + std::exp(-x)); }
-
-// See `parakeet_tdt.cpp::gemv_f32` for the rationale on why
-// vectorising this matters even though Sortformer's transformer is
-// `tf_d_model = 192` (much smaller than the CTC encoder). The inner
-// dot-product runs T*T*n_heads*head_dim FMAs per `self_attention`
-// call -- already small but on the critical path of every diarize
-// chunk; vectorisation is free with __restrict + `-O3 -ffast-math`
-// on gcc/clang and the `#pragma GCC ivdep` removes the data-
-// dependence assumption that otherwise pessimises some compilers.
-void gemv(const float * __restrict W, const float * __restrict x,
-          const float * __restrict b, float * __restrict y,
-          int out_dim, int in_dim) {
-    for (int i = 0; i < out_dim; ++i) {
-        const float * __restrict row = W + (size_t) i * in_dim;
-        float acc = b ? b[i] : 0.0f;
-        #pragma GCC ivdep
-        for (int j = 0; j < in_dim; ++j) acc += row[j] * x[j];
-        y[i] = acc;
-    }
-}
-
-void linear_batch(const float * __restrict W, const float * __restrict X,
-                  const float * __restrict b, float * __restrict Y,
-                  int n_rows, int out_dim, int in_dim) {
-    for (int t = 0; t < n_rows; ++t) {
-        gemv(W, X + (size_t) t * in_dim, b, Y + (size_t) t * out_dim, out_dim, in_dim);
-    }
-}
-
-void layer_norm_inplace(float * X, int n_rows, int d, const float * gamma, const float * beta, float eps = 1e-5f) {
-    for (int t = 0; t < n_rows; ++t) {
-        float * row = X + (size_t) t * d;
-        double sum = 0.0;
-        for (int i = 0; i < d; ++i) sum += row[i];
-        const float mean = (float) (sum / d);
-        double sq = 0.0;
-        for (int i = 0; i < d; ++i) { float c = row[i] - mean; sq += c * c; }
-        const float inv = 1.0f / std::sqrt((float) (sq / d) + eps);
-        for (int i = 0; i < d; ++i) {
-            row[i] = (row[i] - mean) * inv * gamma[i] + beta[i];
-        }
-    }
-}
-
-void self_attention(const SortformerTransformerRuntimeBlock & B,
-                    int n_heads, int head_dim, int d_model, int T,
-                    const float * __restrict X,
-                    float * __restrict Y) {
-    std::vector<float> Q((size_t) T * d_model);
-    std::vector<float> K((size_t) T * d_model);
-    std::vector<float> V((size_t) T * d_model);
-
-    linear_batch(B.attn_q_w.data(), X, B.attn_q_b.data(), Q.data(), T, d_model, d_model);
-    linear_batch(B.attn_k_w.data(), X, B.attn_k_b.data(), K.data(), T, d_model, d_model);
-    linear_batch(B.attn_v_w.data(), X, B.attn_v_b.data(), V.data(), T, d_model, d_model);
-
-    const float scale = 1.0f / std::sqrt((float) head_dim);
-
-    std::vector<float> ctx((size_t) T * d_model, 0.0f);
-    std::vector<float> scores((size_t) T);
-    std::vector<float> probs((size_t) T);
-
-    for (int h = 0; h < n_heads; ++h) {
-        const int off = h * head_dim;
-        for (int qi = 0; qi < T; ++qi) {
-            const float * q_row = Q.data() + (size_t) qi * d_model + off;
-            float max_score = -1e30f;
-            for (int kj = 0; kj < T; ++kj) {
-                const float * k_row = K.data() + (size_t) kj * d_model + off;
-                float s = 0.0f;
-                for (int d = 0; d < head_dim; ++d) s += q_row[d] * k_row[d];
-                s *= scale;
-                scores[kj] = s;
-                if (s > max_score) max_score = s;
-            }
-            float sum_exp = 0.0f;
-            for (int kj = 0; kj < T; ++kj) {
-                const float e = std::exp(scores[kj] - max_score);
-                probs[kj] = e;
-                sum_exp += e;
-            }
-            const float inv_sum = 1.0f / sum_exp;
-            float * c_row = ctx.data() + (size_t) qi * d_model + off;
-            for (int kj = 0; kj < T; ++kj) {
-                const float p = probs[kj] * inv_sum;
-                const float * v_row = V.data() + (size_t) kj * d_model + off;
-                for (int d = 0; d < head_dim; ++d) c_row[d] += p * v_row[d];
-            }
-        }
-    }
-
-    linear_batch(B.attn_o_w.data(), ctx.data(), B.attn_o_b.data(), Y, T, d_model, d_model);
-}
-
-void transformer_block(const SortformerTransformerRuntimeBlock & B,
-                       int n_heads, int head_dim, int d_model, int T,
-                       float * X) {
-    std::vector<float> attn_out((size_t) T * d_model);
-    self_attention(B, n_heads, head_dim, d_model, T, X, attn_out.data());
-
-    for (size_t i = 0; i < (size_t) T * d_model; ++i) attn_out[i] += X[i];
-    layer_norm_inplace(attn_out.data(), T, d_model, B.ln1_w.data(), B.ln1_b.data());
-
-    const int d_ff = (int) B.ffn_in_b.size();
-    std::vector<float> ffn_hidden((size_t) T * d_ff);
-    linear_batch(B.ffn_in_w.data(), attn_out.data(), B.ffn_in_b.data(), ffn_hidden.data(), T, d_ff, d_model);
-    for (size_t i = 0; i < ffn_hidden.size(); ++i) ffn_hidden[i] = std::max(0.0f, ffn_hidden[i]);
-
-    std::vector<float> ffn_out((size_t) T * d_model);
-    linear_batch(B.ffn_out_w.data(), ffn_hidden.data(), B.ffn_out_b.data(), ffn_out.data(), T, d_model, d_ff);
-
-    for (size_t i = 0; i < (size_t) T * d_model; ++i) ffn_out[i] += attn_out[i];
-    layer_norm_inplace(ffn_out.data(), T, d_model, B.ln2_w.data(), B.ln2_b.data());
-
-    std::memcpy(X, ffn_out.data(), (size_t) T * d_model * sizeof(float));
-}
-
-}
-
-int sortformer_prepare_runtime(const ParakeetCtcModel & model, SortformerRuntimeWeights & W) {
-    W.D_enc       = model.encoder_cfg.sortformer_fc_d_model;
-    W.tf_d        = model.encoder_cfg.sortformer_tf_d_model;
-    W.tf_inner    = model.encoder_cfg.sortformer_tf_inner_size;
-    W.tf_n_heads  = model.encoder_cfg.sortformer_tf_n_heads;
-    W.tf_n_layers = model.encoder_cfg.sortformer_tf_n_layers;
-    W.num_spks    = model.encoder_cfg.sortformer_num_spks;
-    if (W.tf_n_heads <= 0 || W.tf_d % W.tf_n_heads != 0) {
-        PARAKEET_LOG_ERROR("sortformer_prepare_runtime: tf_d_model %d not divisible by n_heads %d\n",
-                           W.tf_d, W.tf_n_heads);
-        return 1;
-    }
-    W.head_dim = W.tf_d / W.tf_n_heads;
-
-    dequant(model.sortformer.encoder_proj_w, W.proj_w);
-    dequant(model.sortformer.encoder_proj_b, W.proj_b);
-
-    W.blocks.clear();
-    W.blocks.resize(W.tf_n_layers);
-    for (int l = 0; l < W.tf_n_layers; ++l) {
-        const auto & sb = model.sortformer.transformer[l];
-        auto & rb = W.blocks[l];
-        dequant(sb.attn_q_w, rb.attn_q_w); dequant(sb.attn_q_b, rb.attn_q_b);
-        dequant(sb.attn_k_w, rb.attn_k_w); dequant(sb.attn_k_b, rb.attn_k_b);
-        dequant(sb.attn_v_w, rb.attn_v_w); dequant(sb.attn_v_b, rb.attn_v_b);
-        dequant(sb.attn_o_w, rb.attn_o_w); dequant(sb.attn_o_b, rb.attn_o_b);
-        dequant(sb.ln1_w,    rb.ln1_w);    dequant(sb.ln1_b,    rb.ln1_b);
-        dequant(sb.ffn_in_w, rb.ffn_in_w); dequant(sb.ffn_in_b, rb.ffn_in_b);
-        dequant(sb.ffn_out_w,rb.ffn_out_w);dequant(sb.ffn_out_b,rb.ffn_out_b);
-        dequant(sb.ln2_w,    rb.ln2_w);    dequant(sb.ln2_b,    rb.ln2_b);
-    }
-
-    dequant(model.sortformer.head_h2h_w, W.head_h2h_w);
-    dequant(model.sortformer.head_h2h_b, W.head_h2h_b);
-    dequant(model.sortformer.head_h2s_w, W.head_h2s_w);
-    dequant(model.sortformer.head_h2s_b, W.head_h2s_b);
-
-    return 0;
-}
-
-int sortformer_diarize(const ParakeetCtcModel & model,
-                       const SortformerRuntimeWeights & W,
-                       const float * encoder_out,
-                       int T_enc, int D_enc,
-                       const SortformerDiarizationOptions & opts,
-                       SortformerDiarizationResult & out) {
-    if (D_enc != W.D_enc) {
-        PARAKEET_LOG_ERROR("sortformer_diarize: encoder D mismatch %d vs %d\n", D_enc, W.D_enc);
-        return 1;
-    }
-    if (T_enc <= 0) {
-        out.n_frames = 0;
-        out.num_spks = W.num_spks;
-        out.speaker_probs.clear();
-        out.segments.clear();
-        return 0;
-    }
-
-    const auto t0 = std::chrono::steady_clock::now();
-
-    std::vector<float> X((size_t) T_enc * W.tf_d);
-    linear_batch(W.proj_w.data(), encoder_out, W.proj_b.data(), X.data(),
-                 T_enc, W.tf_d, W.D_enc);
-
-    for (int l = 0; l < W.tf_n_layers; ++l) {
-        transformer_block(W.blocks[l], W.tf_n_heads, W.head_dim, W.tf_d, T_enc, X.data());
-    }
-
-    for (size_t i = 0; i < X.size(); ++i) X[i] = std::max(0.0f, X[i]);
-
-    std::vector<float> H1((size_t) T_enc * W.tf_d);
-    linear_batch(W.head_h2h_w.data(), X.data(), W.head_h2h_b.data(), H1.data(),
-                 T_enc, W.tf_d, W.tf_d);
-
-    for (size_t i = 0; i < H1.size(); ++i) H1[i] = std::max(0.0f, H1[i]);
-
-    out.n_frames = T_enc;
-    out.num_spks = W.num_spks;
-    out.speaker_probs.assign((size_t) T_enc * W.num_spks, 0.0f);
-    linear_batch(W.head_h2s_w.data(), H1.data(), W.head_h2s_b.data(), out.speaker_probs.data(),
-                 T_enc, W.num_spks, W.tf_d);
-
-    for (auto & v : out.speaker_probs) v = sigmoidf(v);
-
-    out.frame_stride_s = (double) (model.mel_cfg.hop_length *
-                                   model.encoder_cfg.subsampling_factor) /
-                         (double) model.mel_cfg.sample_rate;
-
-    out.segments.clear();
-    const float thr = opts.threshold;
-    for (int s = 0; s < W.num_spks; ++s) {
+// Threshold speaker probabilities into time-sorted segments.
+void sf_threshold_segments(const std::vector<float> & speaker_probs,
+                           int T_enc, int num_spks,
+                           double frame_stride_s, float threshold,
+                           std::vector<SortformerSegment> & segments) {
+    segments.clear();
+    for (int s = 0; s < num_spks; ++s) {
         bool active = false;
         int  start_frame = 0;
         for (int t = 0; t < T_enc; ++t) {
-            const bool a = out.speaker_probs[(size_t) t * W.num_spks + s] > thr;
-            if (a && !active) { start_frame = t; active = true; }
+            const bool a = speaker_probs[(size_t)t * num_spks + s] > threshold;
+            if (a && !active)  { start_frame = t; active = true; }
             if (!a && active) {
                 SortformerSegment seg;
                 seg.speaker_id = s;
-                seg.start_s = start_frame * out.frame_stride_s;
-                seg.end_s   = t           * out.frame_stride_s;
-                out.segments.push_back(seg);
+                seg.start_s = start_frame * frame_stride_s;
+                seg.end_s   = t           * frame_stride_s;
+                segments.push_back(seg);
                 active = false;
             }
         }
         if (active) {
             SortformerSegment seg;
             seg.speaker_id = s;
-            seg.start_s = start_frame * out.frame_stride_s;
-            seg.end_s   = T_enc       * out.frame_stride_s;
-            out.segments.push_back(seg);
+            seg.start_s = start_frame * frame_stride_s;
+            seg.end_s   = T_enc       * frame_stride_s;
+            segments.push_back(seg);
         }
     }
-    std::sort(out.segments.begin(), out.segments.end(),
+    std::sort(segments.begin(), segments.end(),
               [](const SortformerSegment & a, const SortformerSegment & b) {
                   if (a.start_s != b.start_s) return a.start_s < b.start_s;
                   return a.speaker_id < b.speaker_id;
               });
+}
+
+ggml_tensor * sf_layer_norm(ggml_context * ctx, ggml_tensor * x,
+                            ggml_tensor * gamma, ggml_tensor * beta, float eps) {
+    x = ggml_norm(ctx, x, eps);
+    x = ggml_mul(ctx, x, gamma);
+    x = ggml_add(ctx, x, beta);
+    return x;
+}
+
+ggml_tensor * sf_transformer_block(ggml_context * ctx, ggml_tensor * x,
+                                   const SortformerTransformerBlock & W,
+                                   int n_heads, int head_dim, int d_model, int T) {
+    // --- multi-head self-attention ---
+    ggml_tensor * q = ggml_add(ctx, ggml_mul_mat(ctx, W.attn_q_w, x), W.attn_q_b);
+    ggml_tensor * k = ggml_add(ctx, ggml_mul_mat(ctx, W.attn_k_w, x), W.attn_k_b);
+    ggml_tensor * v = ggml_add(ctx, ggml_mul_mat(ctx, W.attn_v_w, x), W.attn_v_b);
+
+    q = ggml_reshape_3d(ctx, q, head_dim, n_heads, T);
+    k = ggml_reshape_3d(ctx, k, head_dim, n_heads, T);
+    v = ggml_reshape_3d(ctx, v, head_dim, n_heads, T);
+
+    q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // (HD, T, H)
+    k = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
+    v = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+
+    const float scale = 1.0f / std::sqrt((float) head_dim);
+    ggml_tensor * scores = ggml_mul_mat(ctx, k, q);  // (T, T, H)
+    scores = ggml_scale(ctx, scores, scale);
+    ggml_tensor * attn = ggml_soft_max(ctx, scores);
+
+    ggml_tensor * v_t = ggml_cont(ctx, ggml_permute(ctx, v, 1, 0, 2, 3));
+    ggml_tensor * attn_v = ggml_mul_mat(ctx, v_t, attn);  // (HD, T, H)
+    ggml_tensor * merged = ggml_cont(ctx, ggml_permute(ctx, attn_v, 0, 2, 1, 3));  // (HD, H, T)
+    merged = ggml_reshape_2d(ctx, merged, d_model, T);
+
+    ggml_tensor * attn_out = ggml_add(ctx, ggml_mul_mat(ctx, W.attn_o_w, merged), W.attn_o_b);
+
+    // residual + LN1 (post-LN)
+    ggml_tensor * r1 = ggml_add(ctx, x, attn_out);
+    r1 = sf_layer_norm(ctx, r1, W.ln1_w, W.ln1_b, 1e-5f);
+
+    // --- FFN ---
+    ggml_tensor * ffn = ggml_add(ctx, ggml_mul_mat(ctx, W.ffn_in_w, r1), W.ffn_in_b);
+    ffn = ggml_relu(ctx, ffn);
+    ffn = ggml_add(ctx, ggml_mul_mat(ctx, W.ffn_out_w, ffn), W.ffn_out_b);
+
+    // residual + LN2
+    ggml_tensor * r2 = ggml_add(ctx, r1, ffn);
+    r2 = sf_layer_norm(ctx, r2, W.ln2_w, W.ln2_b, 1e-5f);
+
+    return r2;
+}
+
+// Build the full Sortformer ggml graph: encoder_proj -> N transformer blocks
+// -> ReLU -> h2h -> ReLU -> h2s -> sigmoid.  Returns the output tensor and
+// writes the input placeholder into *inp.
+ggml_tensor * sf_build_graph(ggml_context * ctx,
+                             const SortformerWeights & sw,
+                             int n_layers, int n_heads, int head_dim,
+                             int tf_d, int D_in, int T_enc,
+                             ggml_tensor ** inp) {
+    ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_in, T_enc);
+    ggml_set_name(x_in, "enc_in");
+    ggml_set_input(x_in);
+    *inp = x_in;
+
+    ggml_tensor * x = ggml_add(ctx, ggml_mul_mat(ctx, sw.encoder_proj_w, x_in),
+                                sw.encoder_proj_b);
+
+    for (int l = 0; l < n_layers; ++l)
+        x = sf_transformer_block(ctx, x, sw.transformer[l],
+                                 n_heads, head_dim, tf_d, T_enc);
+
+    x = ggml_relu(ctx, x);
+    x = ggml_add(ctx, ggml_mul_mat(ctx, sw.head_h2h_w, x), sw.head_h2h_b);
+    x = ggml_relu(ctx, x);
+    x = ggml_add(ctx, ggml_mul_mat(ctx, sw.head_h2s_w, x), sw.head_h2s_b);
+    x = ggml_sigmoid(ctx, x);
+
+    ggml_set_name(x, "speaker_probs");
+    ggml_set_output(x);
+    return x;
+}
+
+// Allocate, upload input, compute, and download output for a Sortformer graph.
+// Returns 0 on success, negative on failure.  Caller must free ctx afterwards.
+int sf_exec_graph(ggml_context * ctx, ggml_backend_t backend,
+                  ggml_tensor * x_in, ggml_tensor * x_out,
+                  const float * encoder_out,
+                  int D_in, int T_enc, int num_spks,
+                  std::vector<float> & speaker_probs) {
+    const size_t graph_slots = 4096;
+    ggml_cgraph * cg = ggml_new_graph_custom(ctx, graph_slots, false);
+    ggml_build_forward_expand(cg, x_out);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_reserve(alloc, cg))  { ggml_gallocr_free(alloc); return -2; }
+    if (!ggml_gallocr_alloc_graph(alloc, cg)) { ggml_gallocr_free(alloc); return -3; }
+
+    ggml_backend_tensor_set(x_in, encoder_out, 0,
+                            (size_t)D_in * T_enc * sizeof(float));
+
+    if (ggml_backend_graph_compute(backend, cg) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(alloc);
+        return -4;
+    }
+
+    speaker_probs.resize((size_t)T_enc * num_spks);
+    ggml_backend_tensor_get(x_out, speaker_probs.data(), 0,
+                            speaker_probs.size() * sizeof(float));
+    ggml_gallocr_free(alloc);
+    return 0;
+}
+
+}  // namespace
+
+int sortformer_diarize_ggml(const ParakeetCtcModel & model,
+                            const float * encoder_out,
+                            int T_enc, int D_enc,
+                            ggml_backend_t backend,
+                            const SortformerDiarizationOptions & opts,
+                            SortformerDiarizationResult & out) {
+    const auto & enc   = model.encoder_cfg;
+    const int D_in     = enc.sortformer_fc_d_model;
+    const int tf_d     = enc.sortformer_tf_d_model;
+    const int n_heads  = enc.sortformer_tf_n_heads;
+    const int n_layers = enc.sortformer_tf_n_layers;
+    const int num_spks = enc.sortformer_num_spks;
+
+    if (D_enc != D_in) {
+        std::fprintf(stderr, "sortformer_diarize_ggml: encoder D mismatch %d vs %d\n", D_enc, D_in);
+        return 1;
+    }
+    if (n_heads <= 0 || tf_d % n_heads != 0) {
+        std::fprintf(stderr, "sortformer_diarize_ggml: tf_d %d not divisible by n_heads %d\n", tf_d, n_heads);
+        return 1;
+    }
+    if (T_enc <= 0) {
+        out.n_frames = 0;  out.num_spks = num_spks;
+        out.speaker_probs.clear();  out.segments.clear();
+        return 0;
+    }
+
+    const int head_dim = tf_d / n_heads;
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // 1. Context for graph construction (no-alloc)
+    const size_t graph_slots = 4096;
+    const size_t overhead = ggml_tensor_overhead() * graph_slots
+                          + ggml_graph_overhead_custom(graph_slots, false);
+    ggml_init_params gp = { overhead, nullptr, true };
+    ggml_context * ctx = ggml_init(gp);
+    if (!ctx) return -1;
+
+    // 2. Build graph
+    ggml_tensor * x_in  = nullptr;
+    ggml_tensor * x_out = sf_build_graph(ctx, model.sortformer,
+                                         n_layers, n_heads, head_dim,
+                                         tf_d, D_in, T_enc, &x_in);
+
+    // 3. Execute on backend
+    int rc = sf_exec_graph(ctx, backend, x_in, x_out,
+                           encoder_out, D_in, T_enc, num_spks,
+                           out.speaker_probs);
+    ggml_free(ctx);
+    if (rc != 0) return rc;
+
+    // 4. Fill result metadata + threshold segmentation
+    out.n_frames = T_enc;
+    out.num_spks = num_spks;
+    out.frame_stride_s = (double)(model.mel_cfg.hop_length *
+                                  model.encoder_cfg.subsampling_factor) /
+                         (double)model.mel_cfg.sample_rate;
+
+    sf_threshold_segments(out.speaker_probs, T_enc, num_spks,
+                          out.frame_stride_s, opts.threshold, out.segments);
 
     out.decode_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - t0).count() / 1000.0;
