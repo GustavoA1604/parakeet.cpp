@@ -16,6 +16,7 @@
 struct ggml_context;
 struct ggml_tensor;
 struct gguf_context;
+typedef struct ggml_backend * ggml_backend_t;
 
 namespace qvac_parakeet {
 
@@ -292,6 +293,12 @@ struct ParakeetCtcModel {
 
     struct Impl;
     std::shared_ptr<Impl> impl;
+
+    // Accessors for callers that build their own ggml graphs against the
+    // GGUF-resident tensors (e.g. parakeet_tdt's per-step LSTM/joint graphs).
+    // Both return `nullptr` until `load_from_gguf` succeeds.
+    ggml_backend_t backend_active() const;  // Metal / CUDA / Vulkan if compiled & enabled, else CPU
+    ggml_context * weights_ctx()    const;  // ggml_context that owns the GGUF tensor metadata
 };
 
 // Forward-looking name. New code should use `ParakeetModel`. The

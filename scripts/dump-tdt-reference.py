@@ -90,11 +90,27 @@ def main():
     hyps = model.transcribe([str(args.wav)], batch_size=1)
     if isinstance(hyps, tuple):
         hyps = hyps[0]
-    text = hyps[0] if isinstance(hyps, list) else hyps
-    if hasattr(text, 'text'):
-        text = text.text
+    h0 = hyps[0] if isinstance(hyps, list) else hyps
+
+    text = h0.text if hasattr(h0, "text") else h0
     (args.out / "transcript.txt").write_text(text + "\n")
     print(f"[tdt-ref] transcript: {text!r}", file=sys.stderr)
+
+    token_ids = None
+    if hasattr(h0, "y_sequence"):
+        ts = h0.y_sequence
+        if hasattr(ts, "detach"):
+            token_ids = ts.detach().cpu().numpy().astype(np.int32)
+        else:
+            token_ids = np.asarray(ts, dtype=np.int32)
+    if token_ids is not None:
+        np.save(args.out / "token_ids.npy", token_ids)
+        print(f"[tdt-ref] token_ids: {token_ids.shape} -> token_ids.npy "
+              f"(first 16: {token_ids[:16].tolist()})", file=sys.stderr)
+    else:
+        print("[tdt-ref] WARN: hypothesis has no y_sequence; skipping token_ids.npy",
+              file=sys.stderr)
+
     print(f"[tdt-ref] done -> {args.out}", file=sys.stderr)
 
 

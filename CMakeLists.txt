@@ -166,7 +166,40 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_OPENCL)
     endif()
 
-    option(QVAC_PARAKEET_FLASH_ATTN "qvac-parakeet: enable experimental fused flash-attn in MHA (off by default; bench-validate per backend before shipping)" OFF)
+    # `PARAKEET_EXPERIMENTAL_FLASH_ATTN` gates the rel-pos MHA
+    # fused-attention path in `parakeet_ctc.cpp`. Per-backend defaults:
+    #
+    #   - Metal:  ON. Validated on M3 Ultra (5 invocations x 15 runs,
+    #             sample-16k.wav, q8_0): encoder 67.35 -> 66.96 ms
+    #             (-0.39 ms / -0.6 %), inference 119.24 -> 118.84 ms
+    #             (-0.40 ms / -0.34 %), parity gates byte-exact (TDT
+    #             decoder 95 tokens; encoder-capture 258048 + 258300
+    #             floats bit-equal). Closes PROGRESS Section 6.5
+    #             "likely a meaningful win on Metal" follow-up.
+    #             `kernel_flash_attn_ext_f32_dk128_dv128` is the kernel
+    #             actually loaded; head_dim 128 covers parakeet-{ctc,
+    #             tdt,eou} d_model=1024/n_heads=8 and parakeet-tdt-1.1b
+    #             d_model=2048/n_heads=16. Sortformer's transformer
+    #             head_dim=24 falls below ggml_flash_attn_ext's
+    #             supported set so the encoder path there is untouched
+    #             (Sortformer uses `parakeet_sortformer.cpp` not
+    #             `parakeet_ctc.cpp::rel_pos_mha_graph`).
+    #   - CPU:    OFF. Cast-to-f16 of the BD mask before softmax
+    #             measurably changed accumulator order and showed
+    #             +3.1 % encoder regression in Round 7 audit; risks
+    #             the bit-equal-NeMo gate.
+    #   - Others: OFF until backend-specific A/B. ggml-opencl supports
+    #             `flash_attn_ext` for head_dim in
+    #             {40,64,80,96,112,128,192,256}; first-Adreno bring-up
+    #             should flip and bench. Vulkan validation harness
+    #             (tests/test_vk_vs_cpu.cpp) is the natural home for
+    #             that A/B once a non-Tegra Vulkan device is available.
+    if (GGML_METAL)
+        set(QVAC_PARAKEET_FLASH_ATTN_DEFAULT ON)
+    else()
+        set(QVAC_PARAKEET_FLASH_ATTN_DEFAULT OFF)
+    endif()
+    option(QVAC_PARAKEET_FLASH_ATTN "qvac-parakeet: enable fused flash-attn in MHA (default ON for Metal; OFF elsewhere pending per-backend A/B)" ${QVAC_PARAKEET_FLASH_ATTN_DEFAULT})
     if (QVAC_PARAKEET_FLASH_ATTN)
         target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
     endif()
@@ -310,6 +343,19 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-tdt-encoder-parity PRIVATE include src ggml/include)
     qvac_parakeet_apply_backend_defs(test-tdt-encoder-parity)
+
+    add_executable(test-tdt-decoder-parity
+        src/test_tdt_decoder_parity.cpp
+        src/parakeet_ctc.cpp
+        src/parakeet_engine.cpp
+        src/parakeet_tdt.cpp
+        src/parakeet_eou.cpp
+        src/parakeet_sortformer.cpp
+        src/mel_preprocess.cpp
+        src/sentencepiece_bpe.cpp
+        src/energy_vad.cpp)
+    target_link_libraries(test-tdt-decoder-parity PRIVATE ggml)
+    target_include_directories(test-tdt-decoder-parity PRIVATE include src ggml/include)
 
     add_executable(test-sortformer-parity
         tests/test_sortformer_parity.cpp

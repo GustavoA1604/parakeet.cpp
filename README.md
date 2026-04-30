@@ -13,7 +13,7 @@ Supported checkpoints:
 |-|-|-|-|-|-|-|-|-|
 | `nvidia/parakeet-ctc-0.6b`    | CTC  | 80  | 1024 × 24 | 1024 | 600 M  | 697 MiB q8_0 / 1.3 GiB f16  | 0.014-0.046 | English only |
 | `nvidia/parakeet-ctc-1.1b`    | CTC  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1217 MiB q8_0               | 0.026-0.074 | English only |
-| `nvidia/parakeet-tdt-0.6b-v3` | TDT  | 128 | 1024 × 24 | 8192 | 600 M  | 715 MiB q8_0 / 1.34 GiB f16 | 0.024-0.050 | ~25 languages + PnC |
+| `nvidia/parakeet-tdt-0.6b-v3` | TDT  | 128 | 1024 × 24 | 8192 | 600 M  | 715 MiB q8_0 / 1.34 GiB f16 | 0.006 (q8_0, end-to-end Metal post-Phase 15 — 160× realtime, decoder fused LSTM+joint) | ~25 languages + PnC |
 | `nvidia/parakeet-tdt-1.1b`    | TDT  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1225 MiB q8_0               | 0.027-0.079 | English only, lowest WER (no PnC) |
 | `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 / 141 MiB q8_0 / 75 MiB q4_0 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
 | `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 / 134 MiB q8_0 / 72 MiB q4_0 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline + Phase 11.11.1 sliding-history live streaming today; full NeMo-style spkcache streaming in Phase 11.11.2) |
@@ -151,6 +151,15 @@ deployments (Snapdragon 7+ / 8 series); see [`patches/README.md`](patches/README
 for the small ggml-opencl patch parakeet ships and how it relates to
 the Adreno-only upstream design.
 
+The CTC encoder, the TDT encoder + LSTM-prediction + joint network
+greedy decode, the EOU encoder, and the Sortformer encoder all run
+entirely on the GPU backend when `--n-gpu-layers > 0`. As of Phase
+13 the TDT decoder is end-to-end Metal-capable: the prediction-net
+LSTM step + joint-network step are expressed as fixed-shape ggml
+graphs against the native quantised GGUF weights (no host
+dequantisation at load time on GPU), so there is no "encoder-only
+GPU offload" hot path remaining for the multilingual TDT model.
+
 ```bash
 # Apple Silicon:
 cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
@@ -192,6 +201,7 @@ This produces the main binary plus per-stage validation harnesses:
 | `build/test-encoder`              | FastConformer encoder per-stage parity vs `dump-ctc-reference.py`. |
 | `build/test-ctc`                  | CTC head + greedy decode + SentencePiece detokenize parity vs NeMo `transcribe()` (consumes `logits.npy` from `dump-ctc-reference.py`). |
 | `build/test-tdt-encoder-parity`   | TDT encoder per-stage parity vs `dump-tdt-reference.py`. |
+| `build/test-tdt-decoder-parity`   | TDT greedy decoder parity: cross-checks the scalar CPU fallback (`n_gpu_layers=0`) against the ggml-graph path (`n_gpu_layers=1`) and asserts exact token-ID equality. Optional 3rd arg points at a NeMo reference dir (`token_ids.npy`) for an external check. |
 | `build/test-sortformer-parity`    | Sortformer mel + encoder + speaker-prob parity vs `dump-sortformer-reference.py`. |
 | `build/test-streaming`            | CTC/TDT Mode 2 byte-equality + timestamp coverage + Mode 3 WER tolerance across chunk sizes. |
 | `build/test-eou-streaming`        | EOU Mode 2 transcript byte-equality vs `Engine::transcribe()` reference + `is_eou_boundary` firing on the trailing `<EOU>` chunk + Mode 3 transcript-within-tolerance. |
@@ -390,6 +400,34 @@ onnxruntime int8 with 21x tighter variance, landing the 20 s clip's
 encoder at **~73x real-time**; quant tier (f16 / Q8_0 / Q4_0) only
 affects file size, not throughput, because the Metal path is
 compute-bound on shader units.
+
+### TDT decoder Metal port (Phase 14)
+
+Bench on `parakeet-tdt-0.6b-v3.q8_0.gguf`, `sample-16k.wav` (20.13 s),
+M4 Air, 5 warmup + 15 timed runs. "Before" is the Phase 10 baseline
+(scalar CPU decoder even on Metal builds); "after" is the new
+end-to-end Metal path with the LSTM prediction net + joint network
+expressed as ggml graphs against the native quantised GGUF weights.
+
+```
+                       Metal-before   Metal-after   delta
+  -----------------------------------------------------------
+  encoder_ms median       68.5         68.9         neutral
+  decoder_ms median       76.4         59.3         -22.4 %
+  decoder_ms best         72.7         58.5         -19.5 %
+  inference_ms median    159.5        143.2         -10.2 %
+  RTF median              0.0079       0.0071       -10 %
+  real-time multiple      132x         142x         +7.5 %
+```
+
+CPU-fallback decode stays neutral (76.6 ms baseline -> 76.95 ms;
+within bench noise) — the Phase 14 graph path is only exercised on
+GPU backends; a runtime check picks the proven scalar
+implementation when `backend_active` is the CPU backend, since
+per-step graph dispatch on synchronous CPU pays a thread-pool
+wakeup penalty that erases the matmul win on small (~3 Mflop) LSTM
+steps. Token-ID stream is byte-equal between the two paths
+(`build/test-tdt-decoder-parity`).
 
 ## 3. Usage
 
@@ -810,8 +848,7 @@ python scripts/dump-ctc-reference.py \
 ./build/test-ctc     models/parakeet-ctc-0.6b.gguf artifacts/ctc-ref/logits.npy
 ```
 
-TDT parity (encoder per-stage; the decoder is checked end-to-end via
-the CLI transcript byte-equality check on `jfk.wav`):
+TDT parity (encoder per-stage + decoder token-ID exact match):
 
 ```bash
 python scripts/dump-tdt-reference.py \
@@ -819,6 +856,11 @@ python scripts/dump-tdt-reference.py \
     --out artifacts/tdt-ref
 
 ./build/test-tdt-encoder-parity \
+    models/parakeet-tdt-0.6b-v3.q8_0.gguf test/samples/jfk.wav artifacts/tdt-ref
+
+# Decoder parity: scalar CPU fallback vs ggml-graph path (Metal /
+# CUDA / Vulkan when compiled), optional NeMo reference if available.
+./build/test-tdt-decoder-parity \
     models/parakeet-tdt-0.6b-v3.q8_0.gguf test/samples/jfk.wav artifacts/tdt-ref
 ```
 
