@@ -806,8 +806,23 @@ void tdt_init_state(TdtRuntimeWeights & W, int blank_id, TdtDecodeState & state)
         // Zero h, c on-device (~5 KB memset), then run one blank-token
         // LSTM step so pred_persist holds the canonical "no tokens yet"
         // prediction (matches NeMo's RNNT_TDT init).
-        ggml_backend_tensor_memset(W.h_persist, 0, 0, ggml_nbytes(W.h_persist));
-        ggml_backend_tensor_memset(W.c_persist, 0, 0, ggml_nbytes(W.c_persist));
+        //
+        // Backend portability: ggml_backend_tensor_memset is implemented
+        // by CPU / Metal / CUDA / Vulkan in the pinned ggml, but
+        // ggml-opencl historically has not implemented it on every
+        // upstream rev. ggml_backend_tensor_set is a hard-required op
+        // for every backend (used by every graph-input upload) and is
+        // guaranteed to work, so we fall back to uploading a host
+        // zero buffer when memset fails. The cost is one-off per
+        // tdt_decode_window call (~5 KB upload) and only paid when the
+        // backend doesn't accelerate the memset path -- negligible vs
+        // the ~150 us-per-step Metal command-buffer cost.
+        const size_t h_bytes = ggml_nbytes(W.h_persist);
+        const size_t c_bytes = ggml_nbytes(W.c_persist);
+        std::vector<uint8_t> zeros;
+        zeros.assign(std::max(h_bytes, c_bytes), 0);
+        ggml_backend_tensor_set(W.h_persist, zeros.data(), 0, h_bytes);
+        ggml_backend_tensor_set(W.c_persist, zeros.data(), 0, c_bytes);
         if (!run_lstm_init_step(W, blank_id)) {
             throw std::runtime_error("tdt_init_state: LSTM graph compute failed");
         }

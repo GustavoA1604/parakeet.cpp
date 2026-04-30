@@ -7,7 +7,10 @@
 #include "parakeet_eou.h"
 #include "mel_preprocess.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1063,17 +1066,29 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         std::fprintf(fp, "{\n");
         std::fprintf(fp, "  \"model\": \"%s\",\n",  opts.model_gguf_path.c_str());
         std::fprintf(fp, "  \"wav\": \"%s\",\n",    opts.wav_path.c_str());
-        const char * backend_label =
-#if defined(GGML_USE_METAL)
-            (opts.n_gpu_layers > 0 ? "ggml-metal" : "ggml-cpu");
-#elif defined(GGML_USE_CUDA)
-            (opts.n_gpu_layers > 0 ? "ggml-cuda" : "ggml-cpu");
-#elif defined(GGML_USE_VULKAN)
-            (opts.n_gpu_layers > 0 ? "ggml-vulkan" : "ggml-cpu");
-#else
-            "ggml-cpu";
-#endif
-        std::fprintf(fp, "  \"backend\": \"%s\",\n", backend_label);
+        // Runtime-accurate backend label. Reads the post-fallback active
+        // backend off the loaded model rather than guessing from
+        // compile-time #ifdefs. Covers OpenCL (which the previous
+        // ifdef cascade missed entirely) and disambiguates correctly
+        // when multiple GPU backends are compiled into the same
+        // binary -- ggml_backend_name() prints what was actually
+        // selected by `init_gpu_backend()`'s CUDA -> Metal -> Vulkan ->
+        // OpenCL -> CPU cascade. Format mirrors the legacy strings
+        // ("ggml-metal" / "ggml-cuda" / etc.) so downstream bench
+        // sweeps that grep on these labels keep working; we just
+        // lower-case ggml_backend_name's "Metal" / "CUDA0" / "OpenCL"
+        // to "ggml-metal" / "ggml-cuda0" / "ggml-opencl".
+        std::string backend_label;
+        if (ggml_backend_t b = model.backend_active(); b != nullptr) {
+            const char * raw = ggml_backend_name(b);
+            backend_label = std::string("ggml-") + (raw ? raw : "cpu");
+            std::transform(backend_label.begin(), backend_label.end(),
+                           backend_label.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+        } else {
+            backend_label = "ggml-cpu";
+        }
+        std::fprintf(fp, "  \"backend\": \"%s\",\n", backend_label.c_str());
         std::fprintf(fp, "  \"n_gpu_layers\": %d,\n", opts.n_gpu_layers);
         std::fprintf(fp, "  \"threads\": %d,\n",    opts.n_threads);
         std::fprintf(fp, "  \"warmup_runs\": %d,\n", extra.bench_warmup);

@@ -356,6 +356,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/energy_vad.cpp)
     target_link_libraries(test-tdt-decoder-parity PRIVATE ggml)
     target_include_directories(test-tdt-decoder-parity PRIVATE include src ggml/include)
+    qvac_parakeet_apply_backend_defs(test-tdt-decoder-parity)
 
     add_executable(test-sortformer-parity
         tests/test_sortformer_parity.cpp
