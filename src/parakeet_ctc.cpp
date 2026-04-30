@@ -4,7 +4,9 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#ifdef GGML_USE_BLAS
 #include "ggml-blas.h"
+#endif
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -13,6 +15,9 @@
 #endif
 #ifdef GGML_USE_VULKAN
 #include "ggml-vulkan.h"
+#endif
+#ifdef GGML_USE_OPENCL
+#include "ggml-opencl.h"
 #endif
 #include "gguf.h"
 
@@ -40,6 +45,23 @@ struct EncoderGraph {
 
     std::vector<float> pe_host;
     std::vector<float> att_mask_host;   // (T_enc, T_enc) row-major; 0 for visible, -inf for masked
+
+    // Subsampling time-pad masks. When `all_valid == true` these are
+    // pre-built once at graph construction (every value is 1.0 over
+    // the corresponding L_i). When `all_valid == false` they are
+    // re-built per call from the actual `mel_valid` count and cached
+    // in `mN_dynamic`; the cached buffers are reused across calls
+    // with the same `(L_i, V_i)` layout to avoid the per-call
+    // std::vector allocations. See `run_encoder` for the cache
+    // invalidation logic.
+    std::vector<float> m0_host;
+    std::vector<float> m1_host;
+    std::vector<float> m2_host;
+    std::vector<float> m3_host;
+    int                m0_v = -1;
+    int                m1_v = -1;
+    int                m2_v = -1;
+    int                m3_v = -1;
 
     ggml_tensor * mel_in   = nullptr;
     ggml_tensor * mask_t0  = nullptr;
@@ -70,6 +92,9 @@ struct EncoderGraph {
         T_mel = 0;
         all_valid = false;
         pe_host.clear();
+        att_mask_host.clear();
+        m0_host.clear(); m1_host.clear(); m2_host.clear(); m3_host.clear();
+        m0_v = m1_v = m2_v = m3_v = -1;
     }
 };
 
@@ -77,7 +102,9 @@ struct ParakeetCtcModel::Impl {
     gguf_context         * gguf           = nullptr;
     ggml_context         * ctx            = nullptr;
     ggml_backend_t         backend_cpu    = nullptr;
+#ifdef GGML_USE_BLAS
     ggml_backend_t         backend_blas   = nullptr;
+#endif
     ggml_backend_t         backend_gpu    = nullptr;
     ggml_backend_t         backend_active = nullptr;
     ggml_backend_buffer_t  weights_buffer = nullptr;
@@ -92,7 +119,9 @@ struct ParakeetCtcModel::Impl {
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         if (ctx)            ggml_free(ctx);
         if (gguf)           gguf_free(gguf);
+#ifdef GGML_USE_BLAS
         if (backend_blas)   ggml_backend_free(backend_blas);
+#endif
         if (backend_gpu)    ggml_backend_free(backend_gpu);
         if (backend_cpu)    ggml_backend_free(backend_cpu);
     }
@@ -118,6 +147,44 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
 #ifdef GGML_USE_VULKAN
     if (auto * b = ggml_backend_vk_init(0)) {
         if (verbose) std::fprintf(stderr, "parakeet: using Vulkan backend\n");
+        return b;
+    }
+#endif
+#ifdef GGML_USE_OPENCL
+    if (auto * b = ggml_backend_opencl_init()) {
+        const ggml_backend_dev_t dev = ggml_backend_get_device(b);
+        const char * name = dev ? ggml_backend_dev_name(dev)        : nullptr;
+        const char * desc = dev ? ggml_backend_dev_description(dev) : nullptr;
+        auto is_adreno_6xx = [](const char * s) -> bool {
+            if (!s) return false;
+            if (!strstr(s, "Adreno")) return false;
+            for (const char * q = s; *q; ++q) {
+                if (*q == '6' && q[1] >= '0' && q[1] <= '9' && q[2] >= '0' && q[2] <= '9') {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (is_adreno_6xx(name) || is_adreno_6xx(desc)) {
+            const char * reported = name ? name : (desc ? desc : "unknown");
+            if (verbose) std::fprintf(stderr,
+                "parakeet: OpenCL device '%s' is Adreno 6xx; "
+                "forcing CPU fallback (7xx/8xx/X1E supported, set "
+                "QVAC_PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
+                reported);
+            const char * override_env = getenv("QVAC_PARAKEET_ALLOW_ADRENO_6XX");
+            if (!override_env || override_env[0] != '1') {
+                ggml_backend_free(b);
+                return nullptr;
+            }
+            if (verbose) std::fprintf(stderr,
+                "parakeet: QVAC_PARAKEET_ALLOW_ADRENO_6XX=1 set; "
+                "keeping OpenCL backend on '%s' anyway\n", reported);
+        }
+        if (verbose) {
+            std::fprintf(stderr, "parakeet: using OpenCL backend (%s)\n",
+                         name ? name : (desc ? desc : "unknown"));
+        }
         return b;
     }
 #endif
@@ -545,10 +612,12 @@ int load_from_gguf(const std::string & gguf_path,
         out_model.tdt.joint_out_b  = require_tensor(impl->ctx, "tdt.joint.out.bias");
     }
 
+#ifdef GGML_USE_BLAS
     if (impl->backend_blas) {
         ggml_backend_free(impl->backend_blas);
         impl->backend_blas = nullptr;
     }
+#endif
 
     out_model.impl = impl;
 
@@ -560,6 +629,18 @@ int load_from_gguf(const std::string & gguf_path,
         std::fprintf(stderr, "  backend: %s  (threads=%d)\n", be, resolved_threads);
     }
     return 0;
+}
+
+bool model_has_gpu_backend(const ParakeetCtcModel & m) {
+    return m.impl && m.impl->backend_gpu != nullptr;
+}
+
+std::string model_active_backend_name(const ParakeetCtcModel & m) {
+    if (!m.impl) return "CPU";
+    ggml_backend_t b = m.impl->backend_active;
+    if (!b) return "CPU";
+    const char * name = ggml_backend_name(b);
+    return name ? std::string(name) : std::string("CPU");
 }
 
 void print_model_summary(const ParakeetCtcModel & m) {
@@ -1161,8 +1242,13 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
         const int left  = enc.att_context_left;
         const int right = enc.att_context_right;
         const int chunk = right + 1;
-        g.att_mask_host.assign((size_t) T * T,
-                               -std::numeric_limits<float>::infinity());
+        // Use a large finite "very negative" sentinel rather than -inf:
+        // Apple Clang at -O3 emits `-Wnan-infinity-disabled` because some
+        // FP optimisations treat infinity as UB, which empirically
+        // corrupts the chunked-limited mask on the EOU offline encoder
+        // (CTC / TDT use full attention so they're unaffected). Softmax
+        // with -1e30 saturates to ~0 just like -inf, with no UB risk.
+        g.att_mask_host.assign((size_t) T * T, -1.0e30f);
         for (int i = 0; i < T; ++i) {
             const int c          = i / chunk;
             const int win_start  = c * chunk - left;
@@ -1323,20 +1409,29 @@ int run_encoder(ParakeetCtcModel   & model,
                 int                  n_mel_frames,
                 int                  n_mels,
                 EncoderOutputs     & out,
-                int                  max_layers) {
+                int                  max_layers,
+                bool                 capture_intermediates) {
     if (!model.impl || !model.impl->backend_active) return -1;
 
     ggml_backend_t backend = model.impl->backend_active;
     const EncoderConfig & enc = model.encoder_cfg;
     const int d_model = enc.d_model;
 
+    // Scan from the end for the last non-zero mel frame: the mel
+    // pre-processor zeros out trailing pad frames (per-feature CMVN
+    // sets them to 0), and `compute_log_mel` always produces at least
+    // one valid frame. Reverse-scan with early-exit replaces the
+    // worst-case O(n_mel_frames * n_mels) full sweep with the typical
+    // case "the last frame is valid -> 1 inner iteration only" path
+    // -- the fast path for non-streaming `Engine::transcribe()` calls
+    // and the tail of any chunk in Mode 2 / Mode 3 streaming.
     int mel_valid = 0;
-    for (int t = 0; t < n_mel_frames; ++t) {
-        bool nonzero = false;
+    for (int t = n_mel_frames - 1; t >= 0; --t) {
+        const float * row = mel + (size_t) t * n_mels;
         for (int m = 0; m < n_mels; ++m) {
-            if (mel[(size_t) t * n_mels + m] != 0.0f) { nonzero = true; break; }
+            if (row[m] != 0.0f) { mel_valid = t + 1; break; }
         }
-        if (nonzero) mel_valid = t + 1;
+        if (mel_valid != 0) break;
     }
     if (mel_valid == 0) mel_valid = n_mel_frames;
     const bool all_valid = (mel_valid == n_mel_frames);
@@ -1391,15 +1486,23 @@ int run_encoder(ParakeetCtcModel   & model,
     const int T = L3;
     const int vocab_size = model.vocab_size;
 
-    auto make_mask = [](int L, int V) {
-        std::vector<float> m(L, 0.0f);
-        for (int t = 0; t < L && t < V; ++t) m[t] = 1.0f;
-        return m;
+    // Refresh the cached subsampling masks if the valid-frame count
+    // changed since last call (or if this is the first call against
+    // this cached graph). For long-form transcribe / Mode 2 streaming
+    // the same `g_ptr` graph is reused across many `run_encoder` calls
+    // with `all_valid == true` (graph cache key includes `all_valid`),
+    // so the cache hit-rate here is essentially 100 % and we save four
+    // std::vector allocations + the corresponding fills every call.
+    auto refresh_mask = [](std::vector<float> & buf, int & v_cache, int L, int V) {
+        if (v_cache == V && (int) buf.size() == L) return;
+        buf.assign((size_t) L, 0.0f);
+        for (int t = 0; t < L && t < V; ++t) buf[t] = 1.0f;
+        v_cache = V;
     };
-    const std::vector<float> m0 = make_mask(L0, V0);
-    const std::vector<float> m1 = make_mask(L1, V1);
-    const std::vector<float> m2 = make_mask(L2, V2);
-    const std::vector<float> m3 = make_mask(L3, V3);
+    refresh_mask(g.m0_host, g.m0_v, L0, V0);
+    refresh_mask(g.m1_host, g.m1_v, L1, V1);
+    refresh_mask(g.m2_host, g.m2_v, L2, V2);
+    refresh_mask(g.m3_host, g.m3_v, L3, V3);
 
     if (!ggml_gallocr_alloc_graph(g.alloc, g.cgraph)) {
         return -3;
@@ -1408,12 +1511,12 @@ int run_encoder(ParakeetCtcModel   & model,
     auto safe_set = [](ggml_tensor * t, const void * src, size_t bytes) {
         if (t && t->buffer) ggml_backend_tensor_set(t, src, 0, bytes);
     };
-    safe_set(g.mel_in,  mel,              (size_t) n_mels * L0 * sizeof(float));
-    safe_set(g.mask_t0, m0.data(),        m0.size()        * sizeof(float));
-    safe_set(g.mask_t1, m1.data(),        m1.size()        * sizeof(float));
-    safe_set(g.mask_t2, m2.data(),        m2.size()        * sizeof(float));
-    safe_set(g.mask_t3, m3.data(),        m3.size()        * sizeof(float));
-    safe_set(g.pe_in,   g.pe_host.data(), g.pe_host.size() * sizeof(float));
+    safe_set(g.mel_in,  mel,                 (size_t) n_mels * L0 * sizeof(float));
+    safe_set(g.mask_t0, g.m0_host.data(),    g.m0_host.size()     * sizeof(float));
+    safe_set(g.mask_t1, g.m1_host.data(),    g.m1_host.size()     * sizeof(float));
+    safe_set(g.mask_t2, g.m2_host.data(),    g.m2_host.size()     * sizeof(float));
+    safe_set(g.mask_t3, g.m3_host.data(),    g.m3_host.size()     * sizeof(float));
+    safe_set(g.pe_in,   g.pe_host.data(),    g.pe_host.size()     * sizeof(float));
     if (g.att_mask) {
         safe_set(g.att_mask, g.att_mask_host.data(),
                  g.att_mask_host.size() * sizeof(float));
@@ -1432,13 +1535,30 @@ int run_encoder(ParakeetCtcModel   & model,
         dst.resize((size_t) ggml_nelements(t));
         ggml_backend_tensor_get(t, dst.data(), 0, dst.size() * sizeof(float));
     };
-    copy_tensor(g.sub_out_node,         out.subsampling_out);
-    copy_tensor(g.post_ff1_0_node,      out.block_0_post_ff1);
-    copy_tensor(g.post_attn_0_node,     out.block_0_post_attn);
-    copy_tensor(g.post_conv_0_node,     out.block_0_post_conv);
-    copy_tensor(g.post_ff2_0_node,      out.block_0_post_ff2);
-    copy_tensor(g.block_0_out_node,     out.block_0_out);
-    copy_tensor(g.block_last_out_node,  out.block_last_out);
+    // The production transcribe/diarize/stream path only consumes
+    // `encoder_out` (TDT/EOU/Sortformer decoders) and `logits` (CTC).
+    // Skip the per-stage host copies in that case -- saves roughly
+    // 7 * d_model * T_enc * 4 bytes per inference call (~4-5 MB on
+    // 0.6B at T_enc=137), which is on the GPU<->host critical path
+    // for OpenCL / CUDA / Vulkan / Metal streaming workloads where
+    // each chunk drives a fresh `run_encoder()` round-trip.
+    if (capture_intermediates) {
+        copy_tensor(g.sub_out_node,         out.subsampling_out);
+        copy_tensor(g.post_ff1_0_node,      out.block_0_post_ff1);
+        copy_tensor(g.post_attn_0_node,     out.block_0_post_attn);
+        copy_tensor(g.post_conv_0_node,     out.block_0_post_conv);
+        copy_tensor(g.post_ff2_0_node,      out.block_0_post_ff2);
+        copy_tensor(g.block_0_out_node,     out.block_0_out);
+        copy_tensor(g.block_last_out_node,  out.block_last_out);
+    } else {
+        out.subsampling_out.clear();
+        out.block_0_post_ff1.clear();
+        out.block_0_post_attn.clear();
+        out.block_0_post_conv.clear();
+        out.block_0_post_ff2.clear();
+        out.block_0_out.clear();
+        out.block_last_out.clear();
+    }
     copy_tensor(g.encoder_out_node,     out.encoder_out);
     copy_tensor(g.logits_node,          out.logits);
 
@@ -1617,11 +1737,19 @@ void ctc_greedy_decode_window(const float * logits,
 
     int32_t prev = inout_prev_token;
     for (int t = start_frame; t < end_frame; ++t) {
-        const float * row = logits + static_cast<size_t>(t) * vocab_size;
+        const float * __restrict row = logits + static_cast<size_t>(t) * vocab_size;
         int32_t best       = 0;
         float   best_score = row[0];
+        // The argmax-with-index reduction has a loop-carried dep on
+        // `best_score` / `best` so it doesn't auto-vectorise as cleanly
+        // as a plain reduction. `__restrict` + the explicit read into a
+        // register at least lets the compiler use a fused max-with-mask
+        // pattern on AVX2 / AVX-512. Same shape as the gemv treatment in
+        // parakeet_tdt.cpp::gemv_f32.
+        #pragma GCC ivdep
         for (int i = 1; i < vocab_size; ++i) {
-            if (row[i] > best_score) { best_score = row[i]; best = i; }
+            const float v = row[i];
+            if (v > best_score) { best_score = v; best = i; }
         }
         if (best != blank_id && best != prev) {
             out_tokens.push_back(best);

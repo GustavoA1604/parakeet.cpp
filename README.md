@@ -1,4 +1,4 @@
-# qvac-parakeet.cpp
+# parakeet.cpp
 
 **Parakeet** (NVIDIA, CC-BY-4.0 FastConformer ASR family) ported to
 [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference on CPU
@@ -50,6 +50,20 @@ that auto-dispatches on `parakeet.model.type`:
 
 Plus a free function `transcribe_with_speakers(sortformer_engine,
 asr_engine, ...)` for combined "who said what" attribution.
+
+The Engine also exposes the resolved compute device after the load-time
+backend cascade and any fallbacks (Adreno-tier policy, OpenCL extension
+probe, missing GPU build, kernel-init failure):
+
+- `Engine::backend_device()` -> `BackendDevice::CPU` or `BackendDevice::GPU`.
+- `Engine::backend_name()`   -> human-readable name from
+  `ggml_backend_name()` (e.g. `"CUDA0"`, `"Metal"`, `"Vulkan0"`,
+  `"OpenCL"`, or `"CPU"`).
+
+Both reflect the post-fallback truth, not the
+`EngineOptions::n_gpu_layers` request, so consumers (Node addons,
+diagnostics UI, telemetry) can surface "running on CPU" / "running on
+GPU" without reproducing the cascade logic.
 
 Both `StreamSession` and `SortformerStreamSession` also support a
 small cross-engine event surface (Phase 13) via
@@ -113,8 +127,8 @@ See `scripts/` for one-shot helpers.
 ## 1. Clone and build
 
 ```bash
-git clone <this-repo> qvac-parakeet.cpp
-cd qvac-parakeet.cpp
+git clone <this-repo> parakeet.cpp
+cd parakeet.cpp
 
 # Clone ggml at the pinned commit. The same pin is used for every
 # backend (CPU, Metal, CUDA, Vulkan); no engine- or backend-specific
@@ -126,11 +140,16 @@ cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 ```
 
 For a GPU backend pick **one** of Metal (Apple Silicon, **~2.5x faster
-than CPU**), CUDA (NVIDIA), or Vulkan (everything else) at configure
-time. The init order at runtime is `CUDA -> Metal -> Vulkan -> CPU`,
-so a single binary built with multiple backends compiled in will use
-the first available one and there is no runtime backend switch -- the
-expectation is one backend per build.
+than CPU**), CUDA (NVIDIA), Vulkan (most other desktops), or OpenCL
+(Android Adreno target) at configure time. The init order at runtime
+is `CUDA -> Metal -> Vulkan -> OpenCL -> CPU`, so a single binary
+built with multiple backends compiled in will use the first available
+one and there is no runtime backend switch -- the expectation is one
+backend per build. The `OpenCL` slot is the most recently shipped
+backend and is primarily for **Android Adreno**
+deployments (Snapdragon 7+ / 8 series); see [`patches/README.md`](patches/README.md)
+for the small ggml-opencl patch parakeet ships and how it relates to
+the Adreno-only upstream design.
 
 ```bash
 # Apple Silicon:
@@ -138,6 +157,13 @@ cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
     -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
 # NVIDIA:   -DGGML_CUDA=ON
 # Generic:  -DGGML_VULKAN=ON
+# Android Adreno production build (cross-compile via NDK; OpenCL ICD
+# loader and headers come from the Android NDK / Snapdragon toolchain):
+#           -DGGML_OPENCL=ON
+# OpenCL on a non-Adreno desktop (NVIDIA / AMD / Apple iGPU) for dev /
+# CI parity testing only -- Adreno-tuned matmul kernels off, generic
+# OpenCL paths only:
+#           -DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF
 cmake --build build-metal -j$(sysctl -n hw.ncpu)
 
 # `--n-gpu-layers` is a yes/no toggle today: any value > 0 moves the
@@ -180,8 +206,25 @@ This produces the main binary plus per-stage validation harnesses:
   a sub-project): builds `live-mic` + `live-mic-attributed`.
 - `-DQVAC_PARAKEET_USE_SYSTEM_GGML=ON`: link against an installed
   ggml instead of the pinned clone in `ggml/`.
-- `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON`: pick
-  exactly one GPU backend at configure time (see GPU note above).
+- `-DQVAC_PARAKEET_GGML_LIB_PREFIX=ON` (default ON, has no effect when
+  `QVAC_PARAKEET_USE_SYSTEM_GGML=ON`): rename the bundled ggml shared
+  / static libraries to `libqvac-parakeet-ggml-*.{so,dylib,a}` (Windows:
+  `qvac-parakeet-ggml-*.dll` + `libqvac-parakeet-ggml-*.dll.a`). Only
+  the produced filenames change; the CMake target names (`ggml`,
+  `ggml-base`, `ggml-cpu`, `ggml-opencl`, ...) and the C symbols
+  (`ggml_*`) are kept upstream-compatible. The rename prevents
+  shared-library filename collisions when multiple addons that bundle
+  different ggml versions are loaded into the same process. Pass
+  `-DQVAC_PARAKEET_GGML_LIB_PREFIX=OFF` to keep upstream filenames
+  (e.g. when you want a single shared `libggml.so` consumed by every
+  in-process addon).
+- `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON` /
+  `-DGGML_OPENCL=ON`: pick exactly one GPU backend at configure time
+  (see GPU note above). For OpenCL on non-Adreno hardware also pass
+  `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF` and ensure
+  `scripts/setup-ggml.sh` has applied
+  `patches/ggml-opencl-allow-non-adreno.patch` -- both are no-ops
+  on real Adreno builds.
 
 ## 2. One-time: convert weights
 
@@ -485,7 +528,7 @@ drop-in swap.
 
 The Node binding at [qvac-lib-infer-parakeet](https://github.com/qvac/qvac-lib-infer-parakeet)
 is the intended consumer for `StreamSession`; check its README for
-the `qvac-parakeet.cpp` version it currently links against.
+the `parakeet.cpp` version it currently links against.
 
 ### Streaming — EOU (`<EOU>` end-of-utterance token)
 
@@ -931,7 +974,7 @@ has the full round-by-round journal):
   `cache_aware_stream_step` was prototyped + rejected on quality
   grounds (PROGRESS.md §8.5 case (A)).
 
-Next: vcpkg port for `qvac-parakeet.cpp` + the
+Next: vcpkg port for `parakeet.cpp` + the
 `qvac-lib-infer-parakeet` binding swap to consume this library
 instead of onnxruntime; Accelerate BLAS for the TDT/EOU decoder's
 LSTM + joint gemvs and Sortformer's transformer attention;
@@ -941,7 +984,7 @@ flash-attn; Phase 11.11.2 Sortformer streaming (NeMo-style spkcache).
 ## Repository layout
 
 ```
-qvac-parakeet.cpp/
+parakeet.cpp/
   ggml/                          pristine ggml clone (not tracked; populated
                                    by scripts/setup-ggml.sh, or skipped entirely
                                    when building with -DQVAC_PARAKEET_USE_SYSTEM_GGML=ON)

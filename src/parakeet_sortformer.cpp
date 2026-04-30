@@ -29,12 +29,21 @@ void dequant(const ggml_tensor * t, std::vector<float> & out) {
 
 inline float sigmoidf(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
+// See `parakeet_tdt.cpp::gemv_f32` for the rationale on why
+// vectorising this matters even though Sortformer's transformer is
+// `tf_d_model = 192` (much smaller than the CTC encoder). The inner
+// dot-product runs T*T*n_heads*head_dim FMAs per `self_attention`
+// call -- already small but on the critical path of every diarize
+// chunk; vectorisation is free with __restrict + `-O3 -ffast-math`
+// on gcc/clang and the `#pragma GCC ivdep` removes the data-
+// dependence assumption that otherwise pessimises some compilers.
 void gemv(const float * __restrict W, const float * __restrict x,
           const float * __restrict b, float * __restrict y,
           int out_dim, int in_dim) {
     for (int i = 0; i < out_dim; ++i) {
-        const float * row = W + (size_t) i * in_dim;
+        const float * __restrict row = W + (size_t) i * in_dim;
         float acc = b ? b[i] : 0.0f;
+        #pragma GCC ivdep
         for (int j = 0; j < in_dim; ++j) acc += row[j] * x[j];
         y[i] = acc;
     }

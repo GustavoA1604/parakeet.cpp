@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Download every Parakeet checkpoint we know about into qvac-parakeet.cpp/models/
+# Download every Parakeet checkpoint we know about into parakeet.cpp/models/
 # (.nemo for the native ggml converter) and qvac/packages/qvac-lib-infer-parakeet/models/
 # (ONNX bundles for the existing Node binding).
 #
@@ -25,8 +25,8 @@ BINDING_DIR="${BINDING_DIR:-$BINDING_DIR_DEFAULT}"
 mkdir -p "$NEMO_DIR"
 
 # Only create the ONNX binding directory if it already exists or the user
-# explicitly opted in via BINDING_DIR. A fresh checkout of qvac-parakeet.cpp/
-# without a sibling qvac/ tree will skip the ONNX section instead of
+# explicitly opted in via BINDING_DIR. A fresh checkout of parakeet.cpp/
+# without a parallel qvac/ tree will skip the ONNX section instead of
 # creating a stray directory next door.
 binding_available=0
 if [[ -n "${BINDING_DIR:-}" ]] && [[ "$BINDING_DIR" != "$BINDING_DIR_DEFAULT" ]]; then

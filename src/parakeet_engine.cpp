@@ -56,6 +56,13 @@ struct Engine::Impl {
     SortformerRuntimeWeights sortformer_rt;
     bool                     sortformer_ready = false;
 
+    // Reusable mel preprocess scratch buffers. Engine APIs are
+    // documented as single-threaded per-instance (see engine.h
+    // `Engine::transcribe_*` notes), so a single state member is
+    // sufficient. StreamSession holds its own MelState (see below)
+    // because the encoder + decoder pipelines run independently.
+    MelState            mel_state;
+
     Impl() = default;
 };
 
@@ -122,6 +129,15 @@ bool Engine::is_transcription_model() const {
            pimpl_->model.model_type == ParakeetModelType::EOU;
 }
 
+BackendDevice Engine::backend_device() const {
+    return model_has_gpu_backend(pimpl_->model) ? BackendDevice::GPU
+                                                : BackendDevice::CPU;
+}
+
+std::string Engine::backend_name() const {
+    return model_active_backend_name(pimpl_->model);
+}
+
 void Engine::cancel() {
     pimpl_->cancel_flag.store(true);
 }
@@ -161,7 +177,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     std::vector<float> mel;
     int n_mel_frames = 0;
     if (int rc = compute_log_mel(samples, n_samples, pimpl_->model.mel_cfg,
-                                 mel, n_mel_frames); rc != 0) {
+                                 pimpl_->mel_state, mel, n_mel_frames); rc != 0) {
         throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -170,7 +186,9 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     const auto t_enc = clock::now();
     EncoderOutputs enc_out;
     if (int rc = run_encoder(pimpl_->model, mel.data(), n_mel_frames,
-                             pimpl_->model.mel_cfg.n_mels, enc_out); rc != 0) {
+                             pimpl_->model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
         throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -274,7 +292,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     std::vector<float> mel;
     int n_mel_frames = 0;
     if (int rc = compute_log_mel(samples, n_samples, pimpl_->model.mel_cfg,
-                                 mel, n_mel_frames); rc != 0) {
+                                 pimpl_->mel_state, mel, n_mel_frames); rc != 0) {
         throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -283,7 +301,9 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     const auto t_enc = clock::now();
     EncoderOutputs enc_out;
     if (int rc = run_encoder(pimpl_->model, mel.data(), n_mel_frames,
-                             pimpl_->model.mel_cfg.n_mels, enc_out); rc != 0) {
+                             pimpl_->model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
         throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -457,7 +477,7 @@ static DiarizationResult engine_impl_diarize_helper(Engine::Impl & impl,
     std::vector<float> mel;
     int n_mel_frames = 0;
     if (int rc = compute_log_mel(work.data(), n_samples, impl.model.mel_cfg,
-                                 mel, n_mel_frames); rc != 0) {
+                                 impl.mel_state, mel, n_mel_frames); rc != 0) {
         throw std::runtime_error("diarize: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -466,7 +486,9 @@ static DiarizationResult engine_impl_diarize_helper(Engine::Impl & impl,
     const auto t_enc = clock::now();
     EncoderOutputs enc_out;
     if (int rc = run_encoder(impl.model, mel.data(), n_mel_frames,
-                             impl.model.mel_cfg.n_mels, enc_out); rc != 0) {
+                             impl.model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
         throw std::runtime_error("diarize: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
@@ -636,6 +658,12 @@ struct StreamSession::Impl {
     std::unique_ptr<EnergyVad> energy_vad;
     int64_t total_pcm_seen = 0;
 
+    // Reusable mel preprocess scratch. Carrying it on the session
+    // means every Mode 2 / Mode 3 chunk skips the 6-vector allocation
+    // in `compute_log_mel` after the first call -- the dominant
+    // per-chunk allocator pressure on streaming workloads.
+    MelState mel_state;
+
     void process_window(const float * window_samples, int window_n,
                         int center_start_sample,
                         int center_end_sample,
@@ -658,14 +686,16 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
     int n_mel_frames = 0;
     if (int rc = compute_log_mel(window_samples, window_n,
                                  engine_impl->model.mel_cfg,
-                                 mel, n_mel_frames); rc != 0) {
+                                 mel_state, mel, n_mel_frames); rc != 0) {
         throw std::runtime_error("StreamSession: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
 
     EncoderOutputs enc_out;
     if (int rc = run_encoder(engine_impl->model, mel.data(), n_mel_frames,
-                             engine_impl->model.mel_cfg.n_mels, enc_out); rc != 0) {
+                             engine_impl->model.mel_cfg.n_mels, enc_out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
         throw std::runtime_error("StreamSession: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
