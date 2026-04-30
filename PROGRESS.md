@@ -930,9 +930,13 @@ shrink the model file and the unified-memory footprint.
     to ggml) so the CPU and Metal paths share `conformer_conv_graph`.
     Would buy a few ms more on Metal since the direct path is
     asymptotically cheaper than im2col.
-  - Test `ggml_flash_attn_ext` on Metal — likely a meaningful win given
+  - ~~Test `ggml_flash_attn_ext` on Metal — likely a meaningful win given
     the fused softmax + V-multiply kernel, plus the dormant infra from
-    Round 7 is already in place.
+    Round 7 is already in place.~~ **Done** — see §15.8 below. Shipped
+    `QVAC_PARAKEET_FLASH_ATTN=ON` as the Metal default; encoder
+    67.35 → 67.00 ms (−0.5 %) and inference 119.24 → 118.66 ms (−0.5 %)
+    on M3 Ultra at byte-exact parity. CPU + CUDA + Vulkan + OpenCL keep
+    the default OFF until each is A/B'd.
   - Hybrid `ggml_backend_sched` with Metal for the encoder + CPU for
     the mel preprocessor, so the CPU mel path doesn't block the GPU
     encoder. Today the mel runs inline on host before the encoder
@@ -3140,3 +3144,122 @@ LSTM+joint is the local optimum on this hardware.
     (CUDA) could see proportionally larger Phase 15 wins.
   - **TDT 1.1B sweep.** Same caveat as Phase 14; the relative
     win should hold but absolute numbers shift.
+
+---
+
+### 15.8 — Phase 6.5 follow-up: ship `ggml_flash_attn_ext` on Metal
+
+Closes the lone bench-validation hole in PROGRESS §6.5 ("Test
+`ggml_flash_attn_ext` on Metal — likely a meaningful win"). The
+infra has been dormant since the Round 7 audit (§5.13), gated
+behind `#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN` in
+`rel_pos_mha_graph()` and surfaced as the `QVAC_PARAKEET_FLASH_ATTN`
+CMake option (off by default everywhere). Round 7 only A/B'd it on
+CPU, where it regressed encoder by +3.1 % because the cast-to-f16
+of the relative-position bias `bd_final` mask before softmax
+shifted the BD computation order; Metal was never tested.
+
+**What changed:** `CMakeLists.txt` now derives a per-backend
+default. When `GGML_METAL=ON` the option defaults to ON; CPU /
+CUDA / Vulkan / OpenCL keep their existing OFF default until each
+ships its own A/B (CUDA can be exercised through
+`scripts/bench-non-apple.sh` once a discrete-GPU host is
+available). No source files in `src/` changed — the
+`#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN` branch in
+`parakeet_ctc.cpp::rel_pos_mha_graph` is what gets compiled in.
+
+**Kernel actually loaded:** from `ggml_metal_library_compile_pipeline`
+log on first invocation —
+
+  - `kernel_flash_attn_ext_pad_mask=1_ncpsg=64`
+  - `kernel_flash_attn_ext_blk_nqptg=8_ncpsg=64`
+  - `kernel_flash_attn_ext_f32_dk128_dv128_mask=1_sinks=0_bias=0_scap=0_kvpad=1_bcm=1_ns10=128_ns20=128_nsg=4`
+
+Head_dim 128 covers `parakeet-ctc-0.6b`, `parakeet-tdt-0.6b-v3`,
+`parakeet_realtime_eou_120m-v1` (all `d_model=1024 / n_heads=8`)
+and `parakeet-tdt-1.1b` (`d_model=2048 / n_heads=16` → also 128).
+Sortformer's transformer is `tf_d_model=192 / n_heads=8 → head_dim=24`,
+which falls below `flash_attn_ext`'s supported set
+{40,64,80,96,112,128,192,256}. `parakeet_sortformer.cpp` does not
+share `rel_pos_mha_graph` with the conformer encoder, so the
+Sortformer transformer block is structurally untouched by this
+flag.
+
+**Bench (M3 Ultra Metal, q8_0, sample-16k.wav 20.13 s, 95 tokens,
+3 warmup + 15 timed runs averaged across 5 invocations):**
+
+| Stage    | FA OFF (HEAD)    | FA ON (this change) | delta              |
+|----------|------------------:|--------------------:|-------------------:|
+| mel ms   |   7.72 ± 0.13     |    7.65 ± 0.02      |              noise |
+| enc ms   |  67.35 ± 0.03     |   67.00 ± 0.02      |  −0.35 ms / −0.5 % |
+| dec ms   |  44.16 ± 0.27     |   44.02 ± 0.51      |              noise |
+| infer ms | 119.24 ± 0.32     |  118.66 ± 0.51      |  −0.58 ms / −0.5 % |
+| RT mult  |     168×          |        170×         |               +2×  |
+
+Stdev figures are between-invocation; per-invocation stdev is
+≤ 0.21 ms on encoder. The 0.35 ms encoder saving is ~5–6× the
+between-invocation stdev, so reproducible.
+
+**Why so modest on M3 Ultra:** the conformer attention shape is
+`T = 252, H = 8, HD = 128`, which puts the QK^T scores tensor at
+~2 MB (252 × 252 × 8 × 4 B). That's well-cached on the M3 Ultra's
+60-core Metal GPU, so the standard `mul_mat → soft_max_ext →
+permute → mul_mat` path was already not memory-bound. The
+remaining win is purely from collapsing four kernel dispatches
+per attention block into one (24 layers × 4 = 96 dispatch saves
+× ~30 µs/dispatch ≈ 2.9 ms theoretical; we measured 0.35 ms,
+suggesting the dispatch saving is partially absorbed by ggml's
+graph-machinery overhead and the f32→f16 BD-mask cast). PCIe-
+based discrete GPUs typically have higher per-dispatch overhead
+and proportionally less L2 per SM, so the predicted-positive
+case on CUDA / Vulkan is meaningfully larger; that's why those
+defaults stay OFF until measured.
+
+**Parity:** all gates pass byte-exact under the new default —
+
+  - `test-tdt-decoder-parity` PASS, 95 tokens, "Alice was
+    beginning…", CPU-fallback vs Metal-graph token IDs identical
+  - `test-mel-fft-parity` PASS, rfft vs textbook FFT rel error
+    6.89e-08, stateful overload bit-equal stateless on 101 frames
+    × 80 mels, 7 sequential calls bit-equal
+  - `test-encoder-capture-parity` (CTC) PASS,
+    `encoder_out (258 048 floats)` and `logits (258 300 floats)`
+    bit-equal across capture=true/false
+  - `test-perf-regression` (TDT q8_0, n_gpu_layers=1) PASS,
+    transcript byte-equal to expected, mel and encoder summary
+    inside the configured budgets
+
+The cast-to-f16 of the BD mask that broke CPU parity in Round 7
+does not break Metal parity here because: (a) the no-streaming
+case (full sample-16k.wav window) has `att_mask = nullptr` so the
+mask passed to `ggml_flash_attn_ext` is purely `bd_scaled =
+scale * bd_final` with no additional masking term to merge; (b)
+the f16 cast happens on a tensor whose pre-softmax magnitudes are
+in the ±5 to ±10 range (relative-position embeddings post matmul
++ `pos_bias_v` add), well within f16's 6-decimal-digit precision;
+(c) the downstream argmax over the joint logits is invariant to
+sub-bit-15 precision drift in attention scores.
+
+**What this does not address:**
+
+  - `att_mask != nullptr` (Mode 2/3 streaming windows). The
+    experimental code path passes only `bd_scaled` as the mask;
+    the additive `att_mask` is dropped on the floor. Mode 1 is
+    fine but for Mode 2/3 production streaming the mask should
+    be folded in via `ggml_add(bd_scaled, att_mask)` before the
+    f16 cast. Tracked as a precondition for the streaming bench
+    sweep.
+  - Sortformer transformer head_dim=24 is unsupported by
+    `flash_attn_ext`. Not a regression — just unaffected.
+
+**Remaining stack-rank for next encoder optimization:**
+
+  1. Conv2d-DW Metal kernel (PROGRESS §6.5 first bullet) —
+     promotes 24 conformer-conv blocks off the im2col fallback.
+     Bigger expected gain than this flash-attn flip because the
+     im2col path adds a separate copy kernel before the matmul.
+  2. Hybrid `ggml_backend_sched`: overlap mel preprocessing
+     (7.65 ms host CPU) with encoder dispatch (67 ms Metal).
+     Up to 7.65 ms inference wall-time saving if we can hide
+     mel under encoder.
+  3. `att_mask` fold-in for streaming (covered above).

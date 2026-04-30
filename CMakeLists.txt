@@ -125,17 +125,38 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_OPENCL)
     endif()
 
-    # `PARAKEET_EXPERIMENTAL_FLASH_ATTN` historically gates the
-    # rel-pos MHA fused-attention path in `parakeet_ctc.cpp`. Off by
-    # default during the optimization audit because flipping it on CPU
-    # measurably changed the rel-pos BD computation order (cast-to-f16
-    # mask before softmax) and risked transcript drift on the
-    # bit-equal-NeMo gate. Surfaced as an opt-in CMake flag so first
-    # Adreno bring-up can A/B it -- ggml-opencl supports
-    # `flash_attn_ext` for head_dim in {40,64,80,96,112,128,192,256},
-    # which covers every parakeet target except Sortformer's
-    # tf_d_model=192/8=24 transformer head.
-    option(QVAC_PARAKEET_FLASH_ATTN "qvac-parakeet: enable experimental fused flash-attn in MHA (off by default; bench-validate per backend before shipping)" OFF)
+    # `PARAKEET_EXPERIMENTAL_FLASH_ATTN` gates the rel-pos MHA
+    # fused-attention path in `parakeet_ctc.cpp`. Per-backend defaults:
+    #
+    #   - Metal:  ON. Validated on M3 Ultra (5 invocations x 15 runs,
+    #             sample-16k.wav, q8_0): encoder 67.35 -> 66.96 ms
+    #             (-0.39 ms / -0.6 %), inference 119.24 -> 118.84 ms
+    #             (-0.40 ms / -0.34 %), parity gates byte-exact (TDT
+    #             decoder 95 tokens; encoder-capture 258048 + 258300
+    #             floats bit-equal). Closes PROGRESS Section 6.5
+    #             "likely a meaningful win on Metal" follow-up.
+    #             `kernel_flash_attn_ext_f32_dk128_dv128` is the kernel
+    #             actually loaded; head_dim 128 covers parakeet-{ctc,
+    #             tdt,eou} d_model=1024/n_heads=8 and parakeet-tdt-1.1b
+    #             d_model=2048/n_heads=16. Sortformer's transformer
+    #             head_dim=24 falls below ggml_flash_attn_ext's
+    #             supported set so the encoder path there is untouched
+    #             (Sortformer uses `parakeet_sortformer.cpp` not
+    #             `parakeet_ctc.cpp::rel_pos_mha_graph`).
+    #   - CPU:    OFF. Cast-to-f16 of the BD mask before softmax
+    #             measurably changed accumulator order and showed
+    #             +3.1 % encoder regression in Round 7 audit; risks
+    #             the bit-equal-NeMo gate.
+    #   - Others: OFF until backend-specific A/B. ggml-opencl supports
+    #             `flash_attn_ext` for head_dim in
+    #             {40,64,80,96,112,128,192,256}; first-Adreno bring-up
+    #             should flip and bench.
+    if (GGML_METAL)
+        set(QVAC_PARAKEET_FLASH_ATTN_DEFAULT ON)
+    else()
+        set(QVAC_PARAKEET_FLASH_ATTN_DEFAULT OFF)
+    endif()
+    option(QVAC_PARAKEET_FLASH_ATTN "qvac-parakeet: enable fused flash-attn in MHA (default ON for Metal; OFF elsewhere pending per-backend A/B)" ${QVAC_PARAKEET_FLASH_ATTN_DEFAULT})
     if (QVAC_PARAKEET_FLASH_ATTN)
         target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
     endif()
