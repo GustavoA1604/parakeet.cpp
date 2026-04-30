@@ -65,20 +65,30 @@ void gemv_add_f32(const float * __restrict W, const float * __restrict x,
 }
 
 // Dequantise a GGUF tensor (f32, f16, q8_0, etc.) into a host float vector.
+// Backend-aware dequantise of a GGUF tensor (f32, f16, q8_0, etc.) into a
+// host float vector. Goes through ggml_backend_tensor_get so it works on
+// Vulkan / CUDA / Metal where t->data is a device handle, not a host
+// pointer. Mirrors the same fix in parakeet_eou.cpp / parakeet_sortformer.cpp
+// (origin/main 4fcea2b — "Fix Vulkan segfault in TDT/EOU/Sortformer
+// prepare_runtime"). For quantised types we fetch raw device bytes into a
+// host scratch buffer first and run to_float on the host buffer.
 void dequantize_to_f32(const ggml_tensor * t, std::vector<float> & out) {
-    if (!t) throw std::runtime_error("tdt: missing tensor for host dequant");
+    if (!t) throw std::runtime_error("tdt_prepare_runtime: missing tensor");
     const size_t n = (size_t) ggml_nelements(t);
     out.resize(n);
     if (t->type == GGML_TYPE_F32) {
-        std::memcpy(out.data(), t->data, n * sizeof(float));
+        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
         return;
     }
     const auto * tr = ggml_get_type_traits(t->type);
     if (!tr || !tr->to_float) {
-        throw std::runtime_error(std::string("tdt: no to_float for type ") +
+        throw std::runtime_error(std::string("tdt_prepare_runtime: no to_float for type ") +
                                  ggml_type_name(t->type));
     }
-    tr->to_float(t->data, out.data(), (int64_t) n);
+    const size_t nbytes = ggml_nbytes(t);
+    std::vector<uint8_t> host_raw(nbytes);
+    ggml_backend_tensor_get(t, host_raw.data(), 0, nbytes);
+    tr->to_float(host_raw.data(), out.data(), (int64_t) n);
 }
 
 // ---- Scalar host-side LSTM step (CPU fallback) ----

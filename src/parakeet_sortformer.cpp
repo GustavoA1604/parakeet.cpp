@@ -1,6 +1,7 @@
 #include "parakeet_sortformer.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -18,13 +19,16 @@ void dequant(const ggml_tensor * t, std::vector<float> & out) {
     const size_t n = (size_t) ggml_nelements(t);
     out.resize(n);
     if (t->type == GGML_TYPE_F32) {
-        std::memcpy(out.data(), t->data, n * sizeof(float));
+        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
         return;
     }
     const auto * tr = ggml_get_type_traits(t->type);
     if (!tr || !tr->to_float)
         throw std::runtime_error(std::string("sortformer_prepare_runtime: no to_float for type ") + ggml_type_name(t->type));
-    tr->to_float(t->data, out.data(), (int64_t) n);
+    const size_t nbytes = ggml_nbytes(t);
+    std::vector<uint8_t> host_raw(nbytes);
+    ggml_backend_tensor_get(t, host_raw.data(), 0, nbytes);
+    tr->to_float(host_raw.data(), out.data(), (int64_t) n);
 }
 
 inline float sigmoidf(float x) { return 1.0f / (1.0f + std::exp(-x)); }
