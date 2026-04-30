@@ -128,6 +128,14 @@ struct ParakeetCtcModel::Impl {
     }
 };
 
+ggml_backend_t ParakeetCtcModel::backend_active() const {
+    return impl ? impl->backend_active : nullptr;
+}
+
+ggml_context * ParakeetCtcModel::weights_ctx() const {
+    return impl ? impl->ctx : nullptr;
+}
+
 
 namespace {
 
@@ -488,6 +496,26 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.subsampling.out_w      = require_tensor(impl->ctx, "encoder.subsampling.out.weight");
     out_model.subsampling.out_b      = maybe_tensor(impl->ctx, "encoder.subsampling.out.bias");
 
+    // Phase 15.7: gate the converter-side pre-stacked encoder.blk.*.attn.qkv
+    // weight on backend.  The wider M=3 * n_embd mat-mul wins on backends
+    // where the un-stacked Q / K / V mat-muls under-saturate the GPU's
+    // tile grid (predicted: CUDA / Vulkan with higher per-dispatch overhead
+    // and proportionally smaller per-SM tile counts than Apple Silicon),
+    // and is measured neutral-to-slightly-bad on Apple Metal where the
+    // un-stacked path already saturates the 60-core M3 Ultra in one tile
+    // wave at M=1024 / T=252.
+    //
+    // CPU stays un-stacked unconditionally: ggml-cpu's per-kernel dispatch
+    // is essentially free, the wider mat-mul drops cache locality, and the
+    // qkv weight would otherwise just bloat the working set.
+    const bool gate_qkv_stack =
+        impl->backend_active &&
+        !ggml_backend_is_cpu(impl->backend_active)
+#ifdef GGML_USE_METAL
+        && !ggml_backend_is_metal(impl->backend_active)
+#endif
+        ;
+
     out_model.blocks.resize(out_model.encoder_cfg.n_layers);
     for (int i = 0; i < out_model.encoder_cfg.n_layers; ++i) {
         BlockWeights & b = out_model.blocks[i];
@@ -508,8 +536,8 @@ int load_from_gguf(const std::string & gguf_path,
         b.attn_k_b    = maybe_tensor(impl->ctx, p + "attn.k.bias");
         b.attn_v_w    = require_tensor(impl->ctx, p + "attn.v.weight");
         b.attn_v_b    = maybe_tensor(impl->ctx, p + "attn.v.bias");
-        b.attn_qkv_w  = maybe_tensor(impl->ctx, p + "attn.qkv.weight");
-        b.attn_qkv_b  = maybe_tensor(impl->ctx, p + "attn.qkv.bias");
+        b.attn_qkv_w  = gate_qkv_stack ? maybe_tensor(impl->ctx, p + "attn.qkv.weight") : nullptr;
+        b.attn_qkv_b  = gate_qkv_stack ? maybe_tensor(impl->ctx, p + "attn.qkv.bias")   : nullptr;
         b.attn_out_w  = require_tensor(impl->ctx, p + "attn.out.weight");
         b.attn_out_b  = maybe_tensor(impl->ctx, p + "attn.out.bias");
         b.attn_pos_w  = require_tensor(impl->ctx, p + "attn.pos.weight");
@@ -905,14 +933,46 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
                                 ggml_tensor * att_mask,
                                 const BlockWeights & W,
                                 int H, int HD, int T) {
-    ggml_tensor * q = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_q_w, xn), W.attn_q_b);
-    ggml_tensor * k = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_k_w, xn), W.attn_k_b);
-    ggml_tensor * v = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_v_w, xn), W.attn_v_b);
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    if (W.attn_qkv_w) {
+        // Pre-stacked encoder.blk.*.attn.qkv.weight from the converter:
+        // one Q8_0 mat-mul produces (3 * n_embd, T) and Q / K / V are
+        // strided ggml_view_3d slices straight into the (HD, H, T)
+        // shape the reshape branch below produces.  Parent T-stride is
+        // 3 * n_embd * f instead of n_embd * f, but the next ops
+        // (permute → cont) walk by per-element nb01 / nb02 strides so
+        // the wider stride is transparent.
+        //
+        // Whether `W.attn_qkv_w` was loaded at all is decided in the
+        // model loader (gated to non-Apple-Metal backends — see the
+        // `ggml_backend_is_metal` branch in `load_model_gguf`).  M3
+        // Ultra Metal already saturates the un-stacked path's tile
+        // grid (M=1024 / T=252 → 16 row × 8 col tiles ≈ 128 chunks vs
+        // 60 cores: one wave fills the GPU); the stacked M=3072 path
+        // adds 3× row tiles where one wave was sufficient, which is
+        // measured neutral-to-slightly-bad on Apple.  CUDA / Vulkan
+        // hardware with higher per-dispatch overhead and proportionally
+        // smaller tiles relative to SM count is the predicted-positive
+        // case; that's what the loader gate is for.
+        ggml_tensor * qkv = ggml_mul_mat(ctx, W.attn_qkv_w, xn);
+        if (W.attn_qkv_b) qkv = ggml_add(ctx, qkv, W.attn_qkv_b);
+        const int n_embd = HD * H;
+        const size_t f = sizeof(float);
+        const size_t row_stride = (size_t) 3 * n_embd * f;
+        q = ggml_view_3d(ctx, qkv, HD, H, T, HD * f, row_stride, 0 * (size_t) n_embd * f);
+        k = ggml_view_3d(ctx, qkv, HD, H, T, HD * f, row_stride, 1 * (size_t) n_embd * f);
+        v = ggml_view_3d(ctx, qkv, HD, H, T, HD * f, row_stride, 2 * (size_t) n_embd * f);
+    } else {
+        q = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_q_w, xn), W.attn_q_b);
+        k = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_k_w, xn), W.attn_k_b);
+        v = maybe_add_bias(ctx, ggml_mul_mat(ctx, W.attn_v_w, xn), W.attn_v_b);
+        q = ggml_reshape_3d(ctx, q, HD, H, T);
+        k = ggml_reshape_3d(ctx, k, HD, H, T);
+        v = ggml_reshape_3d(ctx, v, HD, H, T);
+    }
     ggml_tensor * p = ggml_mul_mat(ctx, W.attn_pos_w, pos_emb);
-
-    q = ggml_reshape_3d(ctx, q, HD, H, T);
-    k = ggml_reshape_3d(ctx, k, HD, H, T);
-    v = ggml_reshape_3d(ctx, v, HD, H, T);
     p = ggml_reshape_3d(ctx, p, HD, H, pos_emb->ne[1]);
 
     ggml_tensor * q_perm = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
@@ -939,8 +999,25 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     const float scale = 1.0f / std::sqrt((float) HD);
 
 #ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN
+    // Non-flash path computes:
+    //   attn = softmax(scale * (q*k^T + bd_final) + att_mask)
+    //        = softmax(scale * q*k^T + scale * bd_final + att_mask)
+    // ggml_flash_attn_ext computes:
+    //   attn = softmax(scale * q*k^T + mask)
+    // so the equivalent mask is `scale * bd_final + att_mask`. Mode 1
+    // (full-window) sets att_mask = nullptr so the fall-through to
+    // bd_scaled alone is byte-exact vs the non-flash path. Mode 2 / 3
+    // streaming windows pass a non-null (T_k, T_q, 1, 1) f32 chunked
+    // mask that must be folded in here, otherwise FA attends to
+    // positions outside the streaming window and produces token
+    // duplication / EOU-detection failures (test-streaming Mode 3
+    // chunk=1000 right=500 -> WER 10.5 % regression; test-eou-streaming
+    // Mode 2 -> no is_eou_boundary). Broadcast: bd_scaled is
+    // (T, T, H, 1); att_mask is (T, T, 1, 1); ggml_can_repeat(att_mask,
+    // bd_scaled) holds so the sum is (T, T, H, 1).
     ggml_tensor * bd_scaled = ggml_scale(ctx, bd_final, scale);
-    ggml_tensor * bd_mask   = ggml_cast(ctx, bd_scaled, GGML_TYPE_F16);
+    ggml_tensor * fa_mask   = att_mask ? ggml_add(ctx, bd_scaled, att_mask) : bd_scaled;
+    ggml_tensor * bd_mask   = ggml_cast(ctx, fa_mask, GGML_TYPE_F16);
     ggml_tensor * attn_out  = ggml_flash_attn_ext(ctx, q_u, k_perm, v_perm, bd_mask,
                                                   scale, 0.0f, 0.0f);
     ggml_tensor * flat      = ggml_reshape_2d(ctx, attn_out, HD * H, T);

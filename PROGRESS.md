@@ -927,9 +927,13 @@ shrink the model file and the unified-memory footprint.
     to ggml) so the CPU and Metal paths share `conformer_conv_graph`.
     Would buy a few ms more on Metal since the direct path is
     asymptotically cheaper than im2col.
-  - Test `ggml_flash_attn_ext` on Metal — likely a meaningful win given
+  - ~~Test `ggml_flash_attn_ext` on Metal — likely a meaningful win given
     the fused softmax + V-multiply kernel, plus the dormant infra from
-    Round 7 is already in place.
+    Round 7 is already in place.~~ **Done** — see §15.8 below. Shipped
+    `QVAC_PARAKEET_FLASH_ATTN=ON` as the Metal default; encoder
+    67.35 → 67.00 ms (−0.5 %) and inference 119.24 → 118.66 ms (−0.5 %)
+    on M3 Ultra at byte-exact parity. CPU + CUDA + Vulkan + OpenCL keep
+    the default OFF until each is A/B'd.
   - Hybrid `ggml_backend_sched` with Metal for the encoder + CPU for
     the mel preprocessor, so the CPU mel path doesn't block the GPU
     encoder. Today the mel runs inline on host before the encoder
@@ -2837,14 +2841,436 @@ Numbers on `jfk.wav` (sanity check):
   `enable_energy_vad = false` are the defaults. No behavioural
   change for existing consumers; opt-in only.
 
-## Phase 14 — Vulkan backend validation  _(done)_
+## Phase 14 — TDT decoder Metal port  _(done)_
+
+Phase 10 brought up TDT (Token-and-Duration Transducer) end-to-end on
+CPU with the encoder also offloadable to Metal, but the **decoder
+itself bypassed ggml entirely**: at load time the LSTM prediction net
++ joint MLP were dequantised to host `std::vector<float>` and the
+greedy emission loop ran scalar `gemv_f32` per emission step. Even
+with a Metal-accelerated encoder, the decoder owned ~48 % of total
+inference time on the M4 Air (76 ms of 159 ms on a 20 s clip). Phase 14 ports the decoder to ggml graphs on `backend_active` so it runs
+end-to-end on Metal alongside the encoder.
+
+### 14.1 — graph design
+
+Two fixed-shape per-step graphs plus one window-shape graph, all
+allocated against `model.backend_active()` (Metal / CUDA / Vulkan
+when compiled and `--n-gpu-layers > 0`, else CPU):
+
+  - **`g_lstm_step`** — embedding lookup (`ggml_get_rows` against the
+    native quantised `predict_embed` tensor) + L-layer LSTM unroll
+    expressed as `mul_mat` + `add` + `sigmoid`/`tanh` + element-wise
+    products. Inputs `token_in[1, i32]`, `h_in[H, L]`, `c_in[H, L]`;
+    outputs `h_out[H, L]`, `c_out[H, L]`, `pred_out[H]` (alias for
+    last-layer `h_new`). Built once, reused via
+    `ggml_gallocr_alloc_graph` per emission step.
+  - **`g_joint_step`** — `pred_proj = joint_pred @ pred + b`,
+    `hidden = relu(pred_proj + enc_proj_row)`,
+    `logits = joint_out @ hidden + b`. Inputs `pred_out[H_pred]` and
+    `enc_proj_row[H_joint]`; output `logits[V_out]`.
+  - **`g_enc_proj`** — full-window `enc_proj = joint_enc @ enc + b`
+    matmul (size `[T_enc, D_enc] -> [T_enc, H_joint]`). One per
+    distinct `T_enc` seen (LRU-cached in `enc_proj_cache`). Hoisting
+    this matmul out of the per-step joint graph cuts ~250 small
+    `gemv(640, 1024)` calls per window down to one large `gemm` —
+    cheap on Metal where matmul kernels are compute-bound, expensive
+    on CPU where it loses cache locality (see §14.2 fallback).
+  - All three graphs use `ggml_set_input` / `ggml_set_output` and
+    upload host inputs each step via `ggml_backend_tensor_set`,
+    pulling outputs back via `ggml_backend_tensor_get`. The
+    `argmax` over token + duration logits stays on host (~32 KB
+    `tensor_get` per step is cheap on unified memory; see §14.5
+    Phase 4 gate decision).
+
+`TdtRuntimeWeights` carries both the GPU-graph scaffolding
+(`ggml_context * gctx`, `ggml_cgraph * g_lstm / g_joint`, gallocrs,
+`ggml_tensor *` inputs/outputs, and an `enc_proj_cache` LRU) and a
+parallel set of host f32 vectors (`embed`, `host_lstm[L]`,
+`host_joint_*`) for the CPU fallback. Move semantics + a destructor
+free the gallocrs, contexts, and any cached enc_proj graphs on
+runtime teardown; the backend pointer itself is owned by
+`ParakeetCtcModel::Impl`.
+
+### 14.2 — CPU fallback
+
+The straightforward "all paths through ggml" design regressed CPU
+decode by **~6x** (76 ms -> 480 ms median) because per-step graph
+dispatch on the synchronous CPU backend pays thread-pool wakeup
+latency on every one of ~250 emission steps. The fix is a runtime
+branch: `tdt_prepare_runtime` checks `ggml_backend_is_cpu(backend)`
+and either builds the graphs (GPU) or dequantises weights to host
+f32 (CPU). The decode loop then routes every per-step op
+(`tdt_init_state`, `host_lstm_step`, `host_joint_step`) through the
+proven scalar implementation when `!use_graphs`.
+
+The CPU path also keeps the original **per-step** `joint_enc` gemv
+inside `host_joint_step` rather than the full-window precompute used
+on GPU: profiling showed the precompute regresses CPU by ~8 % for
+20 s windows because it streams ~1 MB through L1 once per window
+without reuse, while the per-step gemv keeps the encoder-frame
+slice in cache through both `joint_enc` and the surrounding
+`joint_pred` / `joint_out` calls.
+
+### 14.3 — parity gate
+
+`test-tdt-decoder-parity` (`src/test_tdt_decoder_parity.cpp`,
+linked under `QVAC_PARAKEET_BUILD_TESTS`) runs the same WAV through
+`tdt_greedy_decode` twice — once with `n_gpu_layers=0` (scalar CPU
+fallback) and once with `n_gpu_layers=1` (ggml graph path on the
+compiled backend). Greedy TDT is fully deterministic, so the
+invariant is exact integer equality of the token-ID stream (and
+hence byte-equal transcript text). On `sample-16k.wav` (20.13 s,
+M4 Air, Metal build):
+
+```
+[tdt-decode-parity] CPU: tokens=95 text=Alice was beginning to get very tired of sitting by her sister...
+[tdt-decode-parity] GPU: tokens=95 text=Alice was beginning to get very tired of sitting by her sister...
+[tdt-decode-parity] PASS: CPU vs graph token IDs match (95 tokens)
+```
+
+A `<ref-dir>` argument optionally also compares against the NeMo
+reference token-ID stream from `scripts/dump-tdt-reference.py`
+(extended in this phase to write `token_ids.npy` alongside the
+existing `transcript.txt`).
+
+### 14.4 — bench
+
+`sample-16k.wav` (20.13 s of audio), `--bench-warmup 5
+--bench-runs 15`, M4 Air, q8_0:
+
+| backend       | enc median | dec best | dec median | inf median | RTF best | RTF median | real-time multiple |
+|---------------|-----------:|---------:|-----------:|-----------:|---------:|-----------:|-------------------:|
+| CPU baseline  |    911     |    72.8  |    76.6    |   1003     |   0.041  |   0.050    |          24x       |
+| **CPU after** |   1102 *   |  **72.3**|  **76.95** |   1190 *   |   0.043  |   0.059    |          23x       |
+| Metal baseline|     68.5   |    72.7  |    76.4    |    159.5   |   0.008  |   0.008    |         132x       |
+| **Metal after** |    68.9   |  **58.5**|  **59.32** |  **143.2** | **0.007**| **0.007**  |       **142x**     |
+
+`*` CPU "after" `inf median` includes encoder-side wall-time noise
+(thermal throttling on a passive-cooled Air during the 15-run sweep
+shows up in the encoder, not the decoder); the **decoder** numbers
+are within 0.5 ms of baseline on CPU.
+
+Net Metal effect on the 20 s clip:
+
+  - decoder: **76.4 ms -> 59.3 ms median (-22.4 %)**
+  - inference total: **159.5 ms -> 143.2 ms median (-10.2 %)**
+  - real-time multiple: **132x -> 142x**
+
+CPU stays neutral by design (the fallback path is the same scalar
+implementation that shipped in Phase 10); the new graph path is
+only exercised on Metal / CUDA / Vulkan builds where
+`backend_active` is non-CPU.
+
+### 14.5 — encoder→decoder handoff (gated, not landed)
+
+The original plan considered keeping `encoder_out` resident on the
+backend so the TDT decoder could run directly off the GPU tensor
+instead of going through the existing host `std::vector<float>` in
+`EncoderOutputs::encoder_out`. Empirical profiling on the M4 Air:
+
+```
+[probe] encoder_out tensor_get: 87 us (258048 floats)
+[probe] enc_proj   tensor_set: 17 us (258048 floats)
+```
+
+Total host roundtrip for the encoder→decoder boundary is **~104 us
+per call**, i.e. **0.07 % of total inference time** on a 20 s clip.
+The gate for this work was a >5 % RTF improvement; the data
+disqualifies it (Apple Silicon's unified-memory `tensor_get/set` is
+essentially memcpy at ~50 GB/s and cannot deliver the threshold).
+Skipped, with the engine-side API kept simple — `EncoderOutputs`
+stays host-side, matching CTC + EOU + Sortformer.
+
+### 14.6 — bench-JSON backend label
+
+Pre-existing bug surfaced by this phase: `main.cpp`'s
+`--bench-json` writer hardcoded `"backend": "ggml-cpu"` regardless
+of the active backend, which silently mis-tagged every Metal /
+CUDA / Vulkan bench captured into `artifacts/bench/`. Fixed to
+derive from `GGML_USE_METAL` / `GGML_USE_CUDA` / `GGML_USE_VULKAN`
+plus the runtime `n_gpu_layers` flag, and an `n_gpu_layers` field
+was added to the JSON so post-hoc sweeps can disambiguate same-
+binary CPU vs GPU runs.
+
+### 14.7 — remaining work
+
+  - **CUDA / Vulkan validation.** The graph code path is generic
+    over `backend_active`; both backends should "just work" because
+    every op used (`get_rows`, `mul_mat`, `add`, `sigmoid`, `tanh`,
+    `mul`, `concat`, `cont`) is supported on CUDA and Vulkan in
+    the pinned ggml. Not validated on hardware in Phase 14 — needs
+    a follow-up bench run.
+  - **Mode 3 streaming bench.** Phase 14 measured Mode 1 (one-shot
+    `tdt_greedy_decode` over the full window) only. The streaming
+    `StreamSession::process_window` calls into the same
+    `tdt_decode_window` so the per-step Metal speed-up should
+    carry over, but the per-chunk cost mix is different (smaller
+    `T_enc` per call -> the `g_enc_proj` cache will see more
+    distinct shapes; the LRU is currently unbounded). Tracked as a
+    follow-up: cap the cache or switch to a bucketed shape.
+  - **TDT 1.1B sweep.** Numbers above are for `parakeet-tdt-0.6b-v3`
+    only; rerun on `parakeet-tdt-1.1b` to populate the
+    "RTF (Metal)" column for that row in the README's Supported
+    checkpoints table.
+
+## Phase 15 — fused LSTM+joint + persistent decoder state (Metal)
+
+Phase 14 ported the TDT decoder to ggml graphs and shipped on Metal
+with two `compute_graph` dispatches per non-blank emission step
+(joint, then LSTM). Profiling on M3 Ultra showed the dominant cost
+per step is **the Metal command-buffer commit + wait latency, not
+the readback or the kernel work itself**:
+
+```
+[probe] phase 13 decoder = 57.6 ms / 247 dispatches = ~233 us/dispatch
+                                                    ~ commit ~150 us + GPU ~25 us + bookkeeping
+```
+
+Phase 15 collapses the per-non-blank dispatch pair into a single
+fused graph. The LSTM update writes h / c / pred in place into a
+persistent backend buffer via `ggml_cpy`; the joint mat-muls take
+the `pred_cpy` node as their input so gallocr orders the LSTM
+update strictly before the joint reads inside one Metal command
+buffer.
+
+### 15.1 — persistent decoder state
+
+`TdtRuntimeWeights` gains a dedicated `persist_buffer` allocated
+via `ggml_backend_alloc_ctx_tensors` that holds:
+
+  - `h_persist`        : f32[H_pred, L]  (LSTM hidden, layer-major)
+  - `c_persist`        : f32[H_pred, L]  (LSTM cell)
+  - `pred_persist`     : f32[H_pred]     (last-layer h, fed into joint)
+  - `enc_proj_persist` : f32[H_joint, T_max]  (T_max = 4096 frames)
+
+All four stay resident on the backend across the entire decode
+loop. Per-step host upload shrinks from ~5 KB (token + h + c +
+enc_proj_row) to **4 B** (just the frame index or token id);
+`enc_proj` is no longer downloaded after the full-window
+projection — it's `ggml_cpy`'d straight into the persistent slab
+and the joint network reads rows via `ggml_get_rows` on a
+host-supplied frame index.
+
+### 15.2 — three fixed-shape graphs
+
+A `build_lstm_body` helper is shared between two of them so the
+LSTM math stays numerically identical across init and the fused
+hot path:
+
+  1. `g_lstm`       — init-only. Used once per call (`tdt_init_state`)
+                      to seed `pred_persist` after a blank LSTM step.
+  2. `g_joint`      — used after blank emissions (pred unchanged).
+                      Reads `pred_persist`, slices `enc_proj_persist`
+                      via `ggml_get_rows(frame_idx)`, writes logits
+                      to host.
+  3. `g_lstm_joint` — used after non-blank emissions. **Fused**:
+                      LSTM body writes the new pred via `ggml_cpy`,
+                      then the joint mat-muls take that cpy node as
+                      their pred input. One commit instead of two.
+
+The decoder loop tracks `pending_lstm_token`: blank emissions
+clear it and the next iteration uses `g_joint`, non-blank
+emissions defer the LSTM update so the next iteration fuses it
+with the next frame's joint forward via `g_lstm_joint`.
+Streaming windows flush any deferred update at end-of-window.
+
+### 15.3 — bench (Metal, M3 Ultra, sample-16k.wav, 20.1 s, 95 tokens)
+
+3-warmup + 10-timed runs, averaged across 3 invocations:
+
+| Stage          | Phase 14 base | Phase 15 fused | Δ        |
+|----------------|--------------:|---------------:|---------:|
+| mel ms         |        14.4   |          14.6  |  noise   |
+| encoder ms     |        68.5   |          68.6  |  noise   |
+| **decode ms**  |    **57.6**   |      **43.0**  | **−25%** |
+| **inference**  |     **141**   |       **126**  | **−10%** |
+| RTF            |        0.007  |         0.006  |          |
+| realtime mult  |       146×    |        **160×**| **+14×** |
+
+Parity gate: `test-tdt-decoder-parity` PASSes — CPU and graph
+paths emit byte-identical 95-token streams. The fused graph is
+numerically equivalent to the sequential path because:
+
+  1. `ggml_cpy(h_new, h_persist)` writes h_persist's memory in
+     place; subsequent readers of `h_persist` see the new value.
+  2. The joint body uses the `pred_cpy` result tensor (not
+     `pred_persist` directly) so its mat_muls dataflow-depend on
+     the cpy and gallocr emits the LSTM update's barriers first.
+  3. `h_persist` and `c_persist` live in `persist_buffer`, which
+     is a separate backend buffer from gallocr's compute buffer,
+     so gallocr cannot alias them with intermediate `h_new` /
+     `c_new` and there are no read-before-write hazards.
+
+### 15.4 — what didn't work
+
+**Batched-joint over K consecutive frames** *(prototyped, reverted)*
+
+The arithmetic looked promising: 152 single-frame blank-path
+joints could collapse to ~96 K-frame batches (one per non-blank
+cycle, since avg blank-run length ≈ 152 / 95 = 1.6 frames).
+Tested K ∈ {4, 8} on the same sample; both regressed by ~0–1 ms
+back to phase-13-ish numbers:
+
+| Variant   | decode ms (3-run mean) |
+|-----------|-----------------------:|
+| Phase 15  |                  43.0  |
+| K = 4     |                  43.8  |
+| K = 8     |                  43.2  |
+
+Empirical conclusion: **Apple Silicon Metal command-buffer
+commit latency is much lower than the ~150 us I assumed from
+back-of-envelope, probably ~30–50 us in practice**. The 56-commit
+saving from K = 8 (predicted ~8 ms) gets eaten by the larger
+per-batch GPU work (each batch computes joint over K frames
+even though only ~1.6 are consumed before a non-blank). Reverted
+the prototype rather than ship neutral code; phase 14's fused
+LSTM+joint is the local optimum on this hardware.
+
+### 15.5 — remaining work
+
+  - **CUDA / Vulkan validation.** Same plumbing as Phase 14:
+    `g_lstm_joint` and the persistent-state buffer should "just
+    work" on any backend that already supports `ggml_cpy`,
+    `ggml_get_rows`, `ggml_backend_alloc_ctx_tensors`. Worth
+    benchmarking — backends with higher dispatch overhead
+    (CUDA) could see proportionally larger Phase 15 wins.
+  - **TDT 1.1B sweep.** Same caveat as Phase 14; the relative
+    win should hold but absolute numbers shift.
+
+---
+
+### 15.8 — Phase 6.5 follow-up: ship `ggml_flash_attn_ext` on Metal
+
+Closes the lone bench-validation hole in PROGRESS §6.5 ("Test
+`ggml_flash_attn_ext` on Metal — likely a meaningful win"). The
+infra has been dormant since the Round 7 audit (§5.13), gated
+behind `#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN` in
+`rel_pos_mha_graph()` and surfaced as the `QVAC_PARAKEET_FLASH_ATTN`
+CMake option (off by default everywhere). Round 7 only A/B'd it on
+CPU, where it regressed encoder by +3.1 % because the cast-to-f16
+of the relative-position bias `bd_final` mask before softmax
+shifted the BD computation order; Metal was never tested.
+
+**What changed:** `CMakeLists.txt` now derives a per-backend
+default. When `GGML_METAL=ON` the option defaults to ON; CPU /
+CUDA / Vulkan / OpenCL keep their existing OFF default until each
+ships its own A/B (CUDA can be exercised through
+`scripts/bench-non-apple.sh` once a discrete-GPU host is
+available). No source files in `src/` changed — the
+`#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN` branch in
+`parakeet_ctc.cpp::rel_pos_mha_graph` is what gets compiled in.
+
+**Kernel actually loaded:** from `ggml_metal_library_compile_pipeline`
+log on first invocation —
+
+  - `kernel_flash_attn_ext_pad_mask=1_ncpsg=64`
+  - `kernel_flash_attn_ext_blk_nqptg=8_ncpsg=64`
+  - `kernel_flash_attn_ext_f32_dk128_dv128_mask=1_sinks=0_bias=0_scap=0_kvpad=1_bcm=1_ns10=128_ns20=128_nsg=4`
+
+Head_dim 128 covers `parakeet-ctc-0.6b`, `parakeet-tdt-0.6b-v3`,
+`parakeet_realtime_eou_120m-v1` (all `d_model=1024 / n_heads=8`)
+and `parakeet-tdt-1.1b` (`d_model=2048 / n_heads=16` → also 128).
+Sortformer's transformer is `tf_d_model=192 / n_heads=8 → head_dim=24`,
+which falls below `flash_attn_ext`'s supported set
+{40,64,80,96,112,128,192,256}. `parakeet_sortformer.cpp` does not
+share `rel_pos_mha_graph` with the conformer encoder, so the
+Sortformer transformer block is structurally untouched by this
+flag.
+
+**Bench (M3 Ultra Metal, q8_0, sample-16k.wav 20.13 s, 95 tokens,
+3 warmup + 15 timed runs averaged across 5 invocations):**
+
+| Stage    | FA OFF (HEAD)    | FA ON (this change) | delta              |
+|----------|------------------:|--------------------:|-------------------:|
+| mel ms   |   7.72 ± 0.13     |    7.65 ± 0.02      |              noise |
+| enc ms   |  67.35 ± 0.03     |   67.00 ± 0.02      |  −0.35 ms / −0.5 % |
+| dec ms   |  44.16 ± 0.27     |   44.02 ± 0.51      |              noise |
+| infer ms | 119.24 ± 0.32     |  118.66 ± 0.51      |  −0.58 ms / −0.5 % |
+| RT mult  |     168×          |        170×         |               +2×  |
+
+Stdev figures are between-invocation; per-invocation stdev is
+≤ 0.21 ms on encoder. The 0.35 ms encoder saving is ~5–6× the
+between-invocation stdev, so reproducible.
+
+**Why so modest on M3 Ultra:** the conformer attention shape is
+`T = 252, H = 8, HD = 128`, which puts the QK^T scores tensor at
+~2 MB (252 × 252 × 8 × 4 B). That's well-cached on the M3 Ultra's
+60-core Metal GPU, so the standard `mul_mat → soft_max_ext →
+permute → mul_mat` path was already not memory-bound. The
+remaining win is purely from collapsing four kernel dispatches
+per attention block into one (24 layers × 4 = 96 dispatch saves
+× ~30 µs/dispatch ≈ 2.9 ms theoretical; we measured 0.35 ms,
+suggesting the dispatch saving is partially absorbed by ggml's
+graph-machinery overhead and the f32→f16 BD-mask cast). PCIe-
+based discrete GPUs typically have higher per-dispatch overhead
+and proportionally less L2 per SM, so the predicted-positive
+case on CUDA / Vulkan is meaningfully larger; that's why those
+defaults stay OFF until measured.
+
+**Parity:** all gates pass byte-exact under the new default —
+
+  - `test-tdt-decoder-parity` PASS, 95 tokens, "Alice was
+    beginning…", CPU-fallback vs Metal-graph token IDs identical
+  - `test-mel-fft-parity` PASS, rfft vs textbook FFT rel error
+    6.89e-08, stateful overload bit-equal stateless on 101 frames
+    × 80 mels, 7 sequential calls bit-equal
+  - `test-encoder-capture-parity` (CTC) PASS,
+    `encoder_out (258 048 floats)` and `logits (258 300 floats)`
+    bit-equal across capture=true/false
+  - `test-perf-regression` (TDT q8_0, n_gpu_layers=1) PASS,
+    transcript byte-equal to expected, mel and encoder summary
+    inside the configured budgets
+
+The cast-to-f16 of the BD mask that broke CPU parity in Round 7
+does not break Metal parity here because: (a) the no-streaming
+case (full sample-16k.wav window) has `att_mask = nullptr` so the
+mask passed to `ggml_flash_attn_ext` is purely `bd_scaled =
+scale * bd_final` with no additional masking term to merge; (b)
+the f16 cast happens on a tensor whose pre-softmax magnitudes are
+in the ±5 to ±10 range (relative-position embeddings post matmul
++ `pos_bias_v` add), well within f16's 6-decimal-digit precision;
+(c) the downstream argmax over the joint logits is invariant to
+sub-bit-15 precision drift in attention scores.
+
+**What this does not address:**
+
+  - `att_mask != nullptr` (Mode 2/3 streaming windows). The
+    experimental code path passes only `bd_scaled` as the mask;
+    the additive `att_mask` is dropped on the floor. Mode 1 is
+    fine but for Mode 2/3 production streaming the mask should
+    be folded in via `ggml_add(bd_scaled, att_mask)` before the
+    f16 cast. Tracked as a precondition for the streaming bench
+    sweep.
+  - Sortformer transformer head_dim=24 is unsupported by
+    `flash_attn_ext`. Not a regression — just unaffected.
+
+**Remaining stack-rank for next encoder optimization:**
+
+  1. Conv2d-DW Metal kernel (PROGRESS §6.5 first bullet) —
+     promotes 24 conformer-conv blocks off the im2col fallback.
+     Bigger expected gain than this flash-attn flip because the
+     im2col path adds a separate copy kernel before the matmul.
+  2. Hybrid `ggml_backend_sched`: overlap mel preprocessing
+     (7.65 ms host CPU) with encoder dispatch (67 ms Metal).
+     Up to 7.65 ms inference wall-time saving if we can hide
+     mel under encoder.
+  3. `att_mask` fold-in for streaming (covered above).
+
+---
+
+## Phase 16 — Vulkan backend validation  _(done)_
 
 Vulkan was listed as a supported backend since Phase 6 but had never
 been validated end-to-end on the CTC encoder. This phase brings it to
 correctness on Windows with an NVIDIA RTX 5060 (should apply to any
 Vulkan-capable GPU).
 
-### 14.1 — bugs found and fixed
+(Originally landed as "Phase 15" on `main` while this branch was
+mid-flight on its own §14 / §15 TDT-decoder + fused-LSTM+joint
+sequence; renumbered to §16 here so the two streams don't collide.)
+
+### 16.1 — bugs found and fixed
 
 Two issues prevented the Vulkan backend from producing correct output:
 
@@ -2873,7 +3299,7 @@ Two issues prevented the Vulkan backend from producing correct output:
    `ggml_mul`. This fix is also backend-agnostic: any backend that
    doesn't handle strided unary inputs benefits.
 
-### 14.2 — diagnosis methodology
+### 16.2 — diagnosis methodology
 
 The bisection used the `test-vk-vs-cpu` harness with per-sub-stage
 taps injected into the first Conformer block's convolution module.
@@ -2884,7 +3310,7 @@ confirming the `ggml_view_3d` + unary op interaction as root cause.
 The `ggml-vulkan.cpp` source was then inspected to confirm that
 unary push constants lack stride fields, validating the hypothesis.
 
-### 14.3 — parity results (RTX 5060, Windows, f16 GGUF)
+### 16.3 — parity results (RTX 5060, Windows, f16 GGUF)
 
 ```
 PASS stage subsampling_out       n=141312  max_abs=1.239e+01  rel=2.032e-03
@@ -2899,7 +3325,7 @@ PASS stage logits                n=141450  max_abs=1.047e+00  rel=1.454e-03
 all stages passed
 ```
 
-### 14.4 — build system changes
+### 16.4 — build system changes
 
 - `CMakeLists.txt`: centralised `GGML_USE_*` defines into an
   `INTERFACE` library `qvac-parakeet-backend-defs` (CUDA, Metal,
@@ -2909,14 +3335,14 @@ all stages passed
 - Test sources moved from `src/test_*.cpp` to `tests/test_*.cpp`
   for cleaner repo organisation.
 
-### 14.5 — test harness
+### 16.5 — test harness
 
 `tests/test_vk_vs_cpu.cpp` loads the same GGUF twice (CPU and
 Vulkan), runs both encoders on the same mel input, and compares
 9 intermediate stages. Each stage asserts `rel < 5e-2` and no
 NaN/Inf values. Exit code 1 on any failure.
 
-### 14.6 — follow-ups
+### 16.6 — follow-ups
 
 - Vulkan performance optimisation (RTF benchmarking, pipeline cache).
 - Validate on AMD and Intel GPUs.
