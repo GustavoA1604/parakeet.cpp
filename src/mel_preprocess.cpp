@@ -1,4 +1,5 @@
 #include "mel_preprocess.h"
+#include "parakeet_log.h"
 
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
@@ -18,7 +19,7 @@ int load_wav_mono_f32(const std::string & wav_path,
                       int                  & out_sample_rate) {
     drwav wav;
     if (!drwav_init_file(&wav, wav_path.c_str(), nullptr)) {
-        std::fprintf(stderr, "error: could not open wav file %s\n", wav_path.c_str());
+        PARAKEET_LOG_ERROR("error: could not open wav file %s\n", wav_path.c_str());
         return 1;
     }
 
@@ -31,7 +32,7 @@ int load_wav_mono_f32(const std::string & wav_path,
     drwav_uninit(&wav);
 
     if (read != total) {
-        std::fprintf(stderr, "error: short read from %s\n", wav_path.c_str());
+        PARAKEET_LOG_ERROR("error: short read from %s\n", wav_path.c_str());
         return 2;
     }
 
@@ -250,13 +251,13 @@ int compute_log_mel_impl(const float        * samples,
                          int                & out_n_frames) {
     if (n_samples <= 0) return 1;
     if (cfg.filterbank.size() != static_cast<size_t>(cfg.n_mels * (cfg.n_fft / 2 + 1))) {
-        std::fprintf(stderr, "mel: unexpected filterbank size (%zu != %d)\n",
-                     cfg.filterbank.size(), cfg.n_mels * (cfg.n_fft / 2 + 1));
+        PARAKEET_LOG_ERROR("mel: unexpected filterbank size (%zu != %d)\n",
+                           cfg.filterbank.size(), cfg.n_mels * (cfg.n_fft / 2 + 1));
         return 2;
     }
     if (static_cast<int>(cfg.window.size()) != cfg.win_length) {
-        std::fprintf(stderr, "mel: unexpected window size (%zu != %d)\n",
-                     cfg.window.size(), cfg.win_length);
+        PARAKEET_LOG_ERROR("mel: unexpected window size (%zu != %d)\n",
+                           cfg.window.size(), cfg.win_length);
         return 3;
     }
 

@@ -12,7 +12,7 @@ else()
     set(QVAC_PARAKEET_STANDALONE_DEFAULT OFF)
 endif()
 
-option(QVAC_PARAKEET_BUILD_LIBRARY     "qvac-parakeet: build the static qvac-parakeet library"                 ON)
+option(QVAC_PARAKEET_BUILD_LIBRARY     "qvac-parakeet: build the qvac-parakeet library (linkage follows BUILD_SHARED_LIBS; defaults to STATIC when unset)" ON)
 option(QVAC_PARAKEET_BUILD_EXECUTABLES "qvac-parakeet: build the qvac-parakeet CLI"                            ${QVAC_PARAKEET_STANDALONE_DEFAULT})
 option(QVAC_PARAKEET_BUILD_TESTS       "qvac-parakeet: build per-stage numerical validation harnesses"         ${QVAC_PARAKEET_STANDALONE_DEFAULT})
 option(QVAC_PARAKEET_BUILD_EXAMPLES    "qvac-parakeet: build standalone examples (live-mic, ...)"              ${QVAC_PARAKEET_STANDALONE_DEFAULT})
@@ -133,16 +133,31 @@ endif()
 set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
     src/parakeet_engine.cpp
+    src/parakeet_pipeline.cpp
     src/parakeet_tdt.cpp
     src/parakeet_eou.cpp
     src/parakeet_sortformer.cpp
+    src/parakeet_log.cpp
     src/mel_preprocess.cpp
     src/sentencepiece_bpe.cpp
     src/energy_vad.cpp
+    # Lives in the library so `qvac_parakeet_cli_main` (declared in
+    # the umbrella header `qvac-parakeet.h`) is actually a library
+    # symbol that addon hosts can link against. The CLI executable
+    # below is a thin shim that just calls into it.
+    src/main.cpp
 )
 
 if (QVAC_PARAKEET_BUILD_LIBRARY)
-    add_library(qvac-parakeet STATIC ${QVAC_PARAKEET_LIB_SOURCES})
+    # Honour BUILD_SHARED_LIBS when set explicitly; otherwise default to
+    # STATIC. Matches the contract qvac-fabric-llm.cpp's `llama` target
+    # uses (BUILD_SHARED_LIBS-driven) so consumers building a shared
+    # qvac-parakeet alongside a shared llama see the same shape.
+    if (DEFINED BUILD_SHARED_LIBS)
+        add_library(qvac-parakeet ${QVAC_PARAKEET_LIB_SOURCES})
+    else()
+        add_library(qvac-parakeet STATIC ${QVAC_PARAKEET_LIB_SOURCES})
+    endif()
     add_library(qvac-parakeet::qvac-parakeet ALIAS qvac-parakeet)
     qvac_parakeet_apply_ccache(qvac-parakeet)
 
@@ -162,10 +177,6 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
 
     target_link_libraries(qvac-parakeet PRIVATE qvac-parakeet-backend-defs)
 
-    if (GGML_OPENCL)
-        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_OPENCL)
-    endif()
-
     option(QVAC_PARAKEET_FLASH_ATTN "qvac-parakeet: enable experimental fused flash-attn in MHA (off by default; bench-validate per backend before shipping)" OFF)
     if (QVAC_PARAKEET_FLASH_ATTN)
         target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
@@ -174,7 +185,21 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
     set_target_properties(qvac-parakeet PROPERTIES
         POSITION_INDEPENDENT_CODE ON
         EXPORT_NAME qvac-parakeet
+        CXX_VISIBILITY_PRESET    hidden
+        VISIBILITY_INLINES_HIDDEN ON
     )
+
+    # Symbol-export contract for shared builds. Mirrors the
+    # LLAMA_SHARED / LLAMA_BUILD pair from qvac-fabric-llm.cpp:
+    # PUBLIC define so consumers see the import side of QVAC_PARAKEET_API,
+    # PRIVATE define inside the library's TUs to flip Windows from
+    # `dllimport` to `dllexport`. Both no-ops in static builds (the
+    # default), so static consumers see exactly the same surface as before.
+    get_target_property(_qvac_parakeet_type qvac-parakeet TYPE)
+    if (_qvac_parakeet_type STREQUAL "SHARED_LIBRARY")
+        target_compile_definitions(qvac-parakeet PUBLIC  QVAC_PARAKEET_SHARED)
+        target_compile_definitions(qvac-parakeet PRIVATE QVAC_PARAKEET_BUILD)
+    endif()
 
     if (CMAKE_BUILD_TYPE STREQUAL "Release" OR NOT CMAKE_BUILD_TYPE)
         target_compile_options(qvac-parakeet PRIVATE
@@ -193,14 +218,62 @@ if (QVAC_PARAKEET_BUILD_EXECUTABLES)
         message(FATAL_ERROR "QVAC_PARAKEET_BUILD_EXECUTABLES requires QVAC_PARAKEET_BUILD_LIBRARY=ON")
     endif()
 
-    add_executable(qvac-parakeet-cli src/cli_main.cpp src/main.cpp)
+    add_executable(qvac-parakeet-cli src/cli_main.cpp)
     target_link_libraries(qvac-parakeet-cli PRIVATE qvac-parakeet)
-    target_include_directories(qvac-parakeet-cli PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     set_target_properties(qvac-parakeet-cli PROPERTIES OUTPUT_NAME qvac-parakeet)
     qvac_parakeet_apply_ccache(qvac-parakeet-cli)
 endif()
 
 if (QVAC_PARAKEET_BUILD_TESTS)
+    enable_testing()
+    include(CTest)
+
+    # Roots that the test registrations below resolve fixture paths against.
+    # All three are CACHE PATHs so CI / package builds can point them at
+    # pre-staged mirrors (e.g. a tarball of `.gguf`s + reference `.npy`s)
+    # without editing the listfile.
+    #
+    #   MODEL_DIR  - GGUF checkpoints (produced by scripts/convert-nemo-to-gguf.py)
+    #   AUDIO_DIR  - 16 kHz mono WAV fixtures committed to test/samples/
+    #   REF_DIR    - NeMo reference dumps (`.npy`) produced by
+    #                scripts/dump-{ctc,tdt,eou,sortformer}-reference.py;
+    #                expected layout is REF_DIR/{ctc,tdt,eou,sortformer}-ref/.
+    #                Tests that need .npy refs auto-disable when the file
+    #                isn't present, so a fresh checkout still gives a green
+    #                ctest run on the model+wav harnesses.
+    set(QVAC_PARAKEET_TEST_MODEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/models"        CACHE PATH "qvac-parakeet: directory containing .gguf fixtures used by the test suite")
+    set(QVAC_PARAKEET_TEST_AUDIO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/test/samples"  CACHE PATH "qvac-parakeet: directory containing .wav fixtures used by the test suite")
+    set(QVAC_PARAKEET_TEST_REF_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/artifacts"     CACHE PATH "qvac-parakeet: directory containing NeMo .npy reference dumps (scripts/dump-*-reference.py)")
+
+    # Helper: register a built test target with CTest. Mirrors the
+    # `llama_test()` shape used by qvac-fabric-llm.cpp so `ctest` against
+    # the build dir surfaces every harness, with labels that allow filtering
+    # (e.g. `ctest -L cpu` to skip GPU-only tests on CI fleets without
+    # the matching backend). The optional REQUIRES list names paths that
+    # must exist at configure time; if any is missing the test is still
+    # registered (so it shows up in `ctest -N`) but marked DISABLED so a
+    # missing reference dump shows as "Not Run" rather than a failure.
+    function(qvac_parakeet_register_test target)
+        cmake_parse_arguments(QPRT "" "LABEL" "ARGS;REQUIRES" ${ARGN})
+        if (NOT DEFINED QPRT_LABEL)
+            set(QPRT_LABEL "cpu")
+        endif()
+        add_test(NAME ${target}
+                 COMMAND $<TARGET_FILE:${target}> ${QPRT_ARGS})
+        set_property(TEST ${target} PROPERTY LABELS ${QPRT_LABEL})
+        set(_qprt_missing "")
+        foreach (_qprt_req IN LISTS QPRT_REQUIRES)
+            if (NOT EXISTS "${_qprt_req}")
+                list(APPEND _qprt_missing "${_qprt_req}")
+            endif()
+        endforeach()
+        if (_qprt_missing)
+            set_property(TEST ${target} PROPERTY DISABLED TRUE)
+            list(JOIN _qprt_missing "\n        " _qprt_missing_pretty)
+            message(STATUS "qvac-parakeet: test ${target} disabled (missing fixture(s):\n        ${_qprt_missing_pretty})")
+        endif()
+    endfunction()
+
     # Helper: keep the parakeet_ctc.cpp #ifdefs (BLAS / CUDA / Metal / Vulkan /
     # OpenCL backend init) consistent across the qvac-parakeet library and any
     # test executable that compiles parakeet_ctc.cpp from source. Without this,
@@ -229,61 +302,119 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         qvac_parakeet_apply_ccache(${target})
     endfunction()
 
+    # Stable shorthands for the fixtures referenced by the registrations
+    # below. Resolved at configure time; missing files turn into DISABLED
+    # tests via qvac_parakeet_register_test(REQUIRES ...).
+    #
+    # q8_0 GGUFs are the runtime fixtures (smoke, streaming, perf): smaller
+    # download, exercises the same code paths as production. f16 GGUFs are
+    # the *parity* fixtures: their per-stage NeMo `.npy` references were
+    # dumped from FP32 PyTorch, and even q8_0's well-behaved 0.5-1 % drift
+    # swamps the per-block tolerance gates (3e-3 ... 5e-3) the parity
+    # harnesses use to catch real operator bugs. So we point the parity
+    # tests at the f16 GGUFs and leave q8_0 in place for everything else.
+    set(_qvp_ctc_q8_gguf   "${QVAC_PARAKEET_TEST_MODEL_DIR}/parakeet-ctc-0.6b.q8_0.gguf")
+    set(_qvp_ctc_f16_gguf  "${QVAC_PARAKEET_TEST_MODEL_DIR}/parakeet-ctc-0.6b.f16.gguf")
+    set(_qvp_tdt_q8_gguf   "${QVAC_PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.q8_0.gguf")
+    set(_qvp_tdt_f16_gguf  "${QVAC_PARAKEET_TEST_MODEL_DIR}/parakeet-tdt-0.6b-v3.f16.gguf")
+    set(_qvp_eou_q8_gguf   "${QVAC_PARAKEET_TEST_MODEL_DIR}/parakeet_realtime_eou_120m-v1.q8_0.gguf")
+    set(_qvp_sf_q8_gguf    "${QVAC_PARAKEET_TEST_MODEL_DIR}/diar_sortformer_4spk-v1.q8_0.gguf")
+    set(_qvp_sf_f16_gguf   "${QVAC_PARAKEET_TEST_MODEL_DIR}/diar_sortformer_4spk-v1.f16.gguf")
+    set(_qvp_sfs_q8_gguf   "${QVAC_PARAKEET_TEST_MODEL_DIR}/diar_streaming_sortformer_4spk-v2.q8_0.gguf")
+    set(_qvp_jfk_wav       "${QVAC_PARAKEET_TEST_AUDIO_DIR}/jfk.wav")
+    set(_qvp_diar_wav      "${QVAC_PARAKEET_TEST_AUDIO_DIR}/diarization-sample-16k.wav")
+    set(_qvp_ctc_ref       "${QVAC_PARAKEET_TEST_REF_DIR}/ctc-ref")
+    set(_qvp_tdt_ref       "${QVAC_PARAKEET_TEST_REF_DIR}/tdt-ref")
+    set(_qvp_sf_ref        "${QVAC_PARAKEET_TEST_REF_DIR}/sortformer-ref")
+
     add_executable(test-mel
         tests/test_mel.cpp
         src/mel_preprocess.cpp
         src/parakeet_ctc.cpp
+        src/parakeet_log.cpp
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-mel PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-mel PRIVATE ggml/include src include)
     qvac_parakeet_apply_backend_defs(test-mel)
+    qvac_parakeet_register_test(test-mel
+        LABEL    "fixture"
+        ARGS     "${_qvp_ctc_f16_gguf}" "${_qvp_jfk_wav}" "${_qvp_ctc_ref}/mel.npy"
+        REQUIRES "${_qvp_ctc_f16_gguf}" "${_qvp_jfk_wav}" "${_qvp_ctc_ref}/mel.npy")
 
     add_executable(test-encoder
         tests/test_encoder.cpp
         src/parakeet_ctc.cpp
+        src/parakeet_log.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-encoder PRIVATE ggml qvac-parakeet-backend-defs)
-    target_include_directories(test-encoder PRIVATE ggml/include src)
+    target_include_directories(test-encoder PRIVATE ggml/include src include)
     qvac_parakeet_apply_backend_defs(test-encoder)
+    qvac_parakeet_register_test(test-encoder
+        LABEL    "fixture"
+        ARGS     "${_qvp_ctc_f16_gguf}" "${_qvp_ctc_ref}"
+        REQUIRES "${_qvp_ctc_f16_gguf}" "${_qvp_ctc_ref}/mel.npy" "${_qvp_ctc_ref}/encoder_out.npy")
 
     add_executable(test-ctc
         tests/test_ctc.cpp
         src/parakeet_ctc.cpp
+        src/parakeet_log.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-ctc PRIVATE ggml qvac-parakeet-backend-defs)
-    target_include_directories(test-ctc PRIVATE ggml/include src)
+    target_include_directories(test-ctc PRIVATE ggml/include src include)
     qvac_parakeet_apply_backend_defs(test-ctc)
+    qvac_parakeet_register_test(test-ctc
+        LABEL    "fixture"
+        ARGS     "${_qvp_ctc_q8_gguf}" "${_qvp_ctc_ref}/logits.npy" "${_qvp_ctc_ref}/decoded.txt"
+        REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_ctc_ref}/logits.npy" "${_qvp_ctc_ref}/decoded.txt")
 
     add_executable(test-streaming tests/test_streaming.cpp)
     target_link_libraries(test-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-streaming PRIVATE include src ggml/include)
     qvac_parakeet_apply_ccache(test-streaming)
+    qvac_parakeet_register_test(test-streaming
+        LABEL    "fixture"
+        ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
 
     add_executable(test-eou-streaming tests/test_eou_streaming.cpp)
     target_link_libraries(test-eou-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-eou-streaming PRIVATE include src ggml/include)
     qvac_parakeet_apply_ccache(test-eou-streaming)
+    qvac_parakeet_register_test(test-eou-streaming
+        LABEL    "fixture"
+        ARGS     "--model" "${_qvp_eou_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_eou_q8_gguf}" "${_qvp_jfk_wav}")
 
     add_executable(test-sortformer-streaming tests/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
     qvac_parakeet_apply_ccache(test-sortformer-streaming)
+    qvac_parakeet_register_test(test-sortformer-streaming
+        LABEL    "fixture"
+        ARGS     "--model" "${_qvp_sfs_q8_gguf}" "--wav" "${_qvp_diar_wav}"
+        REQUIRES "${_qvp_sfs_q8_gguf}" "${_qvp_diar_wav}")
 
     add_executable(test-perf-regression src/test_perf_regression.cpp)
     target_link_libraries(test-perf-regression PRIVATE qvac-parakeet)
     target_include_directories(test-perf-regression PRIVATE include src ggml/include)
     qvac_parakeet_apply_ccache(test-perf-regression)
+    qvac_parakeet_register_test(test-perf-regression
+        LABEL    "perf"
+        ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
 
     # Internal regression gate for the round-2 mel preprocess sweep
     # (real-FFT, MelState reuse). Pure unit test -- no GGUF needed.
     add_executable(test-mel-fft-parity
         src/test_mel_fft_parity.cpp
-        src/mel_preprocess.cpp)
+        src/mel_preprocess.cpp
+        src/parakeet_log.cpp)
     target_link_libraries(test-mel-fft-parity PRIVATE ggml)
     target_include_directories(test-mel-fft-parity PRIVATE ggml/include src include)
     qvac_parakeet_apply_backend_defs(test-mel-fft-parity)
+    qvac_parakeet_register_test(test-mel-fft-parity LABEL "unit")
 
     # Regression gate for the round-1 capture_intermediates flag.
     # Asserts run_encoder(capture=true) and (capture=false) produce
@@ -291,16 +422,23 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     add_executable(test-encoder-capture-parity
         src/test_encoder_capture_parity.cpp
         src/parakeet_ctc.cpp
+        src/parakeet_log.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
     target_link_libraries(test-encoder-capture-parity PRIVATE ggml)
     target_include_directories(test-encoder-capture-parity PRIVATE ggml/include src include)
     qvac_parakeet_apply_backend_defs(test-encoder-capture-parity)
+    qvac_parakeet_register_test(test-encoder-capture-parity
+        LABEL    "fixture"
+        ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
 
     add_executable(test-tdt-encoder-parity
         tests/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_pipeline.cpp
+        src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
@@ -310,11 +448,17 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     target_link_libraries(test-tdt-encoder-parity PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-tdt-encoder-parity PRIVATE include src ggml/include)
     qvac_parakeet_apply_backend_defs(test-tdt-encoder-parity)
+    qvac_parakeet_register_test(test-tdt-encoder-parity
+        LABEL    "fixture"
+        ARGS     "${_qvp_tdt_f16_gguf}" "${_qvp_jfk_wav}" "${_qvp_tdt_ref}"
+        REQUIRES "${_qvp_tdt_f16_gguf}" "${_qvp_jfk_wav}" "${_qvp_tdt_ref}/encoder_out.npy")
 
     add_executable(test-sortformer-parity
         tests/test_sortformer_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
+        src/parakeet_pipeline.cpp
+        src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
         src/parakeet_sortformer.cpp
@@ -324,16 +468,25 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     target_link_libraries(test-sortformer-parity PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-sortformer-parity PRIVATE include src ggml/include)
     qvac_parakeet_apply_backend_defs(test-sortformer-parity)
+    qvac_parakeet_register_test(test-sortformer-parity
+        LABEL    "fixture"
+        ARGS     "${_qvp_sf_f16_gguf}" "${_qvp_diar_wav}" "${_qvp_sf_ref}"
+        REQUIRES "${_qvp_sf_f16_gguf}" "${_qvp_diar_wav}" "${_qvp_sf_ref}/encoder_out.npy")
 
     if (GGML_VULKAN)
         add_executable(test-vk-vs-cpu
             tests/test_vk_vs_cpu.cpp
             src/parakeet_ctc.cpp
+            src/parakeet_log.cpp
             src/mel_preprocess.cpp
             src/sentencepiece_bpe.cpp)
         target_link_libraries(test-vk-vs-cpu PRIVATE ggml qvac-parakeet-backend-defs)
-        target_include_directories(test-vk-vs-cpu PRIVATE ggml/include src)
+        target_include_directories(test-vk-vs-cpu PRIVATE ggml/include src include)
         qvac_parakeet_apply_backend_defs(test-vk-vs-cpu)
+        qvac_parakeet_register_test(test-vk-vs-cpu
+            LABEL    "gpu"
+            ARGS     "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}"
+            REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
     endif()
 endif()
 

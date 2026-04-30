@@ -3,6 +3,7 @@
 #include "qvac-parakeet/ctc/engine.h"
 
 #include "parakeet_ctc.h"
+#include "parakeet_log.h"
 #include "parakeet_tdt.h"
 #include "parakeet_eou.h"
 #include "mel_preprocess.h"
@@ -27,7 +28,7 @@ static int parakeet_setenv(const char * name, const char * value, int /*overwrit
 namespace {
 
 void print_usage(const char * argv0) {
-    std::fprintf(stderr,
+    PARAKEET_LOG_INFO(
         "usage: %s --model <gguf> (--wav <input.wav> | --pcm-in <input.raw>) [options]\n"
         "\n"
         "Single CLI for all four engine families. The GGUF is auto-detected:\n"
@@ -134,8 +135,11 @@ void print_usage(const char * argv0) {
         "  --profile-runs N     timed runs per configuration in --profile (default 5)\n"
         "  --profile-warmup N   warmup runs per configuration (default 2)\n"
         "\n"
-        "  --dump-mel PATH      write the C++ log-mel tensor as raw float32 (80, T_mel)\n"
-        "                       to PATH; handy for offline diffing against mel.npy.\n"
+        "  --dump-mel PATH      write the C++ log-mel tensor as raw float32\n"
+        "                       (n_mels, T_mel) to PATH; handy for offline diffing\n"
+        "                       against mel.npy. n_mels is read from the loaded\n"
+        "                       GGUF (80 for CTC; 128 for TDT/EOU/Sortformer); the\n"
+        "                       actual shape is logged at dump time.\n"
         "  --version            print version and exit\n"
         "  --help               this help text\n",
         argv0);
@@ -146,25 +150,25 @@ int load_raw_pcm(const std::string & path,
                  std::vector<float> & out_samples) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
-        std::fprintf(stderr, "error: could not open raw PCM file %s\n", path.c_str());
+        PARAKEET_LOG_ERROR("error: could not open raw PCM file %s\n", path.c_str());
         return 1;
     }
     const std::streamsize size = f.tellg();
     f.seekg(0, std::ios::beg);
     if (size <= 0) {
-        std::fprintf(stderr, "error: raw PCM file %s is empty\n", path.c_str());
+        PARAKEET_LOG_ERROR("error: raw PCM file %s is empty\n", path.c_str());
         return 2;
     }
     if (format == "s16le") {
         if (size % 2 != 0) {
-            std::fprintf(stderr, "error: s16le PCM size %lld not multiple of 2\n",
+            PARAKEET_LOG_ERROR("error: s16le PCM size %lld not multiple of 2\n",
                          (long long) size);
             return 3;
         }
         const size_t n = static_cast<size_t>(size) / 2;
         std::vector<int16_t> buf(n);
         if (!f.read(reinterpret_cast<char *>(buf.data()), size)) {
-            std::fprintf(stderr, "error: short read from %s\n", path.c_str());
+            PARAKEET_LOG_ERROR("error: short read from %s\n", path.c_str());
             return 4;
         }
         out_samples.resize(n);
@@ -174,19 +178,19 @@ int load_raw_pcm(const std::string & path,
     }
     if (format == "f32le") {
         if (size % 4 != 0) {
-            std::fprintf(stderr, "error: f32le PCM size %lld not multiple of 4\n",
+            PARAKEET_LOG_ERROR("error: f32le PCM size %lld not multiple of 4\n",
                          (long long) size);
             return 3;
         }
         const size_t n = static_cast<size_t>(size) / 4;
         out_samples.resize(n);
         if (!f.read(reinterpret_cast<char *>(out_samples.data()), size)) {
-            std::fprintf(stderr, "error: short read from %s\n", path.c_str());
+            PARAKEET_LOG_ERROR("error: short read from %s\n", path.c_str());
             return 4;
         }
         return 0;
     }
-    std::fprintf(stderr, "error: unknown --pcm-format '%s' (expected s16le or f32le)\n",
+    PARAKEET_LOG_ERROR("error: unknown --pcm-format '%s' (expected s16le or f32le)\n",
                  format.c_str());
     return 5;
 }
@@ -409,7 +413,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         } else if (a == "--diarization-pad-segment-ms" && i + 1 < argc) {
             extra.attributed_pad_segment_ms = std::max(0, std::atoi(argv[++i]));
         } else {
-            std::fprintf(stderr, "unknown option: %s\n", a.c_str());
+            PARAKEET_LOG_ERROR("unknown option: %s\n", a.c_str());
             print_usage(argv[0]);
             return 2;
         }
@@ -421,11 +425,11 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         return 2;
     }
     if (!opts.wav_path.empty() && !extra.pcm_in_path.empty()) {
-        std::fprintf(stderr, "error: --wav and --pcm-in are mutually exclusive\n");
+        PARAKEET_LOG_ERROR("error: --wav and --pcm-in are mutually exclusive\n");
         return 2;
     }
     if (extra.emit_format != "text" && extra.emit_format != "jsonl") {
-        std::fprintf(stderr, "error: --emit must be 'text' or 'jsonl' (got '%s')\n",
+        PARAKEET_LOG_ERROR("error: --emit must be 'text' or 'jsonl' (got '%s')\n",
                      extra.emit_format.c_str());
         return 2;
     }
@@ -442,7 +446,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     const auto t_load = clock::now();
     ParakeetCtcModel model;
     if (int rc = load_from_gguf(opts.model_gguf_path, model, opts.n_threads, opts.n_gpu_layers, opts.verbose); rc != 0) {
-        std::fprintf(stderr, "error: failed to load %s (rc=%d)\n", opts.model_gguf_path.c_str(), rc);
+        PARAKEET_LOG_ERROR("error: failed to load %s (rc=%d)\n", opts.model_gguf_path.c_str(), rc);
         return 3;
     }
     const double load_ms = ms_since(t_load);
@@ -452,7 +456,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     int sr = model.mel_cfg.sample_rate;
     if (!opts.wav_path.empty()) {
         if (int rc = load_wav_mono_f32(opts.wav_path, samples, sr); rc != 0) {
-            std::fprintf(stderr, "error: failed to load %s (rc=%d)\n", opts.wav_path.c_str(), rc);
+            PARAKEET_LOG_ERROR("error: failed to load %s (rc=%d)\n", opts.wav_path.c_str(), rc);
             return 4;
         }
     } else {
@@ -462,7 +466,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         if (extra.pcm_rate > 0) {
             sr = extra.pcm_rate;
         } else {
-            std::fprintf(stderr,
+            PARAKEET_LOG_INFO(
                 "warning: --pcm-in without --pcm-rate; assuming %d Hz to match the model.\n"
                 "         Pass --pcm-rate explicitly to silence this warning and to fail-fast\n"
                 "         on a mismatched raw PCM rate (resampling is not yet wired).\n",
@@ -471,7 +475,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         }
     }
     if (sr != model.mel_cfg.sample_rate) {
-        std::fprintf(stderr, "error: input is %d Hz but model expects %d Hz (resampling not yet wired)\n",
+        PARAKEET_LOG_ERROR("error: input is %d Hz but model expects %d Hz (resampling not yet wired)\n",
                      sr, model.mel_cfg.sample_rate);
         return 5;
     }
@@ -480,7 +484,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
     if (!extra.diarization_model_path.empty()) {
         if (model.model_type == ParakeetModelType::SORTFORMER) {
-            std::fprintf(stderr, "error: --diarization-model expects --model to be a transcription\n"
+            PARAKEET_LOG_ERROR("error: --diarization-model expects --model to be a transcription\n"
                                  "       (CTC/TDT) GGUF; got Sortformer at --model. Swap them.\n");
             return 5;
         }
@@ -493,7 +497,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         Engine sf_engine(sf_opts);
 
         if (!sf_engine.is_diarization_model()) {
-            std::fprintf(stderr, "error: --diarization-model %s is not a Sortformer GGUF\n",
+            PARAKEET_LOG_ERROR("error: --diarization-model %s is not a Sortformer GGUF\n",
                          extra.diarization_model_path.c_str());
             return 5;
         }
@@ -538,7 +542,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             }
         }
         if (opts.verbose) {
-            std::fprintf(stderr,
+            PARAKEET_LOG_INFO(
                 "[attributed] audio=%.2fs samples=%zu@%dHz diar.segments=%zu asr_calls=%d\n"
                 "[attributed] total=%.1fms RTF=%.3f merged.segments=%zu\n",
                 audio_ms / 1000.0, samples.size(), sr,
@@ -601,7 +605,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                     std::chrono::steady_clock::now() - t_stream_start).count() / 1000.0;
 
             if (opts.verbose) {
-                std::fprintf(stderr,
+                PARAKEET_LOG_INFO(
                     "[diarize-stream] load=%.1fms audio=%.2fs samples=%zu@%dHz\n"
                     "[diarize-stream] chunk_ms=%d history_ms=%d segments=%d total=%.1fms RTF=%.3f\n",
                     load_ms, audio_ms / 1000.0, samples.size(), sr,
@@ -625,7 +629,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             }
         }
         if (opts.verbose) {
-            std::fprintf(stderr,
+            PARAKEET_LOG_INFO(
                 "[diarize] load=%.1fms audio=%.2fs samples=%zu@%dHz frames=%d num_spks=%d\n"
                 "[diarize] mel=%.1fms enc=%.1fms dec=%.1fms total=%.1fms RTF=%.3f segments=%zu\n",
                 load_ms, audio_ms / 1000.0, samples.size(), sr,
@@ -655,6 +659,9 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             if (fp) {
                 std::fwrite(transposed.data(), sizeof(float), transposed.size(), fp);
                 std::fclose(fp);
+                PARAKEET_LOG_INFO("[dump] wrote mel (%d, %d) to %s\n",
+                                  model.mel_cfg.n_mels, n_frames,
+                                  extra.dump_mel_path.c_str());
             }
             extra.dump_mel_path.clear();
         }
@@ -676,7 +683,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                         transposed[m * n_frames + t] = mel[t * model.mel_cfg.n_mels + m];
                 std::fwrite(transposed.data(), sizeof(float), transposed.size(), fp);
                 std::fclose(fp);
-                std::fprintf(stderr, "[dump] wrote our_mel (%d, %d) to %s\n",
+                PARAKEET_LOG_INFO("[dump] wrote our_mel (%d, %d) to %s\n",
                              model.mel_cfg.n_mels, n_frames, dump_path);
             }
         }
@@ -686,7 +693,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                 std::fwrite(enc_out.encoder_out.data(), sizeof(float),
                             enc_out.encoder_out.size(), fp);
                 std::fclose(fp);
-                std::fprintf(stderr, "[dump] wrote encoder_out (%d frames x %d) to %s\n",
+                PARAKEET_LOG_INFO("[dump] wrote encoder_out (%d frames x %d) to %s\n",
                              enc_out.n_enc_frames, enc_out.d_model, dump_path);
             }
         }
@@ -696,7 +703,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                 std::fwrite(enc_out.subsampling_out.data(), sizeof(float),
                             enc_out.subsampling_out.size(), fp);
                 std::fclose(fp);
-                std::fprintf(stderr, "[dump] wrote subsampling_out (%zu floats) to %s\n",
+                PARAKEET_LOG_INFO("[dump] wrote subsampling_out (%zu floats) to %s\n",
                              enc_out.subsampling_out.size(), dump_path);
             }
         }
@@ -706,7 +713,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                 std::fwrite(enc_out.block_0_out.data(), sizeof(float),
                             enc_out.block_0_out.size(), fp);
                 std::fclose(fp);
-                std::fprintf(stderr, "[dump] wrote block_0_out (%zu floats) to %s\n",
+                PARAKEET_LOG_INFO("[dump] wrote block_0_out (%zu floats) to %s\n",
                              enc_out.block_0_out.size(), dump_path);
             }
         }
@@ -760,10 +767,10 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     int n_frames = 0;
 
     if (extra.profile) {
-        std::fprintf(stderr, "[profile] model=%s  wav=%s (%.2f s audio, %d samples @ %d Hz)\n",
+        PARAKEET_LOG_INFO("[profile] model=%s  wav=%s (%.2f s audio, %d samples @ %d Hz)\n",
                      opts.model_gguf_path.c_str(), opts.wav_path.c_str(),
                      audio_ms / 1000.0, (int) samples.size(), sr);
-        std::fprintf(stderr, "[profile] threads=%d  warmup=%d  runs=%d per config\n",
+        PARAKEET_LOG_INFO("[profile] threads=%d  warmup=%d  runs=%d per config\n",
                      opts.n_threads, extra.profile_warmup, extra.profile_runs);
 
         RunTimes t_mel;
@@ -774,11 +781,11 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         std::vector<float> mel_buf;
         if (int rc = compute_log_mel(samples.data(), (int) samples.size(),
                                      model.mel_cfg, mel_buf, n_frames_tmp); rc != 0) {
-            std::fprintf(stderr, "profile: mel failed rc=%d\n", rc);
+            PARAKEET_LOG_ERROR("profile: mel failed rc=%d\n", rc);
             return 20;
         }
         const double mel_ms = ms_since(clk);
-        std::fprintf(stderr, "[profile] mel preprocess: %.2f ms   (audio=%.2fs, mel_frames=%d)\n",
+        PARAKEET_LOG_INFO("[profile] mel preprocess: %.2f ms   (audio=%.2fs, mel_frames=%d)\n",
                      mel_ms, audio_ms / 1000.0, n_frames_tmp);
 
         const int nl_full = (int) model.encoder_cfg.n_layers;
@@ -794,7 +801,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             for (int w = 0; w < extra.profile_warmup; ++w) {
                 if (int rc = run_encoder(model, mel_buf.data(), n_frames_tmp,
                                          model.mel_cfg.n_mels, tmp_out, nl); rc != 0) {
-                    std::fprintf(stderr, "profile: run_encoder failed rc=%d at nl=%d\n", rc, nl);
+                    PARAKEET_LOG_ERROR("profile: run_encoder failed rc=%d at nl=%d\n", rc, nl);
                     return 21;
                 }
             }
@@ -802,14 +809,14 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
                 const auto t0 = std::chrono::steady_clock::now();
                 if (int rc = run_encoder(model, mel_buf.data(), n_frames_tmp,
                                          model.mel_cfg.n_mels, tmp_out, nl); rc != 0) {
-                    std::fprintf(stderr, "profile: run_encoder failed rc=%d at nl=%d\n", rc, nl);
+                    PARAKEET_LOG_ERROR("profile: run_encoder failed rc=%d at nl=%d\n", rc, nl);
                     return 22;
                 }
                 timings.push_back(ms_since(t0));
             }
             AggStats s = aggregate(timings);
             results.emplace_back(nl, s);
-            std::fprintf(stderr, "[profile] n_layers=%2d:  mean=%7.2f ms   median=%7.2f ms   min=%7.2f ms   max=%7.2f ms   std=%6.2f\n",
+            PARAKEET_LOG_INFO("[profile] n_layers=%2d:  mean=%7.2f ms   median=%7.2f ms   min=%7.2f ms   max=%7.2f ms   std=%6.2f\n",
                          nl, s.mean, s.median, s.min, s.max, s.stdev);
         }
 
@@ -826,28 +833,28 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         const double block_0_extra = t1 - t0 - per_block_from_1_to_full;
         const double sub_plus_ctc = t0;
 
-        std::fprintf(stderr, "\n[profile] ---------- encoder attribution (median ms) ----------\n");
-        std::fprintf(stderr, "[profile]   mel preprocess                    %7.2f   (%.1f%% of total)\n",
+        PARAKEET_LOG_INFO("\n[profile] ---------- encoder attribution (median ms) ----------\n");
+        PARAKEET_LOG_INFO("[profile]   mel preprocess                    %7.2f   (%.1f%% of total)\n",
                      mel_ms, mel_ms / (mel_ms + t_full) * 100.0);
-        std::fprintf(stderr, "[profile]   subsampling + CTC head (nl=0)     %7.2f   (%.1f%% of total)\n",
+        PARAKEET_LOG_INFO("[profile]   subsampling + CTC head (nl=0)     %7.2f   (%.1f%% of total)\n",
                      sub_plus_ctc, sub_plus_ctc / (mel_ms + t_full) * 100.0);
-        std::fprintf(stderr, "[profile]   block-0 overhead above avg block  %+7.2f   (extra captures / first-block warmup)\n",
+        PARAKEET_LOG_INFO("[profile]   block-0 overhead above avg block  %+7.2f   (extra captures / first-block warmup)\n",
                      block_0_extra);
-        std::fprintf(stderr, "[profile]   per-block avg (nl=1..%d range)    %7.2f   (x %d blocks = %7.2f ms, %.1f%% of total)\n",
+        PARAKEET_LOG_INFO("[profile]   per-block avg (nl=1..%d range)    %7.2f   (x %d blocks = %7.2f ms, %.1f%% of total)\n",
                      nl_full,
                      per_block_from_1_to_full, nl_full,
                      per_block_from_1_to_full * nl_full,
                      per_block_from_1_to_full * nl_full / (mel_ms + t_full) * 100.0);
-        std::fprintf(stderr, "[profile]   per-block avg (nl=1..%d range)    %7.2f   (sanity check)\n",
+        PARAKEET_LOG_INFO("[profile]   per-block avg (nl=1..%d range)    %7.2f   (sanity check)\n",
                      nl_mid, per_block_from_1_to_mid);
-        std::fprintf(stderr, "[profile]   full encoder (nl=%d)               %7.2f\n",
+        PARAKEET_LOG_INFO("[profile]   full encoder (nl=%d)               %7.2f\n",
                      nl_full, t_full);
-        std::fprintf(stderr, "[profile]   total (mel + encoder)              %7.2f   RTF = %.4f\n",
+        PARAKEET_LOG_INFO("[profile]   total (mel + encoder)              %7.2f   RTF = %.4f\n",
                      mel_ms + t_full, (mel_ms + t_full) / audio_ms);
-        std::fprintf(stderr, "[profile] -------------------------------------------------------\n");
+        PARAKEET_LOG_INFO("[profile] -------------------------------------------------------\n");
 
         const int T_enc = n_frames_tmp / 8;
-        std::fprintf(stderr, "\n[profile] sub-stage breakdown of a single conformer block (T_enc=%d)\n", T_enc);
+        PARAKEET_LOG_INFO("\n[profile] sub-stage breakdown of a single conformer block (T_enc=%d)\n", T_enc);
         qvac_parakeet::BlockSubstageTimes sub;
         if (qvac_parakeet::profile_block_substages(model, T_enc,
                 extra.profile_warmup, extra.profile_runs, sub) == 0) {
@@ -855,7 +862,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             auto row = [&](const char * label, double ms) {
                 const double pct_block = sub.block_full_ms > 0 ? ms / sub.block_full_ms * 100.0 : 0.0;
                 const double pct_sum   = sum > 0              ? ms / sum * 100.0               : 0.0;
-                std::fprintf(stderr, "[profile]   %-14s %7.2f ms   (%5.1f%% of sum-of-parts,  %5.1f%% of full-block)\n",
+                PARAKEET_LOG_INFO("[profile]   %-14s %7.2f ms   (%5.1f%% of sum-of-parts,  %5.1f%% of full-block)\n",
                              label, ms, pct_sum, pct_block);
             };
             row("FF1  (macaron)", sub.ff1_ms);
@@ -863,19 +870,19 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             row("Conv module",    sub.conv_ms);
             row("FF2  (macaron)", sub.ff2_ms);
             row("norm_out",       sub.norm_out_ms);
-            std::fprintf(stderr, "[profile]   %-14s %7.2f ms   (sum of parts, slight overhead vs full)\n",
+            PARAKEET_LOG_INFO("[profile]   %-14s %7.2f ms   (sum of parts, slight overhead vs full)\n",
                          "sum of parts", sum);
-            std::fprintf(stderr, "[profile]   %-14s %7.2f ms   (actual full-block forward)\n",
+            PARAKEET_LOG_INFO("[profile]   %-14s %7.2f ms   (actual full-block forward)\n",
                          "full block", sub.block_full_ms);
 
             const double per_block_measured = per_block_from_1_to_full;
             const double n_layers_full = (double) model.encoder_cfg.n_layers;
-            std::fprintf(stderr, "\n[profile] extrapolated cost over all %d blocks (mean per-block = %.2f ms):\n",
+            PARAKEET_LOG_INFO("\n[profile] extrapolated cost over all %d blocks (mean per-block = %.2f ms):\n",
                          (int) n_layers_full, per_block_measured);
             auto extrap = [&](const char * label, double ms) {
                 const double frac = sum > 0 ? ms / sum : 0.0;
                 const double total_ms = frac * per_block_measured * n_layers_full;
-                std::fprintf(stderr, "[profile]   %-14s ~%7.2f ms across encoder  (= %.1f%% of encoder time)\n",
+                PARAKEET_LOG_INFO("[profile]   %-14s ~%7.2f ms across encoder  (= %.1f%% of encoder time)\n",
                              label, total_ms, total_ms / t_full * 100.0);
             };
             extrap("FF1",       sub.ff1_ms);
@@ -884,7 +891,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             extrap("FF2",       sub.ff2_ms);
             extrap("norm_out",  sub.norm_out_ms);
         } else {
-            std::fprintf(stderr, "[profile] sub-stage profiling failed\n");
+            PARAKEET_LOG_ERROR("[profile] sub-stage profiling failed\n");
         }
         return 0;
     }
@@ -928,7 +935,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
             const double stream_ms = ms_since(t_stream);
             if (opts.verbose) {
-                std::fprintf(stderr,
+                PARAKEET_LOG_INFO(
                     "[stream-duplex] load=%.1fms audio=%.2fs samples=%zu@%dHz\n"
                     "[stream-duplex] chunk_ms=%d left=%dms right=%dms segments=%d total=%.1fms RTF=%.3f\n",
                     load_ms, audio_ms / 1000.0, samples.size(), sr,
@@ -946,7 +953,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
         const double stream_ms = ms_since(t_stream);
         if (opts.verbose) {
-            std::fprintf(stderr,
+            PARAKEET_LOG_INFO(
                 "[stream] load=%.1fms audio=%.2fs samples=%zu@%dHz mel_frames=%d enc_frames=%d\n"
                 "[stream] mel=%.1fms enc=%.1fms dec=%.1fms total=%.1fms RTF=%.3f tokens=%zu\n",
                 load_ms, audio_ms / 1000.0, samples.size(), sr,
@@ -966,7 +973,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             const double inf_rtf   = times.inference_ms / audio_ms;
             const double total_ms  = ms_since(t_load);
             const double total_rtf = total_ms / audio_ms;
-            std::fprintf(stderr,
+            PARAKEET_LOG_INFO(
                 "[BENCH] load=%.1fms wav=%.1fs (%zu samples@%dHz) mel=%dx%d\n"
                 "[BENCH] mel=%.1fms enc=%.1fms dec=%.1fms inference=%.1fms  RTF=%.3f\n"
                 "[BENCH] total(load+wav+inf)=%.1fms  total_RTF=%.3f  tokens=%zu\n",
@@ -977,17 +984,17 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         return 0;
     }
 
-    std::fprintf(stderr, "[bench] model=%s  wav=%s (%.2f s audio, %d samples @ %d Hz)\n",
+    PARAKEET_LOG_INFO("[bench] model=%s  wav=%s (%.2f s audio, %d samples @ %d Hz)\n",
                  opts.model_gguf_path.c_str(), opts.wav_path.c_str(),
                  audio_ms / 1000.0, (int) samples.size(), sr);
-    std::fprintf(stderr, "[bench] threads=%d  warmup=%d  runs=%d\n",
+    PARAKEET_LOG_INFO("[bench] threads=%d  warmup=%d  runs=%d\n",
                  opts.n_threads, extra.bench_warmup, extra.bench_runs);
-    std::fprintf(stderr, "[bench] load=%.1fms wav_read=%.1fms\n", load_ms, wav_ms);
+    PARAKEET_LOG_INFO("[bench] load=%.1fms wav_read=%.1fms\n", load_ms, wav_ms);
 
     for (int w = 0; w < extra.bench_warmup; ++w) {
         RunTimes t;
         if (int rc = run_once(text, ids, n_frames, t); rc != 0) return 10 + rc;
-        std::fprintf(stderr, "[bench] warmup %d/%d  mel=%.1fms enc=%.1fms dec=%.1fms  RTF=%.3f\n",
+        PARAKEET_LOG_INFO("[bench] warmup %d/%d  mel=%.1fms enc=%.1fms dec=%.1fms  RTF=%.3f\n",
                      w + 1, extra.bench_warmup, t.mel_ms, t.enc_ms, t.dec_ms, t.inference_ms / audio_ms);
     }
 
@@ -1006,7 +1013,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         dec_v.push_back(t.dec_ms);
         inf_v.push_back(t.inference_ms);
         enc_frames_last = t.encoder_frames;
-        std::fprintf(stderr, "[bench] run %d/%d    mel=%.1fms enc=%.1fms dec=%.1fms inference=%.1fms  RTF=%.3f\n",
+        PARAKEET_LOG_INFO("[bench] run %d/%d    mel=%.1fms enc=%.1fms dec=%.1fms inference=%.1fms  RTF=%.3f\n",
                      r + 1, extra.bench_runs, t.mel_ms, t.enc_ms, t.dec_ms,
                      t.inference_ms, t.inference_ms / audio_ms);
     }
@@ -1022,7 +1029,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     const double   rtf_mean   = s_inf.mean   / audio_ms;
     const bool     noisy      = s_inf.stdev > 0.2 * s_inf.mean;
 
-    std::fprintf(stderr,
+    PARAKEET_LOG_INFO(
         "[bench] ----------- summary (%d timed runs, warmup excluded) -----------\n"
         "[bench]   audio              = %.3f s (%zu samples @ %d Hz)\n"
         "[bench]   model load         = %.1f ms\n"
@@ -1051,7 +1058,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
     if (!extra.bench_json_path.empty()) {
         FILE * fp = std::fopen(extra.bench_json_path.c_str(), "w");
         if (!fp) {
-            std::fprintf(stderr, "error: cannot open %s for writing\n", extra.bench_json_path.c_str());
+            PARAKEET_LOG_ERROR("error: cannot open %s for writing\n", extra.bench_json_path.c_str());
             return 30;
         }
         auto fmt_stats = [&](const char * name, const AggStats & s, const std::vector<double> & v) {
@@ -1087,75 +1094,8 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         std::fprintf(fp, "    \"rtf_best\":   %.6f\n",  rtf_best);
         std::fprintf(fp, "}\n");
         std::fclose(fp);
-        std::fprintf(stderr, "[bench] wrote %s\n", extra.bench_json_path.c_str());
+        PARAKEET_LOG_INFO("[bench] wrote %s\n", extra.bench_json_path.c_str());
     }
 
     return 0;
-}
-
-namespace qvac_parakeet {
-
-int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result) {
-    using clock = std::chrono::steady_clock;
-    const auto t0 = clock::now();
-
-    ParakeetCtcModel model;
-    if (int rc = load_from_gguf(opts.model_gguf_path, model, opts.n_threads,
-                                opts.n_gpu_layers, opts.verbose); rc != 0) {
-        return rc;
-    }
-    if (model.model_type != ParakeetModelType::CTC) {
-        const char * mt = "Sortformer";
-        if (model.model_type == ParakeetModelType::TDT) mt = "TDT";
-        else if (model.model_type == ParakeetModelType::EOU) mt = "EOU";
-        std::fprintf(stderr,
-            "qvac_parakeet::transcribe_wav: %s is a %s GGUF; this entry point\n"
-            "    only handles CTC. Use qvac_parakeet::Engine (see\n"
-            "    <qvac-parakeet/ctc/engine.h>) which auto-dispatches to TDT,\n"
-            "    EOU, and Sortformer GGUFs.\n",
-            opts.model_gguf_path.c_str(), mt);
-        return 11;
-    }
-
-    std::vector<float> samples;
-    int sr = 0;
-    if (int rc = load_wav_mono_f32(opts.wav_path, samples, sr); rc != 0) return rc;
-    if (sr != model.mel_cfg.sample_rate) return 10;
-
-    const auto t1 = clock::now();
-    std::vector<float> mel;
-    int n_frames = 0;
-    if (int rc = compute_log_mel(samples.data(), (int) samples.size(),
-                                 model.mel_cfg, mel, n_frames); rc != 0) return rc;
-    const double pre_ms = std::chrono::duration_cast<std::chrono::microseconds>(
-                             clock::now() - t1).count() / 1000.0;
-
-    const auto t2 = clock::now();
-    EncoderOutputs enc_out;
-    if (int rc = run_encoder(model, mel.data(), n_frames, model.mel_cfg.n_mels, enc_out,
-                             /*max_layers=*/-1,
-                             /*capture_intermediates=*/false); rc != 0) return rc;
-    const double enc_ms = std::chrono::duration_cast<std::chrono::microseconds>(
-                             clock::now() - t2).count() / 1000.0;
-
-    const auto t3 = clock::now();
-    std::vector<int32_t> ids = ctc_greedy_decode(
-        enc_out.logits.data(), enc_out.n_enc_frames, model.vocab_size, model.blank_id);
-    result.text = detokenize(model.vocab, ids);
-    result.token_ids = std::move(ids);
-    const double dec_ms = std::chrono::duration_cast<std::chrono::microseconds>(
-                             clock::now() - t3).count() / 1000.0;
-
-    result.preprocess_ms = pre_ms;
-    result.encoder_ms    = enc_ms;
-    result.decode_ms     = dec_ms;
-    result.total_ms      = std::chrono::duration_cast<std::chrono::microseconds>(
-                               clock::now() - t0).count() / 1000.0;
-    result.audio_samples = (int) samples.size();
-    result.sample_rate   = sr;
-    result.mel_frames    = n_frames;
-    result.encoder_frames = enc_out.n_enc_frames;
-    return 0;
-}
-
 }

@@ -1,4 +1,5 @@
 #include "parakeet_tdt.h"
+#include "parakeet_log.h"
 #include "sentencepiece_bpe.h"
 
 #include "ggml.h"
@@ -203,8 +204,8 @@ int tdt_decode_window(const ParakeetCtcModel & model,
                       std::vector<int32_t> & out_tokens,
                       int & out_steps) {
     if (D_enc != W.D_enc) {
-        std::fprintf(stderr, "tdt_decode_window: encoder d_model mismatch (%d vs %d)\n",
-                     D_enc, W.D_enc);
+        PARAKEET_LOG_ERROR("tdt_decode_window: encoder d_model mismatch (%d vs %d)\n",
+                           D_enc, W.D_enc);
         return 1;
     }
     if (!state.initialized) {

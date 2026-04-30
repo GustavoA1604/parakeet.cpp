@@ -17,8 +17,7 @@ Two patches ship today:
 2. [`ggml-opencl-program-binary-cache.patch`](#ggml-opencl-program-binary-cachepatch)
    — adds a persistent on-disk cache for compiled OpenCL kernel
    binaries, removing the multi-second `clBuildProgram` wave at every
-   cold start. Honours `$GGML_OPENCL_CACHE_DIR` (the same env var the
-   `qvac-lib-infer-llamacpp-llm` Android addon already plumbs), with
+   cold start. Honours `$GGML_OPENCL_CACHE_DIR`, with
    `$XDG_CACHE_HOME/ggml/opencl` → `$HOME/.cache/ggml/opencl`
    fallbacks. Opt-out via `GGML_OPENCL_CACHE_DIR=""`.
 
@@ -114,8 +113,7 @@ The intended audience for the patch is:
     AMD/NVIDIA users get a clean CPU fallback instead of crashing
     inside `clBuildProgram`).
   * Anyone who wants to reproduce the OpenCL backend's mel/encoder
-    parity numbers (see commit messages on the `open-cl` branch)
-    without an Adreno device.
+    parity numbers without an Adreno device.
 
 Opt-in is gated behind `GGML_OPENCL_ALLOW_UNKNOWN_GPU=1` so misconfigured
 production builds still get the same explicit `Unsupported GPU` error
@@ -141,7 +139,7 @@ freshly-compiled program back to disk on miss.
 | Symptom                                                                                | Root cause                                                                              | What this patch does                                                                                              |
 |----------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | Every cold-start `qvac-parakeet --n-gpu-layers 1` re-compiles all 88 OpenCL kernels    | `build_program_from_source` always calls `clCreateProgramWithSource` + `clBuildProgram` | Look up `<cache_dir>/<key>.bin` first via `clCreateProgramWithBinary`; only fall through to source compile on miss |
-| The `qvac-lib-infer-llamacpp-llm` Android addon already `setenv`s `GGML_OPENCL_CACHE_DIR` for the same goal, but ggml-opencl ignores it | The env var is read **nowhere** in upstream ggml-opencl at this commit  | Resolves cache dir from `$GGML_OPENCL_CACHE_DIR` → `$XDG_CACHE_HOME/ggml/opencl` → `$HOME/.cache/ggml/opencl`. The downstream contract finally takes effect. |
+| Hosts already `setenv` `GGML_OPENCL_CACHE_DIR` for the same goal, but ggml-opencl ignores it | The env var is read **nowhere** in upstream ggml-opencl at this commit  | Resolves cache dir from `$GGML_OPENCL_CACHE_DIR` → `$XDG_CACHE_HOME/ggml/opencl` → `$HOME/.cache/ggml/opencl`. The downstream contract finally takes effect. |
 
 ### Cache key
 

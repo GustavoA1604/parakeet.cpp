@@ -4,6 +4,8 @@ ggml/
 # Python virtualenv for the converter + reference-dump scripts.
 venv/
 .venv/
+.venv-*/
+.pip-cache/
 __pycache__/
 *.pyc
 

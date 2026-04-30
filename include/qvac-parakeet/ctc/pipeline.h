@@ -7,16 +7,19 @@
 // FastConformer encoder + CTC head, and greedily decodes with
 // collapse-repeats + blank-removal + SentencePiece detokenization.
 //
-// Feeding a TDT or Sortformer GGUF here is a hard error (return code 11)
-// -- those checkpoints have no CTC head and require different decoders.
-// For multi-engine support (CTC + TDT + Sortformer behind one API),
-// use the persistent `Engine` umbrella in <qvac-parakeet/ctc/engine.h>,
-// which auto-detects the model type at load and dispatches accordingly.
+// Feeding a TDT, EOU or Sortformer GGUF here is a hard error (return
+// code 11) -- those checkpoints have no CTC head and require different
+// decoders. For multi-engine support (CTC + TDT + EOU + Sortformer
+// behind one API), use the persistent `Engine` umbrella in
+// <qvac-parakeet/ctc/engine.h>, which auto-detects the model type at
+// load and dispatches accordingly.
 //
 // `Engine` is also preferred for any persistent / many-utterance use even
 // on CTC GGUFs because it amortises the model load cost.
 //
-// Implementation in src/parakeet_ctc.cpp.
+// Implementation in src/parakeet_pipeline.cpp.
+
+#include "../api.h"
 
 #include <cstdint>
 #include <string>
@@ -49,7 +52,8 @@ struct TranscribeResult {
     int encoder_frames   = 0;
 };
 
-int transcribe_wav(const TranscribeOptions & opts, TranscribeResult & result);
+QVAC_PARAKEET_API int transcribe_wav(const TranscribeOptions & opts,
+                                     TranscribeResult       & result);
 
 namespace ctc {
     using namespace ::qvac_parakeet;

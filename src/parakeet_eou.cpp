@@ -1,4 +1,5 @@
 #include "parakeet_eou.h"
+#include "parakeet_log.h"
 #include "sentencepiece_bpe.h"
 
 #include "ggml.h"
@@ -222,8 +223,8 @@ int eou_decode_window(const ParakeetCtcModel & model,
                       std::vector<EouSegmentBoundary> & out_segments,
                       int & out_steps) {
     if (D_enc != W.D_enc) {
-        std::fprintf(stderr, "eou_decode_window: encoder d_model mismatch (%d vs %d)\n",
-                     D_enc, W.D_enc);
+        PARAKEET_LOG_ERROR("eou_decode_window: encoder d_model mismatch (%d vs %d)\n",
+                           D_enc, W.D_enc);
         return 1;
     }
     if (!state.initialized) {

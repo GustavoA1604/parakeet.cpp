@@ -5,6 +5,7 @@ Produces artifacts/ctc-ref/block_0_{post_ff1,post_attn,post_conv,post_ff2}.npy
 so the C++ test-encoder can isolate which sub-component diverges.
 """
 
+import argparse
 import math
 import sys
 from pathlib import Path
@@ -25,8 +26,15 @@ spec.loader.exec_module(mod)
 
 
 def main():
-    out = Path("artifacts/ctc-ref")
-    W, meta = mod.load_gguf("models/parakeet-ctc-0.6b.gguf")
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--gguf", type=Path, default=Path("models/parakeet-ctc-0.6b.gguf"),
+                   help="CTC GGUF whose weights drive the Python shadow encoder.")
+    p.add_argument("--out",  type=Path, default=Path("artifacts/ctc-ref"),
+                   help="Directory the .npy substage dumps are written to "
+                        "(must already contain the mel.npy from dump-ctc-reference.py).")
+    args = p.parse_args()
+    out = args.out
+    W, meta = mod.load_gguf(str(args.gguf))
     mel = torch.from_numpy(np.load(out / "mel.npy"))
     mel_valid = int((mel != 0).any(dim=0).sum().item())
 

@@ -1,4 +1,5 @@
 #include "parakeet_ctc.h"
+#include "parakeet_log.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -134,19 +135,19 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
     if (n_gpu_layers <= 0) return nullptr;
 #ifdef GGML_USE_CUDA
     if (auto * b = ggml_backend_cuda_init(0)) {
-        if (verbose) std::fprintf(stderr, "parakeet: using CUDA backend\n");
+        if (verbose) PARAKEET_LOG_INFO("parakeet: using CUDA backend\n");
         return b;
     }
 #endif
 #ifdef GGML_USE_METAL
     if (auto * b = ggml_backend_metal_init()) {
-        if (verbose) std::fprintf(stderr, "parakeet: using Metal backend\n");
+        if (verbose) PARAKEET_LOG_INFO("parakeet: using Metal backend\n");
         return b;
     }
 #endif
 #ifdef GGML_USE_VULKAN
     if (auto * b = ggml_backend_vk_init(0)) {
-        if (verbose) std::fprintf(stderr, "parakeet: using Vulkan backend\n");
+        if (verbose) PARAKEET_LOG_INFO("parakeet: using Vulkan backend\n");
         return b;
     }
 #endif
@@ -167,7 +168,7 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
         };
         if (is_adreno_6xx(name) || is_adreno_6xx(desc)) {
             const char * reported = name ? name : (desc ? desc : "unknown");
-            if (verbose) std::fprintf(stderr,
+            if (verbose) PARAKEET_LOG_WARN(
                 "parakeet: OpenCL device '%s' is Adreno 6xx; "
                 "forcing CPU fallback (7xx/8xx/X1E supported, set "
                 "QVAC_PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
@@ -177,18 +178,18 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
                 ggml_backend_free(b);
                 return nullptr;
             }
-            if (verbose) std::fprintf(stderr,
+            if (verbose) PARAKEET_LOG_INFO(
                 "parakeet: QVAC_PARAKEET_ALLOW_ADRENO_6XX=1 set; "
                 "keeping OpenCL backend on '%s' anyway\n", reported);
         }
         if (verbose) {
-            std::fprintf(stderr, "parakeet: using OpenCL backend (%s)\n",
-                         name ? name : (desc ? desc : "unknown"));
+            PARAKEET_LOG_INFO("parakeet: using OpenCL backend (%s)\n",
+                              name ? name : (desc ? desc : "unknown"));
         }
         return b;
     }
 #endif
-    if (verbose) std::fprintf(stderr, "parakeet: no GPU backend compiled in, falling back to CPU\n");
+    if (verbose) PARAKEET_LOG_INFO("parakeet: no GPU backend compiled in, falling back to CPU\n");
     return nullptr;
 }
 
@@ -251,14 +252,11 @@ int load_from_gguf(const std::string & gguf_path,
                    int                 n_threads,
                    int                 n_gpu_layers,
                    bool                verbose) {
-    (void) n_threads;
-    (void) n_gpu_layers;
-
     auto impl = std::make_shared<ParakeetCtcModel::Impl>();
 
     impl->backend_cpu = ggml_backend_cpu_init();
     if (!impl->backend_cpu) {
-        std::fprintf(stderr, "gguf: ggml_backend_cpu_init failed\n");
+        PARAKEET_LOG_ERROR("gguf: ggml_backend_cpu_init failed\n");
         return 10;
     }
     int resolved_threads = n_threads;
@@ -281,7 +279,7 @@ int load_from_gguf(const std::string & gguf_path,
     gguf_init_params params = { /*no_alloc=*/ true, &impl->ctx };
     impl->gguf = gguf_init_from_file(gguf_path.c_str(), params);
     if (!impl->gguf) {
-        std::fprintf(stderr, "gguf: failed to open %s\n", gguf_path.c_str());
+        PARAKEET_LOG_ERROR("gguf: failed to open %s\n", gguf_path.c_str());
         return 1;
     }
 
@@ -289,7 +287,7 @@ int load_from_gguf(const std::string & gguf_path,
 
     impl->weights_buffer = ggml_backend_alloc_ctx_tensors(impl->ctx, impl->backend_active);
     if (!impl->weights_buffer) {
-        std::fprintf(stderr, "gguf: ggml_backend_alloc_ctx_tensors failed\n");
+        PARAKEET_LOG_ERROR("gguf: ggml_backend_alloc_ctx_tensors failed\n");
         return 12;
     }
     ggml_backend_buffer_set_usage(impl->weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
@@ -297,7 +295,7 @@ int load_from_gguf(const std::string & gguf_path,
     {
         std::ifstream f(gguf_path, std::ios::binary);
         if (!f) {
-            std::fprintf(stderr, "gguf: cannot reopen %s for tensor data\n", gguf_path.c_str());
+            PARAKEET_LOG_ERROR("gguf: cannot reopen %s for tensor data\n", gguf_path.c_str());
             return 13;
         }
         const size_t data_offset = gguf_get_data_offset(g);
@@ -312,7 +310,7 @@ int load_from_gguf(const std::string & gguf_path,
             buf.resize(nbytes);
             f.seekg((std::streamoff)(data_offset + off), std::ios::beg);
             if (!f.read(buf.data(), nbytes)) {
-                std::fprintf(stderr, "gguf: short read on tensor '%s' (%zu bytes)\n", name, nbytes);
+                PARAKEET_LOG_ERROR("gguf: short read on tensor '%s' (%zu bytes)\n", name, nbytes);
                 return 14;
             }
             ggml_backend_tensor_set(t, buf.data(), 0, nbytes);
@@ -322,12 +320,12 @@ int load_from_gguf(const std::string & gguf_path,
     {
         const int id = find_key(g, "general.architecture");
         if (id < 0) {
-            std::fprintf(stderr, "gguf: missing general.architecture\n");
+            PARAKEET_LOG_ERROR("gguf: missing general.architecture\n");
             return 2;
         }
         const char * arch = gguf_get_val_str(g, id);
         if (std::strcmp(arch, "parakeet-ctc") != 0) {
-            std::fprintf(stderr, "gguf: expected arch=parakeet-ctc, got '%s'\n", arch);
+            PARAKEET_LOG_ERROR("gguf: expected arch=parakeet-ctc, got '%s'\n", arch);
             return 2;
         }
     }
@@ -626,7 +624,7 @@ int load_from_gguf(const std::string & gguf_path,
         const char * be = impl->backend_gpu
                             ? ggml_backend_name(impl->backend_gpu)
                             : "CPU";
-        std::fprintf(stderr, "  backend: %s  (threads=%d)\n", be, resolved_threads);
+        PARAKEET_LOG_INFO("  backend: %s  (threads=%d)\n", be, resolved_threads);
     }
     return 0;
 }
@@ -648,60 +646,60 @@ void print_model_summary(const ParakeetCtcModel & m) {
     if (m.model_type == ParakeetModelType::TDT)        mt = "tdt";
     else if (m.model_type == ParakeetModelType::EOU)        mt = "eou";
     else if (m.model_type == ParakeetModelType::SORTFORMER) mt = "sortformer";
-    std::fprintf(stderr, "parakeet-%s loaded:\n", mt);
+    PARAKEET_LOG_INFO("parakeet-%s loaded:\n", mt);
     const char * conv_norm = m.encoder_cfg.conv_norm_type == ConvNormType::LayerNorm ? "ln" : "bn";
-    std::fprintf(stderr, "  encoder: d_model=%d n_layers=%d n_heads=%d head_dim=%d ff_dim=%d conv_k=%d sub=%dx xscaling=%d untie=%d use_bias=%d conv_norm=%s\n",
-                 m.encoder_cfg.d_model, m.encoder_cfg.n_layers, m.encoder_cfg.n_heads,
-                 m.encoder_cfg.head_dim, m.encoder_cfg.ff_dim, m.encoder_cfg.conv_kernel,
-                 m.encoder_cfg.subsampling_factor,
-                 (int) m.encoder_cfg.xscaling, (int) m.encoder_cfg.untie_biases,
-                 (int) m.encoder_cfg.use_bias, conv_norm);
+    PARAKEET_LOG_INFO("  encoder: d_model=%d n_layers=%d n_heads=%d head_dim=%d ff_dim=%d conv_k=%d sub=%dx xscaling=%d untie=%d use_bias=%d conv_norm=%s\n",
+                      m.encoder_cfg.d_model, m.encoder_cfg.n_layers, m.encoder_cfg.n_heads,
+                      m.encoder_cfg.head_dim, m.encoder_cfg.ff_dim, m.encoder_cfg.conv_kernel,
+                      m.encoder_cfg.subsampling_factor,
+                      (int) m.encoder_cfg.xscaling, (int) m.encoder_cfg.untie_biases,
+                      (int) m.encoder_cfg.use_bias, conv_norm);
     if (m.encoder_cfg.att_chunked_limited || m.encoder_cfg.causal_downsampling || m.encoder_cfg.conv_causal) {
-        std::fprintf(stderr, "  streaming: att_ctx=[%d,%d] style=%s causal_ds=%d conv_ctx=%s\n",
-                     m.encoder_cfg.att_context_left, m.encoder_cfg.att_context_right,
-                     m.encoder_cfg.att_chunked_limited ? "chunked_limited" : "regular",
-                     (int) m.encoder_cfg.causal_downsampling,
-                     m.encoder_cfg.conv_causal ? "causal" : "default");
+        PARAKEET_LOG_INFO("  streaming: att_ctx=[%d,%d] style=%s causal_ds=%d conv_ctx=%s\n",
+                          m.encoder_cfg.att_context_left, m.encoder_cfg.att_context_right,
+                          m.encoder_cfg.att_chunked_limited ? "chunked_limited" : "regular",
+                          (int) m.encoder_cfg.causal_downsampling,
+                          m.encoder_cfg.conv_causal ? "causal" : "default");
     }
-    std::fprintf(stderr, "  preproc: sr=%d n_fft=%d win=%d hop=%d n_mels=%d preemph=%.2f log_guard=%.2e\n",
-                 m.mel_cfg.sample_rate, m.mel_cfg.n_fft, m.mel_cfg.win_length,
-                 m.mel_cfg.hop_length, m.mel_cfg.n_mels, m.mel_cfg.preemph,
-                 (double) m.mel_cfg.log_zero_guard_value);
+    PARAKEET_LOG_INFO("  preproc: sr=%d n_fft=%d win=%d hop=%d n_mels=%d preemph=%.2f log_guard=%.2e\n",
+                      m.mel_cfg.sample_rate, m.mel_cfg.n_fft, m.mel_cfg.win_length,
+                      m.mel_cfg.hop_length, m.mel_cfg.n_mels, m.mel_cfg.preemph,
+                      (double) m.mel_cfg.log_zero_guard_value);
     if (m.model_type == ParakeetModelType::CTC) {
-        std::fprintf(stderr, "  ctc:     vocab=%d blank=%d\n", m.vocab_size, m.blank_id);
+        PARAKEET_LOG_INFO("  ctc:     vocab=%d blank=%d\n", m.vocab_size, m.blank_id);
     } else if (m.model_type == ParakeetModelType::EOU) {
-        std::fprintf(stderr, "  eou:     vocab=%d blank=%d eou_id=%d eob_id=%d "
-                             "pred_hidden=%d pred_layers=%d joint_hidden=%d "
-                             "chunk_mel=%d cache_lookback=%d cache_time=%d max_syms=%d\n",
-                     m.vocab_size, m.blank_id, m.eou_id, m.eob_id,
-                     m.encoder_cfg.eou_pred_hidden, m.encoder_cfg.eou_pred_rnn_layers,
-                     m.encoder_cfg.eou_joint_hidden,
-                     m.encoder_cfg.eou_chunk_mel_frames,
-                     m.encoder_cfg.eou_cache_lookback_frames,
-                     m.encoder_cfg.eou_cache_time_steps,
-                     m.encoder_cfg.eou_max_symbols_per_step);
+        PARAKEET_LOG_INFO("  eou:     vocab=%d blank=%d eou_id=%d eob_id=%d "
+                          "pred_hidden=%d pred_layers=%d joint_hidden=%d "
+                          "chunk_mel=%d cache_lookback=%d cache_time=%d max_syms=%d\n",
+                          m.vocab_size, m.blank_id, m.eou_id, m.eob_id,
+                          m.encoder_cfg.eou_pred_hidden, m.encoder_cfg.eou_pred_rnn_layers,
+                          m.encoder_cfg.eou_joint_hidden,
+                          m.encoder_cfg.eou_chunk_mel_frames,
+                          m.encoder_cfg.eou_cache_lookback_frames,
+                          m.encoder_cfg.eou_cache_time_steps,
+                          m.encoder_cfg.eou_max_symbols_per_step);
     } else if (m.model_type == ParakeetModelType::SORTFORMER) {
-        std::fprintf(stderr, "  sortformer: num_spks=%d  fc_d_model=%d  tf=%dlx%dh d_model=%d inner=%d pre_ln=%d\n",
-                     m.encoder_cfg.sortformer_num_spks,
-                     m.encoder_cfg.sortformer_fc_d_model,
-                     m.encoder_cfg.sortformer_tf_n_layers,
-                     m.encoder_cfg.sortformer_tf_n_heads,
-                     m.encoder_cfg.sortformer_tf_d_model,
-                     m.encoder_cfg.sortformer_tf_inner_size,
-                     (int) m.encoder_cfg.sortformer_tf_pre_ln);
+        PARAKEET_LOG_INFO("  sortformer: num_spks=%d  fc_d_model=%d  tf=%dlx%dh d_model=%d inner=%d pre_ln=%d\n",
+                          m.encoder_cfg.sortformer_num_spks,
+                          m.encoder_cfg.sortformer_fc_d_model,
+                          m.encoder_cfg.sortformer_tf_n_layers,
+                          m.encoder_cfg.sortformer_tf_n_heads,
+                          m.encoder_cfg.sortformer_tf_d_model,
+                          m.encoder_cfg.sortformer_tf_inner_size,
+                          (int) m.encoder_cfg.sortformer_tf_pre_ln);
     } else {
-        std::fprintf(stderr, "  tdt:     vocab=%d blank=%d pred_hidden=%d pred_layers=%d joint_hidden=%d durations=[",
-                     m.vocab_size, m.blank_id,
-                     m.encoder_cfg.tdt_pred_hidden, m.encoder_cfg.tdt_pred_rnn_layers,
-                     m.encoder_cfg.tdt_joint_hidden);
+        PARAKEET_LOG_INFO("  tdt:     vocab=%d blank=%d pred_hidden=%d pred_layers=%d joint_hidden=%d durations=[",
+                          m.vocab_size, m.blank_id,
+                          m.encoder_cfg.tdt_pred_hidden, m.encoder_cfg.tdt_pred_rnn_layers,
+                          m.encoder_cfg.tdt_joint_hidden);
         for (size_t i = 0; i < m.tdt_durations.size(); ++i) {
-            std::fprintf(stderr, "%s%d", i ? "," : "", m.tdt_durations[i]);
+            PARAKEET_LOG_INFO("%s%d", i ? "," : "", m.tdt_durations[i]);
         }
-        std::fprintf(stderr, "]\n");
+        PARAKEET_LOG_INFO("]\n");
     }
-    std::fprintf(stderr, "  tensors: filterbank=%ldx%ld window=%ld blocks=%zu\n",
-                 (long) m.mel_filterbank->ne[0], (long) m.mel_filterbank->ne[1],
-                 (long) m.window->ne[0], m.blocks.size());
+    PARAKEET_LOG_INFO("  tensors: filterbank=%ldx%ld window=%ld blocks=%zu\n",
+                      (long) m.mel_filterbank->ne[0], (long) m.mel_filterbank->ne[1],
+                      (long) m.window->ne[0], m.blocks.size());
 }
 
 namespace {

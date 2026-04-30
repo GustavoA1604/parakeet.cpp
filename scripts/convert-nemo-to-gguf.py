@@ -111,9 +111,11 @@ def parse_args() -> argparse.Namespace:
                    help="Path to .nemo archive (tarball). Downloads from HF if missing.")
     p.add_argument("--out", type=Path, default=Path("models/parakeet-ctc-0.6b.gguf"),
                    help="Output GGUF path.")
-    p.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
+    p.add_argument("--quant", choices=QUANT_CHOICES, default="q8_0",
                    help="Weight dtype for 2D projection matrices. Biases / norms / BN "
-                        "stay at f32. f16 default; use q8_0 for ~2x smaller.")
+                        "stay at f32. q8_0 default (~2x smaller than f16, bit-equal "
+                        "transcripts on clean speech across CTC/TDT/EOU/Sortformer); "
+                        "pass --quant f16 for the bit-equal floating-point baseline.")
     p.add_argument("--hf-repo", default="nvidia/parakeet-ctc-0.6b",
                    help="HF model id to download from if --ckpt is missing.")
     return p.parse_args()

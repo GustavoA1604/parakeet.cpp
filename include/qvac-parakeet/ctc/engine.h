@@ -1,16 +1,16 @@
 #pragma once
 
-// Persistent Parakeet engine -- CTC, TDT and Sortformer behind one umbrella.
+// Persistent Parakeet engine -- CTC, TDT, EOU and Sortformer behind
+// one umbrella.
 //
 // Loads the GGUF once and keeps the preprocessor filterbank + encoder
-// weights + decoder (CTC head, TDT prediction+joint, or Sortformer
+// weights + decoder (CTC head, TDT/EOU prediction+joint, or Sortformer
 // transformer+head) + tokenizer (when applicable) + backend resident so
 // subsequent calls pay only the mel extraction + encoder + decode cost.
 // The header path under <qvac-parakeet/ctc/...> is historical -- the
 // `Engine` class auto-detects the model type at load time and dispatches.
 //
-// Transcription entry points (CTC + TDT GGUFs) mirror the
-// qvac/packages/sdk API:
+// Transcription entry points (CTC, TDT, EOU GGUFs):
 //
 //   1. transcribe()                - full audio in, full text out (one-shot).
 //   2. transcribe_stream()         - Mode 2: full audio in up front, segments
@@ -83,6 +83,8 @@
 //     Mode 3). Always call `finalize()` if you care about those.
 //
 // Implementation in src/parakeet_engine.cpp.
+
+#include "../api.h"
 
 #include <cstdint>
 #include <functional>
@@ -180,7 +182,6 @@ struct StreamEvent {
 
     // EndOfTurn fields
     float    eot_confidence    = 0.0f;  // 0..1; for EOU = 1.0 when `<EOU>` fired
-    int      speaker_id_at_turn = -1;
 };
 
 using StreamEventCallback = std::function<void(const StreamEvent &)>;
@@ -328,7 +329,7 @@ struct StreamingSegment {
 
 using StreamingCallback = std::function<void(const StreamingSegment &)>;
 
-class StreamSession {
+class QVAC_PARAKEET_API StreamSession {
 public:
     struct Impl;
     explicit StreamSession(std::unique_ptr<Impl> impl);
@@ -362,7 +363,7 @@ private:
 // chunks until the history window is full. With history_ms >> chunk_ms
 // the IDs stabilise quickly. Phase 11.11.2 will add proper NeMo-style
 // spkcache compression for fully stable cross-chunk speaker identity.
-class SortformerStreamSession {
+class QVAC_PARAKEET_API SortformerStreamSession {
 public:
     struct Impl;
     explicit SortformerStreamSession(std::unique_ptr<Impl> impl);
@@ -384,7 +385,7 @@ private:
     std::unique_ptr<Impl> pimpl_;
 };
 
-class Engine {
+class QVAC_PARAKEET_API Engine {
 public:
     explicit Engine(const EngineOptions & opts);
     ~Engine();
@@ -442,8 +443,8 @@ public:
 
     const EngineOptions & options() const;
 
-    // "ctc", "tdt", or "sortformer", reflecting the parakeet.model.type
-    // metadata of the loaded GGUF.
+    // "ctc", "tdt", "eou", or "sortformer", reflecting the
+    // parakeet.model.type metadata of the loaded GGUF.
     std::string model_type() const;
 
     // Resolved compute device for this Engine's loaded model. CPU when
@@ -473,13 +474,13 @@ private:
 // Throws std::runtime_error if sortformer_engine is not a Sortformer
 // model or asr_engine is not a transcription model. Both engines must
 // be loaded at the same sample rate (typically 16 kHz).
-AttributedTranscriptionResult transcribe_with_speakers(
+QVAC_PARAKEET_API AttributedTranscriptionResult transcribe_with_speakers(
     Engine & sortformer_engine,
     Engine & asr_engine,
     const std::string & wav_path,
     const AttributedTranscriptionOptions & opts = {});
 
-AttributedTranscriptionResult transcribe_samples_with_speakers(
+QVAC_PARAKEET_API AttributedTranscriptionResult transcribe_samples_with_speakers(
     Engine & sortformer_engine,
     Engine & asr_engine,
     const float * samples,
@@ -489,7 +490,7 @@ AttributedTranscriptionResult transcribe_samples_with_speakers(
 
 // Backward-compatibility shim. The library's public namespace was
 // `qvac_parakeet::ctc` through v0.1.0-pre; it is now `qvac_parakeet`
-// because the same Engine handles CTC, TDT, and Sortformer GGUFs.
+// because the same Engine handles CTC, TDT, EOU and Sortformer GGUFs.
 // All names in `qvac_parakeet` are visible via the legacy
 // `qvac_parakeet::ctc::` qualifier so existing consumer code keeps
 // building. New code should use `qvac_parakeet::` directly.

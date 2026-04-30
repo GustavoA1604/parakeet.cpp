@@ -89,7 +89,10 @@ int main(int argc, char ** argv) {
     using namespace qvac_parakeet::ctc;
     std::fprintf(stderr, "[sf-parity] loading %s\n", gguf_path.c_str());
     ParakeetCtcModel model;
-    if (int rc = load_from_gguf(gguf_path, model, 0, 1, false); rc != 0) return 3;
+    // Force CPU encoder: this harness gates operator parity vs NeMo's FP32
+    // reference; backend-induced drift (CPU<->GPU) is gated separately by
+    // test-vk-vs-cpu and would otherwise mask real encoder regressions here.
+    if (int rc = load_from_gguf(gguf_path, model, 0, 0, false); rc != 0) return 3;
     if (model.model_type != ParakeetModelType::SORTFORMER) {
         std::fprintf(stderr, "  error: expected Sortformer model\n");
         return 3;

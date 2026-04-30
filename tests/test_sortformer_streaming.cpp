@@ -218,7 +218,7 @@ int run_basic(const std::string & gguf_path, const std::string & wav_path) {
 
 int main(int argc, char ** argv) {
     std::string gguf = "models/sortformer-4spk-v1.f16.gguf";
-    std::string wav  = "test/samples/two-speakers-16k.wav";
+    std::string wav  = "test/samples/diarization-sample-16k.wav";
     bool gguf_user = false;
     bool wav_user  = false;
     for (int i = 1; i < argc; ++i) {

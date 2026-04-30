@@ -2,7 +2,7 @@
 
 **Parakeet** (NVIDIA, CC-BY-4.0 FastConformer ASR family) ported to
 [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference on CPU
-and GPU (Metal / CUDA / Vulkan), with no runtime dependency on Python,
+and GPU (Metal / Vulkan / OpenCL), with no runtime dependency on Python,
 PyTorch, or onnxruntime. Ships CTC, TDT, EOU, and Sortformer engines
 under one `Engine` umbrella; EOU (FastConformer-RNN-T 120M with native
 `<EOU>` end-of-utterance token) is the most recently shipped engine.
@@ -17,7 +17,7 @@ Supported checkpoints:
 | `nvidia/parakeet-tdt-1.1b`    | TDT  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1225 MiB q8_0               | 0.027-0.079 | English only, lowest WER (no PnC) |
 | `nvidia/diar_sortformer_4spk-v1` | Sortformer head (diarization) | 80 | enc 512 × 18 + tf 192 × 18 | n/a (4 speakers) | ~123 M | 263 MiB f16 / 141 MiB q8_0 / 75 MiB q4_0 | 0.017-0.097 | Speaker diarization (up to 4 speakers, offline) |
 | `nvidia/diar_streaming_sortformer_4spk-v2` | Sortformer head (diarization) | 128 | enc 512 × 17 + tf 192 × 18 | n/a (4 speakers) | ~117 M | 251 MiB f16 / 134 MiB q8_0 / 72 MiB q4_0 | similar to v1 in offline mode | Speaker diarization, streaming-trained (offline + Phase 11.11.1 sliding-history live streaming today; full NeMo-style spkcache streaming in Phase 11.11.2) |
-| `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T (1L LSTM 640) + `<EOU>` token | 128 | 512 × 17 (chunked-limited att=[70,1] + causal subsampler + LN-in-conv) | 1027 (1024 BPE + `<EOU>` + `<EOB>` + blank) | 120 M | 246 MiB f16 / 132 MiB q8_0 | encoder out cosine 0.999997 vs NeMo offline; CPU-only today (GPU follow-up tracked) | English only, low-latency streaming ASR with native `<EOU>` end-of-utterance token detection (NeMo voice-agent target). NVIDIA Open Model License. Phase 12.5 ships offline + Mode 2 + rolling-encoder Mode 3 with offline-equivalent transcripts (Mode 2 byte-equal NeMo, Mode 3 within tolerance). Driving the streaming-trained weights through NeMo's chunked-limited `cache_aware_stream_step` was prototyped during the Phase 12.x exploration and rejected on quality grounds (~2× early-utterance WER, no `<EOU>` emitted) -- see PROGRESS.md §8.5 case (A). |
+| `nvidia/parakeet_realtime_eou_120m-v1` | RNN-T (1L LSTM 640) + `<EOU>` token | 128 | 512 × 17 (chunked-limited att=[70,1] + causal subsampler + LN-in-conv) | 1027 (1024 BPE + `<EOU>` + `<EOB>` + blank) | 120 M | 246 MiB f16 / 132 MiB q8_0 | encoder out cosine 0.999997 vs NeMo offline; encoder runs on the same GPU backend cascade as CTC/TDT/Sortformer (Metal / Vulkan / OpenCL), the LSTM + joint MLP decoder is CPU-only | English only, low-latency streaming ASR with native `<EOU>` end-of-utterance token detection (NeMo voice-agent target). NVIDIA Open Model License. Phase 12.5 ships offline + Mode 2 + rolling-encoder Mode 3 with offline-equivalent transcripts (Mode 2 byte-equal NeMo, Mode 3 within tolerance). Driving the streaming-trained weights through NeMo's chunked-limited `cache_aware_stream_step` was prototyped during the Phase 12.x exploration and rejected on quality grounds (~2× early-utterance WER, no `<EOU>` emitted) -- see PROGRESS.md §8.5 case (A). |
 
 Same converter, same encoder graph (with conv_norm_type / causal_downsampling /
 chunked_limited_attention / use_bias all toggled by GGUF metadata so the EOU
@@ -57,8 +57,8 @@ probe, missing GPU build, kernel-init failure):
 
 - `Engine::backend_device()` -> `BackendDevice::CPU` or `BackendDevice::GPU`.
 - `Engine::backend_name()`   -> human-readable name from
-  `ggml_backend_name()` (e.g. `"CUDA0"`, `"Metal"`, `"Vulkan0"`,
-  `"OpenCL"`, or `"CPU"`).
+  `ggml_backend_name()` (e.g. `"Metal"`, `"Vulkan0"`, `"OpenCL"`,
+  or `"CPU"`).
 
 Both reflect the post-fallback truth, not the
 `EngineOptions::n_gpu_layers` request, so consumers (Node addons,
@@ -131,7 +131,7 @@ git clone <this-repo> parakeet.cpp
 cd parakeet.cpp
 
 # Clone ggml at the pinned commit. The same pin is used for every
-# backend (CPU, Metal, CUDA, Vulkan); no engine- or backend-specific
+# backend (CPU, Metal, Vulkan, OpenCL); no engine- or backend-specific
 # ggml patches are applied today.
 ./scripts/setup-ggml.sh
 
@@ -140,26 +140,24 @@ cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 ```
 
 For a GPU backend pick **one** of Metal (Apple Silicon, **~2.5x faster
-than CPU**), CUDA (NVIDIA), Vulkan (most other desktops), or OpenCL
-(Android Adreno target) at configure time. The init order at runtime
-is `CUDA -> Metal -> Vulkan -> OpenCL -> CPU`, so a single binary
-built with multiple backends compiled in will use the first available
-one and there is no runtime backend switch -- the expectation is one
-backend per build. The `OpenCL` slot is the most recently shipped
-backend and is primarily for **Android Adreno**
-deployments (Snapdragon 7+ / 8 series); see [`patches/README.md`](patches/README.md)
-for the small ggml-opencl patch parakeet ships and how it relates to
-the Adreno-only upstream design.
+than CPU**), Vulkan (most desktops), or OpenCL (Android Adreno target)
+at configure time. A single binary built with multiple backends
+compiled in will use the first available one and there is no runtime
+backend switch -- the expectation is one backend per build. The
+`OpenCL` slot is the most recently shipped backend and is primarily
+for **Android Adreno** deployments (Snapdragon 7+ / 8 series); see
+[`patches/README.md`](patches/README.md) for the small ggml-opencl
+patch parakeet ships and how it relates to the Adreno-only upstream
+design.
 
 ```bash
 # Apple Silicon:
 cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release \
     -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON
-# NVIDIA:   -DGGML_CUDA=ON
-# Generic:  -DGGML_VULKAN=ON
+# Generic desktop:  -DGGML_VULKAN=ON
 # Android Adreno production build (cross-compile via NDK; OpenCL ICD
 # loader and headers come from the Android NDK / Snapdragon toolchain):
-#           -DGGML_OPENCL=ON
+#                   -DGGML_OPENCL=ON
 # OpenCL on a non-Adreno desktop (NVIDIA / AMD / Apple iGPU) for dev /
 # CI parity testing only -- Adreno-tuned matmul kernels off, generic
 # OpenCL paths only:
@@ -172,14 +170,13 @@ cmake --build build-metal -j$(sysctl -n hw.ncpu)
 # is not implemented (encoder is small enough to fit on one device).
 ./build-metal/qvac-parakeet \
     --n-gpu-layers 1 \
-    --model models/parakeet-ctc-0.6b.gguf \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --wav   test/samples/jfk.wav
 ```
 
-(Use a quantised GGUF -- e.g. `parakeet-ctc-0.6b.q8_0.gguf` --
-produced via `--quant q8_0` in the converter snippet under §2 if you
-want the smaller / faster file. The bare `.gguf` is f16 and works
-the same.)
+(`q8_0` is the converter default and the recommended tier for
+production. Pass `--quant f16` in §2 for the bit-equal floating-point
+baseline; `--quant q4_0` for the smallest tier.)
 
 This produces the main binary plus per-stage validation harnesses:
 
@@ -219,9 +216,9 @@ This produces the main binary plus per-stage validation harnesses:
   `-DQVAC_PARAKEET_GGML_LIB_PREFIX=OFF` to keep upstream filenames
   (e.g. when you want a single shared `libggml.so` consumed by every
   in-process addon).
-- `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON` /
-  `-DGGML_OPENCL=ON`: pick exactly one GPU backend at configure time
-  (see GPU note above). For OpenCL on non-Adreno hardware also pass
+- `-DGGML_METAL=ON` / `-DGGML_VULKAN=ON` / `-DGGML_OPENCL=ON`: pick
+  exactly one GPU backend at configure time (see GPU note above).
+  For OpenCL on non-Adreno hardware also pass
   `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF` and ensure
   `scripts/setup-ggml.sh` has applied
   `patches/ggml-opencl-allow-non-adreno.patch` -- both are no-ops
@@ -230,44 +227,43 @@ This produces the main binary plus per-stage validation harnesses:
 ## 2. One-time: convert weights
 
 The converter (`scripts/convert-nemo-to-gguf.py` -- name is
-historical; it auto-detects CTC, TDT and Sortformer from the .nemo
-config and writes the right GGUF in each case) takes a `.nemo` archive
-and produces a single self-contained GGUF (encoder + decoder weights +
-embedded tokenizer where applicable + precomputed mel filterbank).
+historical; it auto-detects CTC, TDT, EOU and Sortformer from the
+.nemo config and writes the right GGUF in each case) takes a `.nemo`
+archive and produces a single self-contained GGUF (encoder + decoder
+weights + embedded tokenizer where applicable + precomputed mel
+filterbank).
 
 ```bash
 python -m venv venv && . venv/bin/activate
 pip install "nemo_toolkit[asr]" gguf numpy soundfile librosa sentencepiece
 
 # Parakeet-CTC 0.6B / 1.1B (English, fast)
+# `--quant q8_0` is the default; pass `--quant f16` for the bit-equal
+# floating-point baseline (2x larger).
 python scripts/convert-nemo-to-gguf.py \
   --ckpt models/parakeet-ctc-0.6b.nemo \
-  --out  models/parakeet-ctc-0.6b.gguf
+  --out  models/parakeet-ctc-0.6b.q8_0.gguf
 
 python scripts/convert-nemo-to-gguf.py \
   --ckpt models/parakeet-ctc-1.1b.nemo \
-  --out  models/parakeet-ctc-1.1b.q8_0.gguf \
-  --quant q8_0
+  --out  models/parakeet-ctc-1.1b.q8_0.gguf
 
 # Parakeet-TDT 0.6B-v3 / 1.1B (multilingual, punctuation, capitalisation)
 python scripts/convert-nemo-to-gguf.py \
   --ckpt    models/parakeet-tdt-0.6b-v3.nemo \
   --hf-repo nvidia/parakeet-tdt-0.6b-v3 \
-  --out     models/parakeet-tdt-0.6b-v3.q8_0.gguf \
-  --quant   q8_0
+  --out     models/parakeet-tdt-0.6b-v3.q8_0.gguf
 
 python scripts/convert-nemo-to-gguf.py \
   --ckpt    models/parakeet-tdt-1.1b.nemo \
   --hf-repo nvidia/parakeet-tdt-1.1b \
-  --out     models/parakeet-tdt-1.1b.q8_0.gguf \
-  --quant   q8_0
+  --out     models/parakeet-tdt-1.1b.q8_0.gguf
 
 # Parakeet-EOU 120M (English, real-time streaming + native <EOU> end-of-utterance token)
 python scripts/convert-nemo-to-gguf.py \
   --ckpt    models/parakeet_realtime_eou_120m-v1.nemo \
   --hf-repo nvidia/parakeet_realtime_eou_120m-v1 \
-  --out     models/parakeet-eou-120m-v1.q8_0.gguf \
-  --quant   q8_0
+  --out     models/parakeet-eou-120m-v1.q8_0.gguf
 
 # Sortformer 4-speaker diarization (offline v1, streaming-trained v2)
 python scripts/convert-nemo-to-gguf.py \
@@ -287,8 +283,7 @@ so when `--ckpt` points at a non-CTC path that does not exist locally
 download the CTC checkpoint instead of the one named in `--ckpt`.
 
 `scripts/download-all-models.sh` pre-fetches every supported `.nemo`
-(plus the corresponding ONNX bundles for the Node binding) -- handy
-when you're about to be on a flaky network.
+in one shot -- handy when you're about to be on a flaky network.
 
 ### Quantization tiers
 
@@ -397,7 +392,7 @@ compute-bound on shader units.
 
 ```bash
 ./build/qvac-parakeet \
-    --model models/parakeet-ctc-0.6b.gguf \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --wav   test/samples/jfk.wav
 ```
 
@@ -418,7 +413,7 @@ warning, and a mismatched rate fails fast (resampling is not yet wired):
 
 ```bash
 ./build/qvac-parakeet \
-    --model models/parakeet-ctc-0.6b.gguf \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --pcm-in recording.raw \
     --pcm-format s16le \   # or f32le; defaults to s16le
     --pcm-rate   16000     # required for fail-fast; warning + fallback if omitted
@@ -426,8 +421,7 @@ warning, and a mismatched rate fails fast (resampling is not yet wired):
 
 ### Streaming — Mode 2 (full audio in, segments streamed out)
 
-The engine exposes three transcription entry points that mirror the qvac
-SDK's `transcribe` / `transcribeStream` API:
+The engine exposes three transcription entry points:
 
 | Entry point | Caller provides | Caller receives | Status |
 |-|-|-|-|
@@ -439,7 +433,9 @@ Mode 2 runs the offline encoder once, then walks the encoder frames in
 `chunk_ms`-sized windows. For CTC GGUFs it runs `ctc_greedy_decode_window`
 per window and the concatenated transcript is **byte-equal** to the
 non-streaming path -- `test-streaming` asserts this across chunk sizes
-{250, 500, 1000, 2000, 4000, 11000} ms on every run. For TDT GGUFs it
+{250, 500, 1000, 2000, 4000, full-clip-duration} ms on every run (the
+trailing entry is the input wav's duration in ms, so on the default
+`jfk.wav` fixture that's 11000 ms). For TDT GGUFs it
 carries `TdtDecodeState` (LSTM hidden + last token) across windows; the
 non-streaming WER is preserved within `test-streaming`'s tolerance band
 (40% at the most aggressive `chunk=1000 left=2000 right=500` config,
@@ -451,7 +447,7 @@ From the CLI:
 
 ```bash
 ./build/qvac-parakeet \
-    --model models/parakeet-ctc-0.6b.gguf \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --pcm-in recording.raw --pcm-format s16le \
     --stream --stream-chunk-ms 1000 \
     --emit text         # or jsonl
@@ -497,7 +493,7 @@ From the CLI (simulates a live producer feeding the same wav in blocks):
 
 ```bash
 ./build/qvac-parakeet \
-    --model models/parakeet-ctc-0.6b.gguf \
+    --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --pcm-in recording.raw --pcm-format s16le \
     --stream --stream-duplex \
     --stream-chunk-ms          2000 \
@@ -527,10 +523,6 @@ window. A KV-cache + conv-state optimisation (Phase 8.5) will roughly
 accuracy; the `StreamSession` public API already supports it as a
 drop-in swap.
 
-The Node binding at [qvac-lib-infer-parakeet](https://github.com/qvac/qvac-lib-infer-parakeet)
-is the intended consumer for `StreamSession`; check its README for
-the `parakeet.cpp` version it currently links against.
-
 ### Streaming — EOU (`<EOU>` end-of-utterance token)
 
 EOU GGUFs flow through the same Mode 1 / Mode 2 / Mode 3 entry points
@@ -550,10 +542,10 @@ struct StreamingSegment {
 
 The decoder threads its own LSTM h/c state across chunks; on `<EOU>`
 it flushes the current segment to text, zeros h/c, and re-primes the
-predictor with the blank embedding -- exactly matching the binding's
-`processEOU` semantics from `qvac-lib-infer-parakeet`. The token is
-not in the visible vocab piece list, so it doesn't appear in
-`segment.text`; consumers see the `is_eou_boundary` flag instead.
+predictor with the blank embedding -- the same reset sequence NeMo's
+RNN-T decoder runs at the boundary. The token is not in the visible
+vocab piece list, so it doesn't appear in `segment.text`; consumers
+see the `is_eou_boundary` flag instead.
 
 CLI examples on `jfk.wav` (the JFK quote ends naturally with one
 `<EOU>` boundary at the very end):
@@ -798,6 +790,74 @@ Sortformer" applies to the speaker IDs the attribution layer sees.
 
 ## 4. Optional: validate against NeMo PyTorch
 
+### Quickstart: `ctest`
+
+The simplest path is to let `ctest` drive the per-stage harnesses listed
+in §1's binary table. Every test executable is registered at configure
+time with the right model + wav (+ `.npy`-reference) arguments and a
+`REQUIRES` list of fixture paths; tests whose fixtures aren't present
+are auto-disabled (reported as "Not Run" rather than failed) so a fresh
+checkout still gives a green run on the harnesses that don't need
+NeMo-dumped references.
+
+```bash
+# 1. Convert checkpoints (§2). For the parity harnesses you also need
+#    f16 GGUFs alongside the q8_0 production fixtures -- the per-stage
+#    parity gates are calibrated against NeMo's FP32 reference and q8_0
+#    quantization noise swamps them:
+python scripts/convert-nemo-to-gguf.py \
+    --ckpt models/parakeet-ctc-0.6b.nemo \
+    --out  models/parakeet-ctc-0.6b.f16.gguf  --quant f16
+python scripts/convert-nemo-to-gguf.py \
+    --ckpt models/parakeet-tdt-0.6b-v3.nemo \
+    --out  models/parakeet-tdt-0.6b-v3.f16.gguf --quant f16
+python scripts/convert-nemo-to-gguf.py \
+    --ckpt models/diar_sortformer_4spk-v1.nemo \
+    --out  models/diar_sortformer_4spk-v1.f16.gguf --quant f16
+
+# 2. Dump NeMo references (one-time, requires the venv from §2):
+python scripts/dump-ctc-reference.py        --wav test/samples/jfk.wav
+python scripts/dump-block0-substages.py     --gguf models/parakeet-ctc-0.6b.f16.gguf
+python scripts/dump-tdt-reference.py        --wav test/samples/jfk.wav
+python scripts/dump-eou-reference.py        --wav test/samples/jfk.wav
+python scripts/dump-sortformer-reference.py --wav test/samples/diarization-sample-16k.wav
+
+# 3. Configure + build + ctest:
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+On a clean run with the dumps in place every test is green
+(`100% tests passed, 0 tests failed out of 11` on a CPU-only build,
+`out of 12` once Vulkan is enabled — the extra slot is `test-vk-vs-cpu`).
+Skip the dump step and the per-stage parity harnesses (`test-mel`,
+`test-encoder`, `test-ctc`, `test-tdt-encoder-parity`,
+`test-sortformer-parity`) auto-disable; the streaming /
+encoder-capture / perf / unit / GPU-parity tests still run because
+they only need a GGUF + WAV.
+
+CTest labels (`unit`, `fixture`, `perf`, `gpu`) let CI fleets carve out
+subsets, e.g. `ctest -L unit` for the no-fixture pure unit tests or
+`ctest -L gpu` to run only `test-vk-vs-cpu` on a Vulkan-enabled build.
+
+The fixture roots are CMake cache vars so prebuilt mirrors can drop in:
+
+| Variable | Default | Holds |
+|----------|---------|-------|
+| `QVAC_PARAKEET_TEST_MODEL_DIR` | `${CMAKE_SOURCE_DIR}/models`       | `*.gguf` checkpoints |
+| `QVAC_PARAKEET_TEST_AUDIO_DIR` | `${CMAKE_SOURCE_DIR}/test/samples` | `*.wav` fixtures |
+| `QVAC_PARAKEET_TEST_REF_DIR`   | `${CMAKE_SOURCE_DIR}/artifacts`    | NeMo `.npy` dumps (`{ctc,tdt,eou,sortformer}-ref/`) |
+
+Override at configure time, e.g.
+`-DQVAC_PARAKEET_TEST_MODEL_DIR=/srv/parakeet/models`.
+
+### Per-stage parity, manual
+
+If you'd rather drive the harnesses directly (e.g. to pass custom
+tolerances such as `--enc-rel-tol 3e-2` for `test-sortformer-parity`
+on a `q8_0` GGUF), the per-engine flows are:
+
 CTC parity (mel + encoder + greedy decode):
 
 ```bash
@@ -805,9 +865,9 @@ python scripts/dump-ctc-reference.py \
     --wav test/samples/jfk.wav \
     --out artifacts/ctc-ref
 
-./build/test-mel     models/parakeet-ctc-0.6b.gguf test/samples/jfk.wav artifacts/ctc-ref/mel.npy
-./build/test-encoder models/parakeet-ctc-0.6b.gguf artifacts/ctc-ref
-./build/test-ctc     models/parakeet-ctc-0.6b.gguf artifacts/ctc-ref/logits.npy
+./build/test-mel     models/parakeet-ctc-0.6b.q8_0.gguf test/samples/jfk.wav artifacts/ctc-ref/mel.npy
+./build/test-encoder models/parakeet-ctc-0.6b.q8_0.gguf artifacts/ctc-ref
+./build/test-ctc     models/parakeet-ctc-0.6b.q8_0.gguf artifacts/ctc-ref/logits.npy
 ```
 
 TDT parity (encoder per-stage; the decoder is checked end-to-end via
@@ -826,11 +886,11 @@ Sortformer parity (mel + encoder + speaker-prob head):
 
 ```bash
 python scripts/dump-sortformer-reference.py \
-    --wav  test/samples/two-speakers-16k.wav \
+    --wav  test/samples/diarization-sample-16k.wav \
     --out  artifacts/sortformer-ref
 
 ./build/test-sortformer-parity \
-    models/sortformer-4spk-v1.f16.gguf test/samples/two-speakers-16k.wav artifacts/sortformer-ref
+    models/sortformer-4spk-v1.f16.gguf test/samples/diarization-sample-16k.wav artifacts/sortformer-ref
 ```
 
 EOU parity (mel + encoder + offline + Mode 2 / Mode 3 streaming).
@@ -861,7 +921,7 @@ Sortformer):
     --model models/parakeet-eou-120m-v1.q8_0.gguf --wav test/samples/jfk.wav
 
 ./build/test-sortformer-streaming \
-    --model models/sortformer-4spk-v1.f16.gguf --wav test/samples/two-speakers-16k.wav
+    --model models/sortformer-4spk-v1.f16.gguf --wav test/samples/diarization-sample-16k.wav
 ```
 
 Expected per-stage rel error (NeMo PyTorch vs C++ at `--quant f16`):
@@ -882,7 +942,7 @@ Vulkan backend parity (build with `-DGGML_VULKAN=ON`):
 
 ```bash
 ./build/test-vk-vs-cpu \
-    models/parakeet-ctc-0.6b.gguf test/samples/jfk.wav
+    models/parakeet-ctc-0.6b.q8_0.gguf test/samples/jfk.wav
 ```
 
 Expected: 9/9 stages PASS with rel < 5e-2 (typical rel ~2e-3 on
@@ -994,12 +1054,10 @@ has the full round-by-round journal):
   (rel < 2 %, tol 5 %). New `test-vk-vs-cpu` regression harness with
   assertions.
 
-Next: vcpkg port for `parakeet.cpp` + the
-`qvac-lib-infer-parakeet` binding swap to consume this library
-instead of onnxruntime; Accelerate BLAS for the TDT/EOU decoder's
-LSTM + joint gemvs and Sortformer's transformer attention;
-`CONV_2D_DW` on Metal (upstream ggml contribution); Metal
-flash-attn; Phase 11.11.2 Sortformer streaming (NeMo-style spkcache).
+Next: Accelerate BLAS for the TDT/EOU decoder's LSTM + joint gemvs
+and Sortformer's transformer attention; `CONV_2D_DW` on Metal
+(upstream ggml contribution); Metal flash-attn; Phase 11.11.2
+Sortformer streaming (NeMo-style spkcache).
 
 ## Repository layout
 
@@ -1024,7 +1082,8 @@ parakeet.cpp/
     parakeet_eou.{h,cpp}         EOU decoder: 1-layer LSTM prediction + joint MLP
                                    + transducer greedy decode with `<EOU>` token
                                    reset semantics (segment flush + h/c zeroing).
-                                   CPU only today.
+                                   CPU-only today; the encoder reuses the shared
+                                   FastConformer GPU graph in parakeet_ctc.cpp.
     parakeet_sortformer.{h,cpp}  Sortformer diarization: encoder_proj + 18-layer
                                    Transformer encoder + ReLU MLP + sigmoid head + segmenter
     parakeet_engine.cpp          Engine + StreamSession + SortformerStreamSession
@@ -1034,7 +1093,6 @@ parakeet.cpp/
                                    (skipped on EOU GGUFs that set normalize=NA)
     sentencepiece_bpe.{h,cpp}    SentencePiece BPE detokenizer (CTC + TDT + EOU)
     dr_wav.h                     vendored single-header WAV reader
-    npy.h                        minimal .npy load / save + compare
     test_*.cpp                   per-stage numerical-parity harnesses that live
                                    alongside implementation (mel-fft-parity,
                                    encoder-capture-parity, perf-regression)
@@ -1072,11 +1130,11 @@ parakeet.cpp/
     ref-encoder-from-gguf.py     run the GGUF encoder in PyTorch as a parity oracle
     streaming-reference.py       reference per-chunk outputs for streaming validation
     verify-gguf-roundtrip.py     load a GGUF and assert all expected tensors are present
-    quantize-ctc-onnx-int8.py    int8-quantize an ONNX CTC export (for the Node binding)
-    download-all-models.sh       pre-fetch every supported .nemo (and ONNX bundle)
+    download-all-models.sh       pre-fetch every supported .nemo
     transcribe.sh                wav -> text wrapper
   cmake/                         CMake package config (for vcpkg follow-up)
-  test/samples/                  fixture wavs (jfk.wav, sample-16k.wav)
+  test/samples/                  fixture wavs (jfk.wav, sample-16k.wav,
+                                   diarization-sample-16k.wav)
   artifacts/                     dumped reference tensors (.npy) per engine; not tracked
   models/                        downloaded .nemo + converted .gguf checkpoints; not tracked
   PROGRESS.md                    chronological development journal

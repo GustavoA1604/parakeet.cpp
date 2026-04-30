@@ -1,4 +1,5 @@
 #include "parakeet_sortformer.h"
+#include "parakeet_log.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -159,8 +160,8 @@ int sortformer_prepare_runtime(const ParakeetCtcModel & model, SortformerRuntime
     W.tf_n_layers = model.encoder_cfg.sortformer_tf_n_layers;
     W.num_spks    = model.encoder_cfg.sortformer_num_spks;
     if (W.tf_n_heads <= 0 || W.tf_d % W.tf_n_heads != 0) {
-        std::fprintf(stderr, "sortformer_prepare_runtime: tf_d_model %d not divisible by n_heads %d\n",
-                     W.tf_d, W.tf_n_heads);
+        PARAKEET_LOG_ERROR("sortformer_prepare_runtime: tf_d_model %d not divisible by n_heads %d\n",
+                           W.tf_d, W.tf_n_heads);
         return 1;
     }
     W.head_dim = W.tf_d / W.tf_n_heads;
@@ -198,7 +199,7 @@ int sortformer_diarize(const ParakeetCtcModel & model,
                        const SortformerDiarizationOptions & opts,
                        SortformerDiarizationResult & out) {
     if (D_enc != W.D_enc) {
-        std::fprintf(stderr, "sortformer_diarize: encoder D mismatch %d vs %d\n", D_enc, W.D_enc);
+        PARAKEET_LOG_ERROR("sortformer_diarize: encoder D mismatch %d vs %d\n", D_enc, W.D_enc);
         return 1;
     }
     if (T_enc <= 0) {

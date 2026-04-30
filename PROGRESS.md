@@ -13,8 +13,7 @@ threshold.
   drop-in).
 - Added `scripts/setup-ggml.sh` pinned to the upstream ggml commit
   (`58c38058`).
-- Vendored `dr_wav.h` + `npy.h` for wav I/O and reference-tensor
-  compare.
+- Vendored `dr_wav.h` for wav I/O.
 - Public headers under `include/qvac-parakeet/` expose
   `qvac_parakeet_cli_main`, `qvac_parakeet::ctc::Engine`, and the
   one-shot `transcribe_wav` API. _(Post-v0.1.0-pre audit, the public
@@ -213,9 +212,7 @@ stats) without shelling out to `time`.
 - `--bench-json PATH`             dump structured JSON for comparing
                                   across runs or backends (ggml-cpu,
                                   ggml-metal, and onnxruntime are all
-                                  in scope; onnxruntime numbers come
-                                  from the qvac-lib-infer-parakeet
-                                  Node binding's bench harness)
+                                  in scope)
 
 Per-stage stats include mean / median / min / max / stdev for mel,
 encoder, decode, and total inference; the summary line highlights
@@ -972,12 +969,12 @@ is historical context.)
 
 ## Phase 7 — streaming entry points (Mode 2)  _(done)_
 
-Scope: ship a platform-agnostic streaming API surface on `Engine` that
-mirrors the three qvac/packages/sdk transcription shapes (one-shot,
-streamed-output, duplex). Mode 2 (streamed-output) is implemented on
-top of today's offline encoder; Mode 3 (duplex) has its header +
-binding-facing API frozen but errors at runtime until Phase 8 delivers
-a cache-aware streaming GGUF.
+Scope: ship a platform-agnostic streaming API surface on `Engine`
+shaped around three transcription modes (one-shot, streamed-output,
+duplex). Mode 2 (streamed-output) is implemented on top of today's
+offline encoder; Mode 3 (duplex) has its header + ABI surface frozen
+but errors at runtime until Phase 8 delivers a cache-aware streaming
+GGUF.
 
 Design rationale is in the plan's scope discussion: chunked-batch on
 the offline encoder was explicitly rejected because it costs 1-3 % WER
@@ -1053,11 +1050,10 @@ themselves.
 `parakeet.encoder.streaming.enabled` GGUF key, added to
 `load_from_gguf`). Today's GGUFs don't set the flag, so the call
 throws `std::runtime_error` with a message pointing at Phase 8 and
-suggesting `transcribe_stream()` for full-audio cases. The
-`qvac-lib-infer-parakeet` binding can be wired against the final
-`StreamSession` shape immediately; when Phase 8 lands the error
-branch is swapped for the real state machine without touching the
-public header.
+suggesting `transcribe_stream()` for full-audio cases. Consumers
+can target the final `StreamSession` shape immediately; when Phase
+8 lands the error branch is swapped for the real state machine
+without touching the public header.
 
 **Update**: §8.2 removed this gate entirely. `stream_start()` now
 runs cache-aware streaming inference directly on the existing offline
@@ -1103,8 +1099,8 @@ CLI byte-equality.
 
 ### 7.7 — Real-world validation
 
-`LastQuestion_long_EN.raw` (5.46 min, 16 kHz s16le mono,
-`qvac/packages/qvac-lib-infer-whispercpp/examples/samples/`):
+`LastQuestion_long_EN.raw` (5.46 min, 16 kHz s16le mono;
+external long-form fixture, not tracked in this repo):
 
 - offline `--model ... --pcm-in ...` transcript: 5169 bytes, 1710
   tokens, 4099 encoder frames.
@@ -1118,23 +1114,24 @@ CLI byte-equality.
   first chunk lands at `start=0.000 end=0.480` with the first word
   `"but"`.
 
-### 7.8 — Phase 8 design notes (not yet implemented)
+### 7.8 — Phase 8 design notes (historical; superseded by Phase 8 below)
 
-Phase 8 will deliver Mode 3 functional: live duplex streaming where
-the caller pushes PCM over time via `StreamSession::feed_pcm_*` and
-receives partial-then-final segments as chunks close.
+This section captures the original Phase 8 scoping notes from before
+Mode 3 shipped. Phase 8 (the next section) records the actual
+implementation; the rolling-encoder design that landed differs from
+the cache-aware streaming-checkpoint plan sketched here. Kept for
+the round-by-round journal trail.
 
-Prerequisites and scope tracked for Phase 8:
+Prerequisites and scope tracked for Phase 8 (as planned at the time):
 
 1. **Checkpoint selection (go/no-go gate).** Evaluate candidate NeMo
    cache-aware streaming checkpoints against Parakeet-CTC-0.6B on the
    repo's reference clips. Primary candidate:
    `stt_en_fastconformer_hybrid_large_streaming_multi`. Accept only
    if WER on reference set is within ±0.5 % of current offline.
-2. **New converter** `scripts/convert-parakeet-streaming-to-gguf.py`,
-   scoped similarly to `convert-nemo-to-gguf.py`. Sets the
-   `parakeet.encoder.streaming.enabled = true` metadata flag that
-   `stream_start()` already probes.
+2. **New converter** scoped similarly to `convert-nemo-to-gguf.py`,
+   to set the `parakeet.encoder.streaming.enabled = true` metadata flag
+   that `stream_start()` already probes.
 3. **Streaming encoder graph**: per-layer attention KV cache tensors
    (left-context), depthwise-conv left-state tensors, chunked +
    left-context attention mask, streaming mel state (reflect-pad only
@@ -1162,11 +1159,9 @@ Prerequisites and scope tracked for Phase 8:
 
 The NeMo registry has only one cache-aware streaming Conformer family:
 `stt_en_fastconformer_hybrid_large_streaming_{multi,80ms,480ms,1040ms}`.
-Same family powers `qvac/packages/qvac-lib-infer-parakeet`'s `'eou'`
-modelType today. It's a 115M-parameter, RNN-T+aux_CTC hybrid trained
-with chunked-limited attention. Real-world quality is not great
-(~2x WER vs Parakeet-CTC-0.6B offline) — the user's existing
-production has confirmed this.
+It's a 115M-parameter, RNN-T+aux_CTC hybrid trained with chunked-limited
+attention. Real-world quality on this family is not great (~2x WER vs
+Parakeet-CTC-0.6B offline).
 
 So Phase 8 is **not** going to ship a port of streaming_multi. Instead,
 the chosen approach is **cache-aware *inference* on the existing
@@ -1342,12 +1337,10 @@ both times on quality grounds.**
 
 - **Round 1 — Phase 8.0** evaluated
   `stt_en_fastconformer_hybrid_large_streaming_multi`, the only
-  NeMo cache-aware streaming Conformer family available at the time
-  and the same family that powers `qvac-lib-infer-parakeet`'s
-  legacy `'eou'` modelType. Real-world quality landed at ~2× WER
-  vs `parakeet-ctc-0.6b` offline (the user's own production
-  confirmed this). Phase 8 therefore chose the rolling-encoder
-  Mode 3 design instead.
+  NeMo cache-aware streaming Conformer family available at the time.
+  Real-world quality landed at ~2× WER vs `parakeet-ctc-0.6b`
+  offline. Phase 8 therefore chose the rolling-encoder Mode 3
+  design instead.
 - **Round 2 — Phase 12.x exploration** ported
   `nvidia/parakeet_realtime_eou_120m-v1` (same model family, newer
   120 M variant) as the EOU engine in Phase 12.5 on the rolling-
@@ -1597,7 +1590,8 @@ with proper nouns (Multivac / Adele / Lupov / Pluto), commas,
 periods, dialog structure. `RTF=0.050` (20× real-time), 1825 tokens,
 1472 ms pure-CPU decode.
 
-**Multilingual sanity** (qvac-lib-infer-whispercpp sample_*.raw):
+**Multilingual sanity** (external `sample_*.raw` clips, not tracked
+in this repo):
 
 - Spanish: *"Se recomienda enfáticamente a los viajeros..."*
 - French:  *"L'accident a eu lieu en terrain montagneux..."*
@@ -2094,14 +2088,15 @@ Trade-offs (vs the planned full Phase 11.11.2 NeMo-style streaming):
   once the history covers the full session.
 - **Con**: each chunk re-runs the full encoder over the trailing
   `history_ms` of audio. Measured RTF ~0.25 on M4 Air CPU at
-  `chunk_ms=2000 history_ms=30000` for the 22 s `two-speakers-16k.wav`
-  sample (5.5 s wall for 22 s of audio). Phase 11.11.2's `spkcache`
-  approach will fix this.
+  `chunk_ms=2000 history_ms=30000` for the 22 s
+  `diarization-sample-16k.wav` sample (5.5 s wall for 22 s of audio).
+  Phase 11.11.2's `spkcache` approach will fix this.
 - **Con**: speaker IDs in the *very first* chunks may be arbitrary
   before the history window contains both speakers. Verified on
-  `two-speakers-16k.wav`: chunk 1 mislabels speaker_0 as speaker_1 at
-  `[2.00-4.00]`; chunks 2-10 align with the offline reference
-  (`speaker_0` for [1.84-10.00], `speaker_1` for [13.36-21.04]).
+  `diarization-sample-16k.wav`: chunk 1 mislabels speaker_0 as
+  speaker_1 at `[2.00-4.00]`; chunks 2-10 align with the offline
+  reference (`speaker_0` for [1.84-10.00], `speaker_1` for
+  [13.36-21.04]).
 
 CLI:
 
@@ -2161,7 +2156,7 @@ the multi-speaker sample in random burst sizes (1-5000 samples per
   `(speaker_id, start_s, end_s)`,
 - `cancel()` on a half-fed session is idempotent.
 
-Verified end-to-end on `two-speakers-16k.wav`:
+Verified end-to-end on `diarization-sample-16k.wav`:
 ```
 offline:  [1.84-10.00] speaker_0  [13.36-21.04] speaker_1
 streaming (chunk=2000, history=30000):
@@ -2245,24 +2240,21 @@ f16 with negligible quality impact); use q4_0 when memory is tight
 probabilities but identical thresholded segments on shipping
 fixtures).
 
-## Phase 12 — EOU end-of-utterance streaming ASR  _(in progress; 12.0 + 12.1 shipped)_
+## Phase 12 — EOU end-of-utterance streaming ASR  _(done)_
 
 ### Phase 12.0 — scope, model selection, API target  _(done)_
 
-The `qvac-lib-infer-parakeet` Node binding exposes four `modelType`
-flavours today: `tdt`, `ctc`, `eou`, `sortformer`. The first three +
-the fourth are all served via onnxruntime; this repo already provides
-ggml backends for `tdt` / `ctc` / `sortformer`. Phase 12 closes the
-loop on `eou` so the binding can swap its onnxruntime backend out for
-a single pure-ggml dependency.
+This repo already provides ggml backends for `tdt` / `ctc` /
+`sortformer`. Phase 12 closes the loop on `eou` so the four
+families that ship under one `Engine` umbrella all run on a
+single pure-ggml dependency.
 
-**Checkpoint.** The community ONNX bundle the binding ships
-(`altunenes/parakeet-rs/realtime_eou_120m-v1-onnx`) is a third-party
-re-export of NVIDIA's official **`nvidia/parakeet_realtime_eou_120m-v1`**
-NeMo `.nemo` checkpoint (NVIDIA Open Model License). Exposing the same
-NeMo source lets us reuse the exact pattern the CTC / TDT / Sortformer
-ports already followed: `.nemo` -> GGUF via `convert-nemo-to-gguf.py`,
-NeMo PyTorch as the parity oracle (no onnxruntime in the dev loop).
+**Checkpoint.** NVIDIA's official
+**`nvidia/parakeet_realtime_eou_120m-v1`** NeMo `.nemo` archive
+(NVIDIA Open Model License). Sourcing the `.nemo` directly lets us
+reuse the exact pattern the CTC / TDT / Sortformer ports already
+followed: `.nemo` -> GGUF via `convert-nemo-to-gguf.py`, NeMo
+PyTorch as the parity oracle.
 
 **Architecture summary** (from `model_config.yaml` + state-dict probe):
 
@@ -2336,16 +2328,19 @@ to land the `EouStreamSession` callback signature with
 - 12.0 plan + scope (this section). _(done)_
 - 12.1 converter + Python reference + GGUF roundtrip. _(done; see
   §12.1 below)_
-- 12.2 EOU GGUF loader + Engine routing.
+- 12.2 EOU GGUF loader + Engine routing. _(done)_
 - 12.3 cache-aware FastConformer encoder graph (LN-in-conv,
-  chunked-limited attention mask, KV + conv state).
+  chunked-limited attention mask, KV + conv state). _(done; KV +
+  conv state path was prototyped and rejected on quality grounds,
+  see §8.5 case (A); LN-in-conv + chunked-limited mask shipped.)_
 - 12.4 RNN-T decoder (1-layer LSTM 640 + joint MLP) with `<EOU>`
-  reset semantics.
-- 12.5 `EouStreamSession` push API (callback shape ready for
-  Phase 13 events).
-- 12.6 CLI auto-routing + `live-mic` auto-detection.
-- 12.7 parity harness (`test-eou-parity` vs `dump-eou-reference.py`)
-  and end-to-end transcript check (`test-eou-streaming` on jfk.wav).
+  reset semantics. _(done)_
+- 12.5 streaming push API (Modes 2 + 3) with callback shape ready
+  for Phase 13 events. _(done; the callback hangs off the existing
+  `StreamSession` rather than a new `EouStreamSession`.)_
+- 12.6 CLI auto-routing + `live-mic` auto-detection. _(done)_
+- 12.7 end-to-end parity harness (`test-eou-streaming` on jfk.wav,
+  driven by `dump-eou-reference.py`). _(done)_
 
 ### Phase 12.1 — converter + Python reference  _(done)_
 
@@ -2639,7 +2634,7 @@ through `StreamSession`, so `live-mic --model
 models/parakeet-eou-120m-v1.q8_0.gguf` works out of the box -- no
 new auto-detection logic was required.
 
-`test-eou-streaming` (new, `src/test_eou_streaming.cpp`) asserts:
+`test-eou-streaming` (new, `tests/test_eou_streaming.cpp`) asserts:
 
 - Mode 2 concatenated text **byte-equal** to the offline
   `Engine::transcribe()` reference;
@@ -2723,9 +2718,8 @@ state transitions and end-of-turn boundaries. Phase 13 lands a
 small public `StreamEvent` surface that streaming sessions can
 emit alongside the existing per-segment callbacks. The shape is
 explicitly designed to be the same as what whisper.cpp's
-streaming API will eventually emit, so consumers (notably the
-`qvac-lib-infer-parakeet` binding) can write engine-agnostic event
-handling once.
+streaming API will eventually emit, so consumers can write
+engine-agnostic event handling once.
 
 ### Public types
 
@@ -2745,7 +2739,6 @@ struct StreamEvent {
 
     // EndOfTurn
     float    eot_confidence;
-    int      speaker_id_at_turn;
 };
 
 using StreamEventCallback = std::function<void(const StreamEvent&)>;
@@ -2812,10 +2805,10 @@ consumer drives.
   `<EOU>` boundary.
 - `test-sortformer-streaming` asserts at least one `VadStateChanged`
   event on a wav with audible speech and at least one Speaking
-  transition. Default fixture (`two-speakers-16k.wav`) skips when
-  missing; on `jfk.wav` (single speaker, 11 s) the test fires one
-  `Speaking` transition on chunk 0 with `speaker_id = 0`, which is
-  the expected shape.
+  transition. Default fixture (`diarization-sample-16k.wav`) skips
+  when missing; on `jfk.wav` (single speaker, 11 s) the test fires
+  one `Speaking` transition on chunk 0 with `speaker_id = 0`, which
+  is the expected shape.
 
 Numbers on `jfk.wav` (sanity check):
 
@@ -2844,14 +2837,14 @@ Numbers on `jfk.wav` (sanity check):
   `enable_energy_vad = false` are the defaults. No behavioural
   change for existing consumers; opt-in only.
 
-## Phase 15 — Vulkan backend validation  _(done)_
+## Phase 14 — Vulkan backend validation  _(done)_
 
 Vulkan was listed as a supported backend since Phase 6 but had never
 been validated end-to-end on the CTC encoder. This phase brings it to
 correctness on Windows with an NVIDIA RTX 5060 (should apply to any
 Vulkan-capable GPU).
 
-### 15.1 — bugs found and fixed
+### 14.1 — bugs found and fixed
 
 Two issues prevented the Vulkan backend from producing correct output:
 
@@ -2880,7 +2873,7 @@ Two issues prevented the Vulkan backend from producing correct output:
    `ggml_mul`. This fix is also backend-agnostic: any backend that
    doesn't handle strided unary inputs benefits.
 
-### 15.2 — diagnosis methodology
+### 14.2 — diagnosis methodology
 
 The bisection used the `test-vk-vs-cpu` harness with per-sub-stage
 taps injected into the first Conformer block's convolution module.
@@ -2891,7 +2884,7 @@ confirming the `ggml_view_3d` + unary op interaction as root cause.
 The `ggml-vulkan.cpp` source was then inspected to confirm that
 unary push constants lack stride fields, validating the hypothesis.
 
-### 15.3 — parity results (RTX 5060, Windows, f16 GGUF)
+### 14.3 — parity results (RTX 5060, Windows, f16 GGUF)
 
 ```
 PASS stage subsampling_out       n=141312  max_abs=1.239e+01  rel=2.032e-03
@@ -2906,7 +2899,7 @@ PASS stage logits                n=141450  max_abs=1.047e+00  rel=1.454e-03
 all stages passed
 ```
 
-### 15.4 — build system changes
+### 14.4 — build system changes
 
 - `CMakeLists.txt`: centralised `GGML_USE_*` defines into an
   `INTERFACE` library `qvac-parakeet-backend-defs` (CUDA, Metal,
@@ -2916,14 +2909,14 @@ all stages passed
 - Test sources moved from `src/test_*.cpp` to `tests/test_*.cpp`
   for cleaner repo organisation.
 
-### 15.5 — test harness
+### 14.5 — test harness
 
 `tests/test_vk_vs_cpu.cpp` loads the same GGUF twice (CPU and
 Vulkan), runs both encoders on the same mel input, and compares
 9 intermediate stages. Each stage asserts `rel < 5e-2` and no
 NaN/Inf values. Exit code 1 on any failure.
 
-### 15.6 — follow-ups
+### 14.6 — follow-ups
 
 - Vulkan performance optimisation (RTF benchmarking, pipeline cache).
 - Validate on AMD and Intel GPUs.
