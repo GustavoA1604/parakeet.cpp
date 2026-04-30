@@ -51,6 +51,20 @@ that auto-dispatches on `parakeet.model.type`:
 Plus a free function `transcribe_with_speakers(sortformer_engine,
 asr_engine, ...)` for combined "who said what" attribution.
 
+The Engine also exposes the resolved compute device after the load-time
+backend cascade and any fallbacks (Adreno-tier policy, OpenCL extension
+probe, missing GPU build, kernel-init failure):
+
+- `Engine::backend_device()` -> `BackendDevice::CPU` or `BackendDevice::GPU`.
+- `Engine::backend_name()`   -> human-readable name from
+  `ggml_backend_name()` (e.g. `"CUDA0"`, `"Metal"`, `"Vulkan0"`,
+  `"OpenCL"`, or `"CPU"`).
+
+Both reflect the post-fallback truth, not the
+`EngineOptions::n_gpu_layers` request, so consumers (Node addons,
+diagnostics UI, telemetry) can surface "running on CPU" / "running on
+GPU" without reproducing the cascade logic.
+
 Both `StreamSession` and `SortformerStreamSession` also support a
 small cross-engine event surface (Phase 13) via
 `StreamingOptions::on_event` / `SortformerStreamingOptions::on_event`:
@@ -192,6 +206,18 @@ This produces the main binary plus per-stage validation harnesses:
   a sub-project): builds `live-mic` + `live-mic-attributed`.
 - `-DQVAC_PARAKEET_USE_SYSTEM_GGML=ON`: link against an installed
   ggml instead of the pinned clone in `ggml/`.
+- `-DQVAC_PARAKEET_GGML_LIB_PREFIX=ON` (default ON, has no effect when
+  `QVAC_PARAKEET_USE_SYSTEM_GGML=ON`): rename the bundled ggml shared
+  / static libraries to `libqvac-parakeet-ggml-*.{so,dylib,a}` (Windows:
+  `qvac-parakeet-ggml-*.dll` + `libqvac-parakeet-ggml-*.dll.a`). Only
+  the produced filenames change; the CMake target names (`ggml`,
+  `ggml-base`, `ggml-cpu`, `ggml-opencl`, ...) and the C symbols
+  (`ggml_*`) are kept upstream-compatible. The rename prevents
+  shared-library filename collisions when multiple addons that bundle
+  different ggml versions are loaded into the same process. Pass
+  `-DQVAC_PARAKEET_GGML_LIB_PREFIX=OFF` to keep upstream filenames
+  (e.g. when you want a single shared `libggml.so` consumed by every
+  in-process addon).
 - `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON` /
   `-DGGML_OPENCL=ON`: pick exactly one GPU backend at configure time
   (see GPU note above). For OpenCL on non-Adreno hardware also pass

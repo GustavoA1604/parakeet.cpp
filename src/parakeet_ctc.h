@@ -310,6 +310,9 @@ int load_from_gguf(const std::string & gguf_path,
 
 void print_model_summary(const ParakeetCtcModel & m);
 
+bool        model_has_gpu_backend(const ParakeetCtcModel & m);
+std::string model_active_backend_name(const ParakeetCtcModel & m);
+
 int run_subsampling(ParakeetCtcModel   & model,
                     const float        * mel,
                     int                  n_mel_frames,

@@ -101,6 +101,17 @@ struct EngineOptions {
     bool verbose     = false;
 };
 
+// Resolved compute device the Engine is actually running on, after the
+// load-time backend cascade (CUDA / Metal / Vulkan / OpenCL) and any
+// fallbacks (Adreno-tier policy, OpenCL extension probe, missing GPU
+// build, kernel-init failure). This is the *post-fallback* truth and
+// will not match the user's `EngineOptions::n_gpu_layers` request when
+// a fallback occurred.
+enum class BackendDevice : int {
+    CPU = 0,
+    GPU = 1,
+};
+
 struct EngineResult {
     std::string text;
     std::vector<int32_t> token_ids;
@@ -434,6 +445,20 @@ public:
     // "ctc", "tdt", or "sortformer", reflecting the parakeet.model.type
     // metadata of the loaded GGUF.
     std::string model_type() const;
+
+    // Resolved compute device for this Engine's loaded model. CPU when
+    // the build has no GPU backend compiled in, when no GPU was
+    // requested (n_gpu_layers <= 0), or when the requested GPU backend
+    // refused to initialise (e.g. Adreno-6xx forced to CPU,
+    // GGML_OPENCL_ALLOW_UNKNOWN_GPU=1 but the device lacks the
+    // required subgroup-size extension). GPU otherwise.
+    BackendDevice backend_device() const;
+
+    // Human-readable name of the active backend, e.g. "CUDA0", "Metal",
+    // "Vulkan0", "OpenCL", "CPU". Sourced from `ggml_backend_name()`
+    // when a GPU backend is active; literal "CPU" otherwise. Stable for
+    // the lifetime of the Engine.
+    std::string backend_name() const;
 
     struct Impl;
 

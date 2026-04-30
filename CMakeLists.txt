@@ -20,6 +20,7 @@ option(QVAC_PARAKEET_BUILD_TOOLS       "qvac-parakeet: build optional dev/CI too
 option(QVAC_PARAKEET_INSTALL           "qvac-parakeet: generate install rules"                                 ON)
 option(QVAC_PARAKEET_USE_SYSTEM_GGML   "qvac-parakeet: use system-installed GGML library"                      OFF)
 option(QVAC_PARAKEET_CCACHE            "qvac-parakeet: use ccache as compiler launcher if available"           ON)
+option(QVAC_PARAKEET_GGML_LIB_PREFIX   "qvac-parakeet: rename bundled ggml libraries to libqvac-parakeet-ggml-* (filename only; CMake target names and C symbols are unchanged). Prevents shared-library filename collisions when multiple addons that vendor different ggml versions are loaded into the same process. Has no effect when QVAC_PARAKEET_USE_SYSTEM_GGML=ON." ON)
 
 # ccache shaves ~30 % off iterative rebuild time on developer machines.
 # Opt-out via -DQVAC_PARAKEET_CCACHE=OFF for clean reproducibility runs.
@@ -72,6 +73,35 @@ if (NOT TARGET ggml)
     else()
         add_subdirectory(ggml)
     endif()
+endif()
+
+function(qvac_parakeet_apply_ggml_prefix target)
+    if (NOT TARGET ${target})
+        return()
+    endif()
+    get_target_property(_qpgp_type ${target} TYPE)
+    if (_qpgp_type STREQUAL "INTERFACE_LIBRARY" OR _qpgp_type STREQUAL "OBJECT_LIBRARY")
+        return()
+    endif()
+    get_target_property(_qpgp_old_name ${target} OUTPUT_NAME)
+    if (NOT _qpgp_old_name OR _qpgp_old_name STREQUAL "_qpgp_old_name-NOTFOUND")
+        set(_qpgp_old_name ${target})
+    endif()
+    set_target_properties(${target} PROPERTIES
+        OUTPUT_NAME "qvac-parakeet-${_qpgp_old_name}"
+    )
+endfunction()
+
+if (QVAC_PARAKEET_GGML_LIB_PREFIX AND NOT QVAC_PARAKEET_USE_SYSTEM_GGML)
+    foreach (_qpgp_target ggml ggml-base)
+        qvac_parakeet_apply_ggml_prefix(${_qpgp_target})
+    endforeach()
+    if (DEFINED GGML_AVAILABLE_BACKENDS)
+        foreach (_qpgp_target ${GGML_AVAILABLE_BACKENDS})
+            qvac_parakeet_apply_ggml_prefix(${_qpgp_target})
+        endforeach()
+    endif()
+    message(STATUS "qvac-parakeet: bundled ggml libraries will be emitted as libqvac-parakeet-ggml-* (set QVAC_PARAKEET_GGML_LIB_PREFIX=OFF to keep upstream filenames)")
 endif()
 
 find_package(OpenMP)

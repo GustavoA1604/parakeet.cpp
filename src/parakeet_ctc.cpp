@@ -631,6 +631,18 @@ int load_from_gguf(const std::string & gguf_path,
     return 0;
 }
 
+bool model_has_gpu_backend(const ParakeetCtcModel & m) {
+    return m.impl && m.impl->backend_gpu != nullptr;
+}
+
+std::string model_active_backend_name(const ParakeetCtcModel & m) {
+    if (!m.impl) return "CPU";
+    ggml_backend_t b = m.impl->backend_active;
+    if (!b) return "CPU";
+    const char * name = ggml_backend_name(b);
+    return name ? std::string(name) : std::string("CPU");
+}
+
 void print_model_summary(const ParakeetCtcModel & m) {
     const char * mt = "ctc";
     if (m.model_type == ParakeetModelType::TDT)        mt = "tdt";
