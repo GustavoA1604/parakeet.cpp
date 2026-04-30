@@ -996,8 +996,25 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
     const float scale = 1.0f / std::sqrt((float) HD);
 
 #ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN
+    // Non-flash path computes:
+    //   attn = softmax(scale * (q*k^T + bd_final) + att_mask)
+    //        = softmax(scale * q*k^T + scale * bd_final + att_mask)
+    // ggml_flash_attn_ext computes:
+    //   attn = softmax(scale * q*k^T + mask)
+    // so the equivalent mask is `scale * bd_final + att_mask`. Mode 1
+    // (full-window) sets att_mask = nullptr so the fall-through to
+    // bd_scaled alone is byte-exact vs the non-flash path. Mode 2 / 3
+    // streaming windows pass a non-null (T_k, T_q, 1, 1) f32 chunked
+    // mask that must be folded in here, otherwise FA attends to
+    // positions outside the streaming window and produces token
+    // duplication / EOU-detection failures (test-streaming Mode 3
+    // chunk=1000 right=500 -> WER 10.5 % regression; test-eou-streaming
+    // Mode 2 -> no is_eou_boundary). Broadcast: bd_scaled is
+    // (T, T, H, 1); att_mask is (T, T, 1, 1); ggml_can_repeat(att_mask,
+    // bd_scaled) holds so the sum is (T, T, H, 1).
     ggml_tensor * bd_scaled = ggml_scale(ctx, bd_final, scale);
-    ggml_tensor * bd_mask   = ggml_cast(ctx, bd_scaled, GGML_TYPE_F16);
+    ggml_tensor * fa_mask   = att_mask ? ggml_add(ctx, bd_scaled, att_mask) : bd_scaled;
+    ggml_tensor * bd_mask   = ggml_cast(ctx, fa_mask, GGML_TYPE_F16);
     ggml_tensor * attn_out  = ggml_flash_attn_ext(ctx, q_u, k_perm, v_perm, bd_mask,
                                                   scale, 0.0f, 0.0f);
     ggml_tensor * flat      = ggml_reshape_2d(ctx, attn_out, HD * H, T);
