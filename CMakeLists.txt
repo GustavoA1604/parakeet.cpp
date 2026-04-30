@@ -106,6 +106,30 @@ endif()
 
 find_package(OpenMP)
 
+# Centralised GGML_USE_* backend defines. Anything that compiles
+# parakeet_ctc.cpp (the library target plus the standalone test
+# executables that recompile it) must link against this so the
+# `init_gpu_backend` / BLAS / CUDA / Metal / Vulkan code paths get
+# selected consistently. Without this, e.g. test-encoder would silently
+# build with the GPU branch compiled out and `--n-gpu-layers 1` would
+# be a no-op.
+add_library(qvac-parakeet-backend-defs INTERFACE)
+if (GGML_CUDA)
+    target_compile_definitions(qvac-parakeet-backend-defs INTERFACE GGML_USE_CUDA)
+endif()
+if (GGML_METAL)
+    target_compile_definitions(qvac-parakeet-backend-defs INTERFACE GGML_USE_METAL)
+endif()
+if (GGML_VULKAN)
+    target_compile_definitions(qvac-parakeet-backend-defs INTERFACE GGML_USE_VULKAN)
+endif()
+if (GGML_BLAS)
+    target_compile_definitions(qvac-parakeet-backend-defs INTERFACE GGML_USE_BLAS)
+endif()
+if (GGML_OPENCL)
+    target_compile_definitions(qvac-parakeet-backend-defs INTERFACE GGML_USE_OPENCL)
+endif()
+
 set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
     src/parakeet_engine.cpp
@@ -136,35 +160,12 @@ if (QVAC_PARAKEET_BUILD_LIBRARY)
         target_link_libraries(qvac-parakeet PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
-    if (GGML_BLAS)
-        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_BLAS)
-    endif()
-    if (GGML_CUDA)
-        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_CUDA)
-    endif()
-    if (GGML_METAL)
-        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_METAL)
-    endif()
-    if (GGML_VULKAN)
-        target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_VULKAN)
-    endif()
-    # GGML_USE_BLAS already surfaced above (matches upstream 8da4939's
-    # placement; the OpenCL wire-up originally re-added it before
-    # GGML_USE_CUDA which is now redundant after the rebase).
+    target_link_libraries(qvac-parakeet PRIVATE qvac-parakeet-backend-defs)
+
     if (GGML_OPENCL)
         target_compile_definitions(qvac-parakeet PRIVATE GGML_USE_OPENCL)
     endif()
 
-    # `PARAKEET_EXPERIMENTAL_FLASH_ATTN` historically gates the
-    # rel-pos MHA fused-attention path in `parakeet_ctc.cpp`. Off by
-    # default during the optimization audit because flipping it on CPU
-    # measurably changed the rel-pos BD computation order (cast-to-f16
-    # mask before softmax) and risked transcript drift on the
-    # bit-equal-NeMo gate. Surfaced as an opt-in CMake flag so first
-    # Adreno bring-up can A/B it -- ggml-opencl supports
-    # `flash_attn_ext` for head_dim in {40,64,80,96,112,128,192,256},
-    # which covers every parakeet target except Sortformer's
-    # tf_d_model=192/8=24 transformer head.
     option(QVAC_PARAKEET_FLASH_ATTN "qvac-parakeet: enable experimental fused flash-attn in MHA (off by default; bench-validate per backend before shipping)" OFF)
     if (QVAC_PARAKEET_FLASH_ATTN)
         target_compile_definitions(qvac-parakeet PRIVATE PARAKEET_EXPERIMENTAL_FLASH_ATTN)
@@ -229,43 +230,43 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     endfunction()
 
     add_executable(test-mel
-        src/test_mel.cpp
+        tests/test_mel.cpp
         src/mel_preprocess.cpp
         src/parakeet_ctc.cpp
         src/sentencepiece_bpe.cpp)
-    target_link_libraries(test-mel PRIVATE ggml)
+    target_link_libraries(test-mel PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-mel PRIVATE ggml/include src include)
     qvac_parakeet_apply_backend_defs(test-mel)
 
     add_executable(test-encoder
-        src/test_encoder.cpp
+        tests/test_encoder.cpp
         src/parakeet_ctc.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
-    target_link_libraries(test-encoder PRIVATE ggml)
+    target_link_libraries(test-encoder PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-encoder PRIVATE ggml/include src)
     qvac_parakeet_apply_backend_defs(test-encoder)
 
     add_executable(test-ctc
-        src/test_ctc.cpp
+        tests/test_ctc.cpp
         src/parakeet_ctc.cpp
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp)
-    target_link_libraries(test-ctc PRIVATE ggml)
+    target_link_libraries(test-ctc PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-ctc PRIVATE ggml/include src)
     qvac_parakeet_apply_backend_defs(test-ctc)
 
-    add_executable(test-streaming src/test_streaming.cpp)
+    add_executable(test-streaming tests/test_streaming.cpp)
     target_link_libraries(test-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-streaming PRIVATE include src ggml/include)
     qvac_parakeet_apply_ccache(test-streaming)
 
-    add_executable(test-eou-streaming src/test_eou_streaming.cpp)
+    add_executable(test-eou-streaming tests/test_eou_streaming.cpp)
     target_link_libraries(test-eou-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-eou-streaming PRIVATE include src ggml/include)
     qvac_parakeet_apply_ccache(test-eou-streaming)
 
-    add_executable(test-sortformer-streaming src/test_sortformer_streaming.cpp)
+    add_executable(test-sortformer-streaming tests/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE qvac-parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
     qvac_parakeet_apply_ccache(test-sortformer-streaming)
@@ -297,7 +298,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
     qvac_parakeet_apply_backend_defs(test-encoder-capture-parity)
 
     add_executable(test-tdt-encoder-parity
-        src/test_tdt_encoder_parity.cpp
+        tests/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
         src/parakeet_tdt.cpp
@@ -306,12 +307,12 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp
         src/energy_vad.cpp)
-    target_link_libraries(test-tdt-encoder-parity PRIVATE ggml)
+    target_link_libraries(test-tdt-encoder-parity PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-tdt-encoder-parity PRIVATE include src ggml/include)
     qvac_parakeet_apply_backend_defs(test-tdt-encoder-parity)
 
     add_executable(test-sortformer-parity
-        src/test_sortformer_parity.cpp
+        tests/test_sortformer_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
         src/parakeet_tdt.cpp
@@ -320,9 +321,20 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/mel_preprocess.cpp
         src/sentencepiece_bpe.cpp
         src/energy_vad.cpp)
-    target_link_libraries(test-sortformer-parity PRIVATE ggml)
+    target_link_libraries(test-sortformer-parity PRIVATE ggml qvac-parakeet-backend-defs)
     target_include_directories(test-sortformer-parity PRIVATE include src ggml/include)
     qvac_parakeet_apply_backend_defs(test-sortformer-parity)
+
+    if (GGML_VULKAN)
+        add_executable(test-vk-vs-cpu
+            tests/test_vk_vs_cpu.cpp
+            src/parakeet_ctc.cpp
+            src/mel_preprocess.cpp
+            src/sentencepiece_bpe.cpp)
+        target_link_libraries(test-vk-vs-cpu PRIVATE ggml qvac-parakeet-backend-defs)
+        target_include_directories(test-vk-vs-cpu PRIVATE ggml/include src)
+        qvac_parakeet_apply_backend_defs(test-vk-vs-cpu)
+    endif()
 endif()
 
 if (QVAC_PARAKEET_BUILD_EXAMPLES)

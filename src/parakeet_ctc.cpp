@@ -233,11 +233,14 @@ std::string get_str(const gguf_context * g, const std::string & k, const std::st
 std::vector<float> read_filterbank_to_vector(ggml_tensor * t) {
     const size_t n_elts = ggml_nelements(t);
     std::vector<float> out(n_elts);
-    if (t->type == GGML_TYPE_F32) {
-        std::memcpy(out.data(), t->data, n_elts * sizeof(float));
-    } else {
+    if (t->type != GGML_TYPE_F32) {
         throw std::runtime_error("preproc tensor type must be f32");
     }
+    // Tensor storage may live on a non-CPU backend (Vulkan/CUDA/Metal), in
+    // which case `t->data` is not a host-accessible pointer. Always go via
+    // the backend buffer API; it copies device->host where needed and is a
+    // no-op for CPU buffers.
+    ggml_backend_tensor_get(t, out.data(), 0, n_elts * sizeof(float));
     return out;
 }
 
@@ -271,9 +274,6 @@ int load_from_gguf(const std::string & gguf_path,
         ggml_backend_blas_set_n_threads(impl->backend_blas, resolved_threads);
     }
 #endif
-    // No #else branch: Impl::backend_blas is default-initialised to
-    // nullptr at the struct (see line ~86), so the GGML_USE_BLAS=OFF
-    // case needs no explicit assignment here.
 
     impl->backend_gpu    = init_gpu_backend(n_gpu_layers, verbose);
     impl->backend_active = impl->backend_gpu ? impl->backend_gpu : impl->backend_cpu;
@@ -982,11 +982,21 @@ ggml_tensor * conformer_conv_graph(ggml_context * ctx, ggml_tensor * xn,
     ggml_tensor * y = ggml_mul_mat(ctx, pw1_w_2d, xn);
     y = maybe_add_bias(ctx, y, W.conv_pw1_b);
 
-    ggml_tensor * half1 = ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
-                                       y->nb[1], y->nb[2], 0);
-    ggml_tensor * half2 = ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
-                                       y->nb[1], y->nb[2],
-                                       (size_t) d_model * y->nb[0]);
+    // Conformer GLU: split (2*d_model, T, B) along the channel axis into two
+    // halves, then y = half1 * sigmoid(half2). The two halves are strided
+    // views over the same source tensor and ggml-vulkan miscomputes the
+    // sigmoid / mul kernels when fed strided inputs (validated on RTX 5060;
+    // see test-vk-vs-cpu bisect: block0_conv_post_glu rel jumps from 1e-3
+    // to ~0.8 without the contig). Materialising each half with ggml_cont
+    // before the elementwise ops fixes the divergence on Vulkan and is a
+    // no-op-cheap memcpy on CPU.
+    ggml_tensor * half1 = ggml_cont(ctx,
+        ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
+                     y->nb[1], y->nb[2], 0));
+    ggml_tensor * half2 = ggml_cont(ctx,
+        ggml_view_3d(ctx, y, d_model, y->ne[1], y->ne[2],
+                     y->nb[1], y->nb[2],
+                     (size_t) d_model * y->nb[0]));
     y = ggml_mul(ctx, half1, ggml_sigmoid(ctx, half2));
 
     ggml_tensor * yt = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
