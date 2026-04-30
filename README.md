@@ -51,6 +51,20 @@ that auto-dispatches on `parakeet.model.type`:
 Plus a free function `transcribe_with_speakers(sortformer_engine,
 asr_engine, ...)` for combined "who said what" attribution.
 
+The Engine also exposes the resolved compute device after the load-time
+backend cascade and any fallbacks (Adreno-tier policy, OpenCL extension
+probe, missing GPU build, kernel-init failure):
+
+- `Engine::backend_device()` -> `BackendDevice::CPU` or `BackendDevice::GPU`.
+- `Engine::backend_name()`   -> human-readable name from
+  `ggml_backend_name()` (e.g. `"CUDA0"`, `"Metal"`, `"Vulkan0"`,
+  `"OpenCL"`, or `"CPU"`).
+
+Both reflect the post-fallback truth, not the
+`EngineOptions::n_gpu_layers` request, so consumers (Node addons,
+diagnostics UI, telemetry) can surface "running on CPU" / "running on
+GPU" without reproducing the cascade logic.
+
 Both `StreamSession` and `SortformerStreamSession` also support a
 small cross-engine event surface (Phase 13) via
 `StreamingOptions::on_event` / `SortformerStreamingOptions::on_event`:
@@ -192,6 +206,7 @@ This produces the main binary plus per-stage validation harnesses:
 | `build/test-streaming`            | CTC/TDT Mode 2 byte-equality + timestamp coverage + Mode 3 WER tolerance across chunk sizes. |
 | `build/test-eou-streaming`        | EOU Mode 2 transcript byte-equality vs `Engine::transcribe()` reference + `is_eou_boundary` firing on the trailing `<EOU>` chunk + Mode 3 transcript-within-tolerance. |
 | `build/test-sortformer-streaming` | `SortformerStreamSession` push API: random-burst feed, no-duplicate, single-`is_final` assertions. |
+| `build/test-vk-vs-cpu`           | Vulkan vs CPU per-stage encoder parity (9 stages, rel < 5 %). Built only when `-DGGML_VULKAN=ON`. |
 
 ### Build options worth knowing
 
@@ -202,6 +217,18 @@ This produces the main binary plus per-stage validation harnesses:
   a sub-project): builds `live-mic` + `live-mic-attributed`.
 - `-DQVAC_PARAKEET_USE_SYSTEM_GGML=ON`: link against an installed
   ggml instead of the pinned clone in `ggml/`.
+- `-DQVAC_PARAKEET_GGML_LIB_PREFIX=ON` (default ON, has no effect when
+  `QVAC_PARAKEET_USE_SYSTEM_GGML=ON`): rename the bundled ggml shared
+  / static libraries to `libqvac-parakeet-ggml-*.{so,dylib,a}` (Windows:
+  `qvac-parakeet-ggml-*.dll` + `libqvac-parakeet-ggml-*.dll.a`). Only
+  the produced filenames change; the CMake target names (`ggml`,
+  `ggml-base`, `ggml-cpu`, `ggml-opencl`, ...) and the C symbols
+  (`ggml_*`) are kept upstream-compatible. The rename prevents
+  shared-library filename collisions when multiple addons that bundle
+  different ggml versions are loaded into the same process. Pass
+  `-DQVAC_PARAKEET_GGML_LIB_PREFIX=OFF` to keep upstream filenames
+  (e.g. when you want a single shared `libggml.so` consumed by every
+  in-process addon).
 - `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON` /
   `-DGGML_OPENCL=ON`: pick exactly one GPU backend at configure time
   (see GPU note above). For OpenCL on non-Adreno hardware also pass
@@ -893,6 +920,16 @@ Stage E2 eou_encoder_out       rel ~ 8e-3, cosine 0.999997 (EOU 17L
                                                             chunked-limited)
 ```
 
+Vulkan backend parity (build with `-DGGML_VULKAN=ON`):
+
+```bash
+./build/test-vk-vs-cpu \
+    models/parakeet-ctc-0.6b.gguf test/samples/jfk.wav
+```
+
+Expected: 9/9 stages PASS with rel < 5e-2 (typical rel ~2e-3 on
+subsampling through block_0, ~7e-3 on deep stages, ~1.5e-3 on logits).
+
 At `--quant q8_0` through `q4_0` the per-stage rel inflates by ~3x
 to ~25x, but the transcript stays bit-equal on clean speech for CTC,
 TDT, and EOU alike. See `PROGRESS.md` §5.12 for the CTC quant sweep,
@@ -900,7 +937,7 @@ TDT, and EOU alike. See `PROGRESS.md` §5.12 for the CTC quant sweep,
 
 ## Current status
 
-Phases 0 through 12 have shipped (see `PROGRESS.md` for the full
+Phases 0 through 15 have shipped (see `PROGRESS.md` for the full
 journal). Phase 12 (EOU FastConformer-RNN-T 120M with native
 `<EOU>` end-of-utterance token) is feature-complete on the offline
 + Mode 2 + Mode 3 streaming axes: bit-equal transcripts to NeMo on
@@ -989,6 +1026,15 @@ has the full round-by-round journal):
   streaming-trained weights through NeMo's chunked-limited
   `cache_aware_stream_step` was prototyped + rejected on quality
   grounds (PROGRESS.md §8.5 case (A)).
+- **Vulkan backend validation (Phase 15)**: Vulkan backend brought to
+  correctness on the CTC encoder (RTX 5060, Windows). Two bugs fixed:
+  `ggml_backend_tensor_get()` for device-to-host filterbank copy
+  (was `memcpy` from GPU pointer), and `ggml_cont()` around strided
+  `ggml_view_3d` slices in the GLU activation (Vulkan unary ops
+  assume contiguous memory). Both fixes are backend-agnostic and
+  benefit any non-CPU backend. 9/9 encoder stages pass parity vs CPU
+  (rel < 2 %, tol 5 %). New `test-vk-vs-cpu` regression harness with
+  assertions.
 
 Next: vcpkg port for `parakeet.cpp` + the
 `qvac-lib-infer-parakeet` binding swap to consume this library
@@ -1031,10 +1077,14 @@ parakeet.cpp/
     sentencepiece_bpe.{h,cpp}    SentencePiece BPE detokenizer (CTC + TDT + EOU)
     dr_wav.h                     vendored single-header WAV reader
     npy.h                        minimal .npy load / save + compare
-    test_*.cpp                   per-stage numerical-parity harnesses (mel, encoder,
-                                   ctc, tdt-encoder, sortformer) + streaming
-                                   validation (test-streaming, test-eou-streaming,
-                                   test-sortformer-streaming)
+    test_*.cpp                   per-stage numerical-parity harnesses that live
+                                   alongside implementation (mel-fft-parity,
+                                   encoder-capture-parity, perf-regression)
+  tests/
+    test_*.cpp                   per-stage validation harnesses (mel, encoder,
+                                   ctc, tdt-encoder, sortformer, streaming,
+                                   eou-streaming, sortformer-streaming,
+                                   vk-vs-cpu)
   include/qvac-parakeet/
     qvac-parakeet.h              CLI entry (qvac_parakeet_cli_main) + library overview
     ctc/engine.h                 persistent multi-engine Engine umbrella + StreamSession +

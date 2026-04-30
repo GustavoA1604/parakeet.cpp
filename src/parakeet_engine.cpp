@@ -129,6 +129,15 @@ bool Engine::is_transcription_model() const {
            pimpl_->model.model_type == ParakeetModelType::EOU;
 }
 
+BackendDevice Engine::backend_device() const {
+    return model_has_gpu_backend(pimpl_->model) ? BackendDevice::GPU
+                                                : BackendDevice::CPU;
+}
+
+std::string Engine::backend_name() const {
+    return model_active_backend_name(pimpl_->model);
+}
+
 void Engine::cancel() {
     pimpl_->cancel_flag.store(true);
 }

@@ -3263,3 +3263,94 @@ sub-bit-15 precision drift in attention scores.
      Up to 7.65 ms inference wall-time saving if we can hide
      mel under encoder.
   3. `att_mask` fold-in for streaming (covered above).
+
+---
+
+## Phase 16 — Vulkan backend validation  _(done)_
+
+Vulkan was listed as a supported backend since Phase 6 but had never
+been validated end-to-end on the CTC encoder. This phase brings it to
+correctness on Windows with an NVIDIA RTX 5060 (should apply to any
+Vulkan-capable GPU).
+
+(Originally landed as "Phase 15" on `main` while this branch was
+mid-flight on its own §14 / §15 TDT-decoder + fused-LSTM+joint
+sequence; renumbered to §16 here so the two streams don't collide.)
+
+### 16.1 — bugs found and fixed
+
+Two issues prevented the Vulkan backend from producing correct output:
+
+1. **`memcpy` from GPU pointer in `read_filterbank_to_vector()`.**
+   The filterbank tensor is allocated on the GPU backend when
+   `n_gpu_layers > 0`. The original code did
+   `std::memcpy(out.data(), t->data, ...)` which dereferences a
+   device pointer on the host — segfault (`0xC0000005`). Fixed by
+   switching to `ggml_backend_tensor_get(t, out.data(), 0, n)` which
+   handles the device-to-host copy transparently. This fix is
+   backend-agnostic: it was already correct on Metal/CUDA because
+   those backends happened to map `t->data` to host-visible memory,
+   but the `ggml_backend_tensor_get` path is the correct API for all
+   backends.
+
+2. **Strided `ggml_view_3d` passed to unary ops in the GLU.**
+   The Conformer conv module's Gated Linear Unit splits the
+   pointwise-conv output in half along the channel dimension using
+   `ggml_view_3d`. The resulting tensors are non-contiguous (strided).
+   `ggml-vulkan`'s unary operations (`ggml_sigmoid`) use push
+   constants that do not carry stride information — they assume
+   contiguous memory. The sigmoid output was therefore garbage
+   (`rel=0.82` at the GLU stage), which cascaded into zero-token
+   transcriptions. Fixed by wrapping both `ggml_view_3d` halves with
+   `ggml_cont()` before feeding them into `ggml_sigmoid` and
+   `ggml_mul`. This fix is also backend-agnostic: any backend that
+   doesn't handle strided unary inputs benefits.
+
+### 16.2 — diagnosis methodology
+
+The bisection used the `test-vk-vs-cpu` harness with per-sub-stage
+taps injected into the first Conformer block's convolution module.
+Each intermediate tensor (`pre`, `post_pw1`, `post_glu`, `post_dw`,
+`post_pw2`, `post_bn`) was compared CPU vs Vulkan. The divergence
+was pinpointed to `post_glu` (rel jumped from ~2e-3 to 0.82),
+confirming the `ggml_view_3d` + unary op interaction as root cause.
+The `ggml-vulkan.cpp` source was then inspected to confirm that
+unary push constants lack stride fields, validating the hypothesis.
+
+### 16.3 — parity results (RTX 5060, Windows, f16 GGUF)
+
+```
+PASS stage subsampling_out       n=141312  max_abs=1.239e+01  rel=2.032e-03
+PASS stage block0_post_ff1       n=141312  max_abs=3.966e+02  rel=2.030e-03
+PASS stage block0_post_attn      n=141312  max_abs=3.965e+02  rel=2.033e-03
+PASS stage block0_post_conv      n=141312  max_abs=3.901e+02  rel=2.032e-03
+PASS stage block0_post_ff2       n=141312  max_abs=3.897e+02  rel=2.035e-03
+PASS stage block0_out            n=141312  max_abs=3.813e-01  rel=1.958e-03
+PASS stage block_last_out        n=141312  max_abs=1.260e-01  rel=6.897e-03
+PASS stage encoder_out           n=141312  max_abs=1.260e-01  rel=6.897e-03
+PASS stage logits                n=141450  max_abs=1.047e+00  rel=1.454e-03
+all stages passed
+```
+
+### 16.4 — build system changes
+
+- `CMakeLists.txt`: centralised `GGML_USE_*` defines into an
+  `INTERFACE` library `qvac-parakeet-backend-defs` (CUDA, Metal,
+  Vulkan, BLAS, OpenCL). All test targets link this library so
+  GPU code paths are compiled consistently.
+- `test-vk-vs-cpu` target gated behind `if (GGML_VULKAN)`.
+- Test sources moved from `src/test_*.cpp` to `tests/test_*.cpp`
+  for cleaner repo organisation.
+
+### 16.5 — test harness
+
+`tests/test_vk_vs_cpu.cpp` loads the same GGUF twice (CPU and
+Vulkan), runs both encoders on the same mel input, and compares
+9 intermediate stages. Each stage asserts `rel < 5e-2` and no
+NaN/Inf values. Exit code 1 on any failure.
+
+### 16.6 — follow-ups
+
+- Vulkan performance optimisation (RTF benchmarking, pipeline cache).
+- Validate on AMD and Intel GPUs.
+- Upstream the `ggml_cont` fix as a ggml-vulkan unary stride patch.
