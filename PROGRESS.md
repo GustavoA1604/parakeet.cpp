@@ -1,20 +1,20 @@
-# qvac-parakeet.cpp — development journal
+# parakeet.cpp — development journal
 
-Chronological record of each bring-up and numerical-parity milestone,
-mirroring `chatterbox.cpp/PROGRESS.md`'s methodology: every stage lands
-with a per-stage `.npy` reference dumped from NeMo PyTorch and a C++
-harness asserting rel error below a documented threshold.
+Chronological record of each bring-up and numerical-parity milestone:
+every stage lands with a per-stage `.npy` reference dumped from NeMo
+PyTorch and a C++ harness asserting rel error below a documented
+threshold.
 
 ## Phase 0 — scaffolding  _(done)_
 
-- Added `CMakeLists.txt` modeled on `chatterbox.cpp` (`QVAC_PARAKEET_*`
-  options, `QVAC_PARAKEET_USE_SYSTEM_GGML` escape hatch, install rules
-  producing `qvac-parakeet::qvac-parakeet` so the eventual vcpkg port
-  is a drop-in).
-- Added `scripts/setup-ggml.sh` pinned to the same ggml commit
-  (`58c38058`) chatterbox builds against.
-- Vendored `dr_wav.h` + `npy.h` from `chatterbox.cpp/src/` for wav I/O
-  and reference-tensor compare.
+- Added `CMakeLists.txt` (`QVAC_PARAKEET_*` options,
+  `QVAC_PARAKEET_USE_SYSTEM_GGML` escape hatch, install rules producing
+  `qvac-parakeet::qvac-parakeet` so the eventual vcpkg port is a
+  drop-in).
+- Added `scripts/setup-ggml.sh` pinned to the upstream ggml commit
+  (`58c38058`).
+- Vendored `dr_wav.h` + `npy.h` for wav I/O and reference-tensor
+  compare.
 - Public headers under `include/qvac-parakeet/` expose
   `qvac_parakeet_cli_main`, `qvac_parakeet::ctc::Engine`, and the
   one-shot `transcribe_wav` API. _(Post-v0.1.0-pre audit, the public
@@ -148,8 +148,7 @@ Implementation (`src/parakeet_ctc.cpp`):
       * Rel-pos MHA: q/k/v/pos linears → reshape to
         `(HD, T, H)` / `(HD, 2T-1, H)` → two matmuls for AC/BD terms
         → Transformer-XL `rel_shift` via concat-zero-pad + reshape
-        trick → softmax → matmul with V → output linear.  Identical
-        topology to chatterbox's S3Gen attention block.
+        trick         → softmax → matmul with V → output linear.
       * Conv module: pointwise(d → 2d) → **GLU split + sigmoid(half2)
         × half1** → depthwise k=9 → pre-fused BN → SiLU → pointwise
         d → d.  Pre-fused BN saves one op per block across 24 blocks.
@@ -843,8 +842,8 @@ Silicon.  End-to-end on the M4 Air GPU:
   - `init_gpu_backend(n_gpu_layers, verbose)` helper chooses CUDA →
     Metal → Vulkan → CPU based on compile flags and returns
     `nullptr` when `n_gpu_layers <= 0` or no GPU backend is
-    compiled in. Matches the convention used by `llama.cpp`,
-    `whisper.cpp`, and `chatterbox.cpp`.
+    compiled in. Matches the convention used by `llama.cpp` and
+    `whisper.cpp`.
   - `Impl::backend_active` pointer — one of CPU or GPU — drives
     `ggml_backend_alloc_ctx_tensors`, `ggml_backend_graph_compute`,
     and the per-call `safe_set` tensor uploads.  All weights live on
@@ -1258,7 +1257,7 @@ audio without changing accuracy.
 
 ### Phase 8.2 — C++ StreamSession (done)
 
-Landed the Mode 3 state machine in [src/parakeet_engine.cpp](qvac-parakeet.cpp/src/parakeet_engine.cpp)
+Landed the Mode 3 state machine in [src/parakeet_engine.cpp](src/parakeet_engine.cpp)
 (`StreamSession::Impl`), backed by the existing `Engine::Impl::model`
 through a borrowed pointer. Key pieces:
 
@@ -2328,7 +2327,7 @@ C++ pipeline this maps to (matching `processEOU` in the binding's
 Cross-engine VAD/EndOfTurn events are **not** part of Phase 12; they
 will be a Phase 13 cross-cutting concern wiring `<EOU>` and Sortformer
 per-frame any-speaker probabilities into a shared `StreamEvent`
-umbrella across qvac-parakeet.cpp + whisper.cpp. Phase 12 just needs
+umbrella across parakeet.cpp + whisper.cpp. Phase 12 just needs
 to land the `EouStreamSession` callback signature with
 `is_eou_boundary` from day 1 so Phase 13 plugs in without churn.
 

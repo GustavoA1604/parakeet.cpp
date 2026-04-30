@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Convert an NVIDIA NeMo .nemo archive to a single GGUF for the
-qvac-parakeet.cpp Engine.
+parakeet.cpp Engine.
 
 Auto-detects the model flavour from ``cfg['target']``:
 
