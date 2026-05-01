@@ -349,12 +349,12 @@ tier specifically.
                    onnxruntime-f16    ggml-cpu-f16
   -----------------------------------------------
   model size           2.3 GiB         1.3 GiB
-  load ms              16 736            642      (26x faster)
-  inf best ms             948           1117      (15 % slower)
-  inf median ms         1 007           1132      (12 % slower)
-  inf stdev ms             52             18      (3x tighter)
-  RTF best               0.047          0.055
-  RTF median             0.050          0.056
+  load ms              16 736            416      (40x faster)
+  inf best ms             948            917      (3 % faster)
+  inf median ms         1 007            982      (2 % faster)
+  inf stdev ms             52             29      (2x tighter)
+  RTF best               0.047          0.046
+  RTF median             0.050          0.049
   Transcripts            match          match
 ```
 
@@ -364,12 +364,12 @@ tier specifically.
                    onnxruntime-int8    ggml-cpu-q8_0
   -------------------------------------------------
   model size          583.9 MiB         697 MiB
-  load ms               2 054             179      (11x faster)
-  inf best ms             677             898      (25 % slower)
-  inf median ms           721             928      (22 % slower)
-  inf stdev ms             55              25      (2x tighter)
-  RTF best               0.034           0.045
-  RTF median             0.036           0.046
+  load ms               2 054             359      (5.7x faster)
+  inf best ms             677             690      (2 % slower)
+  inf median ms           721             715      (1 % faster)
+  inf stdev ms             55              16      (3.4x tighter)
+  RTF best               0.034           0.040
+  RTF median             0.036           0.041
   Transcripts            match           match
 ```
 
@@ -380,21 +380,22 @@ run with `--n-gpu-layers 1`):
                    onnxruntime-int8    ggml-metal-q8_0
   ---------------------------------------------------
   model size          583.9 MiB         697 MiB
-  load ms               2 295              420      (5.5x faster)
-  inf best ms             682              282      (2.4x faster)
-  inf median ms           712              283      (2.5x faster)
-  inf stdev ms             18             0.83      (21x tighter)
+  load ms               2 295              251      (9.1x faster)
+  inf best ms             682              284      (2.4x faster)
+  inf median ms           712              286      (2.5x faster)
+  inf stdev ms             18             0.55     (33x tighter)
   RTF best               0.034           0.014
   RTF median             0.035           0.014
   Transcripts            match           match
 ```
 
-Summary: on CPU, onnxruntime's AMX-accelerated kernels are 12-25 %
-faster than ggml-cpu. On Metal, ggml is **2.4-2.5x faster** than
-onnxruntime int8 with 21x tighter variance, landing the 20 s clip's
-encoder at **~73x real-time**; quant tier (f16 / Q8_0 / Q4_0) only
-affects file size, not throughput, because the Metal path is
-compute-bound on shader units.
+Summary: on CPU, ggml-cpu has caught up both at f16 (now 2-3 % faster
+than onnxruntime-f16) and at int8 (1 % faster than onnxruntime-int8,
+down from 22-25 % previously). On Metal, ggml is **2.4-2.5x faster**
+than onnxruntime int8 with **33x tighter variance** (0.55 ms vs 18 ms
+stdev), landing the 20 s clip's encoder at **~70x real-time**; quant
+tier (f16 / Q8_0 / Q4_0) only affects file size, not throughput, because
+the Metal path is compute-bound on shader units.
 
 ### TDT decoder Metal port (Phase 14)
 
@@ -1036,12 +1037,12 @@ has the full round-by-round journal):
   tier (f16 through Q4_0) on both CPU and Metal backends. Per-stage
   numerical parity at the f16 quantization floor (~1-2e-3 rel vs NeMo
   PyTorch) on every intermediate encoder tensor.
-- **CPU optimisation (Phase 5)**: encoder runs 22x real-time on an
-  M4 Air CPU at Q8_0 — 12 % faster than ONNX f16, 22 % slower than
+- **CPU optimisation (Phase 5)**: encoder runs 24x real-time on an
+  M4 Air CPU at Q8_0 — 18 % faster than ONNX f16, 1 % faster than
   ONNX int8.
-- **Metal (Phase 6)**: encoder runs 73x real-time on the M4 Air GPU
-  at Q8_0 — 2.5x faster than onnxruntime int8 with 21x tighter
-  variance (0.83 ms stdev).
+- **Metal (Phase 6)**: encoder runs 70x real-time on the M4 Air GPU
+  at Q8_0 — 2.5x faster than onnxruntime int8 with 33x tighter
+  variance (0.55 ms vs 18 ms stdev).
 - **Mode 2 streaming (Phase 7)**: `Engine::transcribe_stream()` runs
   the offline encoder once, walks the encoder frames in `chunk_ms`
   windows, emits per-segment callbacks. Byte-equal to non-streaming
