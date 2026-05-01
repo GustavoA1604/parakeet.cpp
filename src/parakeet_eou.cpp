@@ -66,19 +66,27 @@ void gemv_add_f32(const float * __restrict W, const float * __restrict x,
     }
 }
 
+// QVAC-18264 — `layer_input_scratch` lifted out of the per-call
+// allocator. EOU emits ~250 tokens per 11s utterance, each calling
+// lstm_step once, so a single-decode allocation count of 250 vs. 1
+// at H_pred=640 (2.5 KB each) shaves ~1.6 MB of malloc/free traffic
+// off the inner loop.  Byte-equal output: each call resizes to H
+// and the inner gemv writes every byte before reading, so no stale
+// state can leak between calls.
 void lstm_step(const EouRuntimeWeights & W,
                const float * __restrict x_input,
                float * __restrict h_state,
                float * __restrict c_state,
-               std::vector<float> & scratch) {
+               std::vector<float> & scratch,
+               std::vector<float> & layer_input_scratch) {
     const int H = W.H_pred;
     const int L = W.L;
     const int G = 4 * H;
 
     scratch.resize((size_t) G);
+    layer_input_scratch.resize((size_t) H);
 
     const float * x = x_input;
-    std::vector<float> layer_input(H);
 
     for (int layer = 0; layer < L; ++layer) {
         const auto & w = W.lstm[layer];
@@ -100,28 +108,32 @@ void lstm_step(const EouRuntimeWeights & W,
             h_new[i] = o_g * std::tanh(c_new);
         }
 
-        std::memcpy(layer_input.data(), h_new, (size_t) H * sizeof(float));
-        x = layer_input.data();
+        std::memcpy(layer_input_scratch.data(), h_new, (size_t) H * sizeof(float));
+        x = layer_input_scratch.data();
     }
 }
 
+// QVAC-18264 — `tmp_scratch` lifted out of the per-call allocator.
+// Same rationale as `lstm_step`: ~250 calls per utterance, each
+// previously fresh-allocating an H-sized vector. gemv_f32 writes
+// every output byte before any read, so re-using the buffer is
+// byte-equal to the per-call allocation.
 void joint_step(const EouRuntimeWeights & W,
                 const float * __restrict enc,
                 const float * __restrict pred,
                 std::vector<float> & hidden,
-                std::vector<float> & logits) {
+                std::vector<float> & logits,
+                std::vector<float> & tmp_scratch) {
     const int H   = W.H_joint;
     const int De  = W.D_enc;
     const int Hp  = W.H_pred;
     const int Vp1 = W.V_plus_1;
 
     hidden.resize(H);
+    tmp_scratch.resize(H);
     gemv_f32(W.joint_enc_w.data(),  enc,  W.joint_enc_b.data(),  hidden.data(), H, De);
-    {
-        std::vector<float> tmp(H);
-        gemv_f32(W.joint_pred_w.data(), pred, W.joint_pred_b.data(), tmp.data(), H, Hp);
-        for (int i = 0; i < H; ++i) hidden[i] += tmp[i];
-    }
+    gemv_f32(W.joint_pred_w.data(), pred, W.joint_pred_b.data(), tmp_scratch.data(), H, Hp);
+    for (int i = 0; i < H; ++i) hidden[i] += tmp_scratch[i];
     for (int i = 0; i < H; ++i) hidden[i] = std::max(0.0f, hidden[i]);
 
     logits.resize(Vp1);
@@ -204,8 +216,10 @@ void eou_init_state(const EouRuntimeWeights & W, EouDecodeState & state) {
     // sees a sensible context (matches NeMo's `initialize_state` +
     // first decoder forward with `targets=[blank]`).
     std::vector<float> scratch;
+    std::vector<float> layer_input_scratch;
     const float * embed_row = W.embed.data() + (size_t) W.blank_id * H;
-    lstm_step(W, embed_row, state.h_state.data(), state.c_state.data(), scratch);
+    lstm_step(W, embed_row, state.h_state.data(), state.c_state.data(),
+              scratch, layer_input_scratch);
     std::memcpy(state.pred_out.data(),
                 state.h_state.data() + (size_t) (L - 1) * H,
                 (size_t) H * sizeof(float));
@@ -240,6 +254,8 @@ int eou_decode_window(const ParakeetCtcModel & model,
     const int max_syms = std::max(1, opts.max_symbols_per_step);
 
     std::vector<float> scratch_lstm;
+    std::vector<float> scratch_lstm_layer_input;
+    std::vector<float> scratch_joint_tmp;
     std::vector<float> scratch_joint_hidden;
     std::vector<float> scratch_joint_logits;
 
@@ -252,7 +268,8 @@ int eou_decode_window(const ParakeetCtcModel & model,
 
         while (state.symbols_this_step < max_syms) {
             joint_step(W, enc_frame, state.pred_out.data(),
-                       scratch_joint_hidden, scratch_joint_logits);
+                       scratch_joint_hidden, scratch_joint_logits,
+                       scratch_joint_tmp);
             ++out_steps;
 
             const int best = argmax_f32(scratch_joint_logits.data(), V_p1);
@@ -283,7 +300,8 @@ int eou_decode_window(const ParakeetCtcModel & model,
                 state.last_token = blank;
                 const float * embed_row = W.embed.data() + (size_t) blank * H;
                 lstm_step(W, embed_row, state.h_state.data(),
-                          state.c_state.data(), scratch_lstm);
+                          state.c_state.data(), scratch_lstm,
+                          scratch_lstm_layer_input);
                 std::memcpy(state.pred_out.data(),
                             state.h_state.data() + (size_t) (L - 1) * H,
                             (size_t) H * sizeof(float));
@@ -303,7 +321,8 @@ int eou_decode_window(const ParakeetCtcModel & model,
 
             const float * embed_row = W.embed.data() + (size_t) best * H;
             lstm_step(W, embed_row, state.h_state.data(),
-                      state.c_state.data(), scratch_lstm);
+                      state.c_state.data(), scratch_lstm,
+                      scratch_lstm_layer_input);
             std::memcpy(state.pred_out.data(),
                         state.h_state.data() + (size_t) (L - 1) * H,
                         (size_t) H * sizeof(float));

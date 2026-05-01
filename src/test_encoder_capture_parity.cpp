@@ -99,16 +99,21 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (model.model_type != ParakeetModelType::CTC) {
-        std::fprintf(stderr,
-            "[test-encoder-capture-parity] skip: only CTC GGUFs carry both "
-            "encoder_out and logits in `EncoderOutputs`; got '%s'\n",
-            model.model_type == ParakeetModelType::TDT ? "tdt"
-            : model.model_type == ParakeetModelType::EOU ? "eou"
-            : model.model_type == ParakeetModelType::SORTFORMER ? "sortformer"
-            : "unknown");
-        return 0;
-    }
+    // Capture-parity gate works on any model type. CTC GGUFs populate
+    // both `encoder_out` and `logits`; TDT/EOU/Sortformer GGUFs only
+    // populate `encoder_out` (their decoders consume `encoder_out` and
+    // produce their own logits separately). For those, `logits` is
+    // empty in BOTH calls, so the byte-equal check trivially holds —
+    // we keep it in the assertion path so any future change that
+    // accidentally starts populating logits on a TDT/EOU/Sortformer
+    // path will be caught.
+    const char * mt_name =
+        model.model_type == ParakeetModelType::CTC        ? "ctc"
+      : model.model_type == ParakeetModelType::TDT        ? "tdt"
+      : model.model_type == ParakeetModelType::EOU        ? "eou"
+      : model.model_type == ParakeetModelType::SORTFORMER ? "sortformer"
+      : "unknown";
+    std::fprintf(stderr, "[test-encoder-capture-parity] model_type=%s\n", mt_name);
 
     std::vector<float> samples;
     int sr = 0;
