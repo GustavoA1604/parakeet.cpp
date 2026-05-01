@@ -1,4 +1,5 @@
-// miniaudio implementation lives in examples/miniaudio_impl.cpp.
+// miniaudio implementation lives in examples/miniaudio_impl.cpp so
+// MINIAUDIO_IMPLEMENTATION is not duplicated across example targets.
 #include "miniaudio.h"
 
 #include "parakeet/engine.h"
@@ -13,10 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -252,11 +251,7 @@ int main(int argc, char ** argv) {
     };
 
     auto on_tx = [&](const StreamingSegment & seg) {
-        // EOU GGUFs raise `is_eou_boundary=true` on chunks where the
-        // model emitted the `<EOU>` end-of-user-turn token (see
-        // live-mic.cpp for the full rationale). The boundary may fire
-        // on the SAME chunk as the trailing speech tokens or on a
-        // SEPARATE post-speech silence chunk; we handle both cases.
+        // EOU models: `is_eou_boundary` when `<EOU>` fired (same semantics as live-mic).
         if (!args.accumulate) {
             const int spk = speaker_for_range(diar_history, seg.start_s, seg.end_s);
             if (!seg.text.empty()) {
@@ -310,7 +305,6 @@ int main(int argc, char ** argv) {
             last_voice_end_s = seg.end_s;
         }
 
-        // <EOU> boundary -> hard line flush in accumulate mode.
         if (seg.is_eou_boundary && line_open) {
             std::fputs("  <EOU>\n", stdout);
             std::fflush(stdout);

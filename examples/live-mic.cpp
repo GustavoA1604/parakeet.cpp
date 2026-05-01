@@ -1,6 +1,5 @@
 // miniaudio implementation lives in examples/miniaudio_impl.cpp so
-// multiple example targets can include the header without colliding
-// on the single-translation-unit MINIAUDIO_IMPLEMENTATION macro.
+// MINIAUDIO_IMPLEMENTATION is not duplicated across example targets.
 #include "miniaudio.h"
 
 #include "parakeet/engine.h"
@@ -15,7 +14,6 @@
 #include <cstring>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -198,19 +196,7 @@ int main(int argc, char ** argv) {
         sopts.right_lookahead_ms = args.right_ms;
         tx_sess = engine.stream_start(sopts,
             [&](const parakeet::StreamingSegment & seg) {
-                // EOU GGUFs raise `is_eou_boundary=true` on the chunk
-                // where the model's joint network emitted the `<EOU>`
-                // token (i.e. natural end-of-user-turn). The token
-                // itself is not in `seg.text` because the decoder
-                // consumes it for its segment-flush + LSTM-state-reset
-                // side effect; the boolean field is the surfacing
-                // signal. CTC / TDT segments leave it false.
-                //
-                // Two cases: the boundary may fire on the SAME chunk
-                // as the trailing speech tokens, or on a SEPARATE
-                // post-speech silence chunk (text empty). We emit a
-                // dedicated `<EOU>` line in both cases so the event is
-                // always visible.
+                // EOU models: `is_eou_boundary` when `<EOU>` fired (often absent from `seg.text`).
                 if (!args.accumulate) {
                     if (!seg.text.empty()) {
                         std::printf("\033[2K\r[%.2f-%.2f]%s\n",
@@ -239,11 +225,6 @@ int main(int argc, char ** argv) {
                     last_voice_end_s = seg.end_s;
                 }
 
-                // In --accumulate mode, an <EOU> boundary acts as a
-                // hard line break: flush the current accumulated turn
-                // immediately, regardless of the silence-timeout path
-                // below. This is the natural mapping of a turn-boundary
-                // signal onto the one-line-per-turn output mode.
                 if (seg.is_eou_boundary && line_open) {
                     std::fputs("  <EOU>\n", stdout);
                     std::fflush(stdout);
