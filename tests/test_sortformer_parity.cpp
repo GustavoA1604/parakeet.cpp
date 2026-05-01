@@ -162,14 +162,14 @@ int main(int argc, char ** argv) {
     std::fprintf(stderr, "[sf-parity] enc  : max_abs=%.4e rel=%.4e  (%s, rel tol=%.1e)\n",
                  max_abs_enc, rel_enc, enc_pass ? "PASS" : "FAIL", enc_rel_tol);
 
-    SortformerRuntimeWeights W;
-    if (sortformer_prepare_runtime(model, W) != 0) return 8;
+    ggml_backend_t backend = model_active_backend(model);
+    if (!backend) { std::fprintf(stderr, "  error: no active ggml backend\n"); return 8; }
     SortformerDiarizationOptions dopts;
     SortformerDiarizationResult dres;
-    if (sortformer_diarize(model, W,
-                           enc_out.encoder_out.data(),
-                           enc_out.n_enc_frames, enc_out.d_model,
-                           dopts, dres) != 0) return 9;
+    if (sortformer_diarize_ggml(model,
+                                enc_out.encoder_out.data(),
+                                enc_out.n_enc_frames, enc_out.d_model,
+                                backend, dopts, dres) != 0) return 9;
 
     int worst = 0;
 
