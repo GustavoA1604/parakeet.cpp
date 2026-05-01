@@ -1,3 +1,10 @@
+// Log-mel parity vs NeMo reference dump for a wav file.
+//
+// Usage:
+//   test-mel <parakeet-ctc.gguf> <input.wav> <ref-mel.npy>
+//
+// Exit 0 on success; non-zero on failure or invalid arguments.
+
 #include "mel_preprocess.h"
 #include "parakeet_ctc.h"
 

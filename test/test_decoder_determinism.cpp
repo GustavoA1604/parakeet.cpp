@@ -1,61 +1,11 @@
-// Decoder determinism regression gate.
-//
-// Asserts that running the same decoder N times against the same encoder
-// output produces byte-equal results every time, and that the public
-// `Engine::transcribe()` / `Engine::diarize()` paths are deterministic
-// across repeated calls on the same Engine instance.
-//
-// Rationale (why this test is needed BEFORE any optimisation change):
-//
-//   * The follow-up optimization sweep on TDT/EOU/Sortformer plans to
-//     replace per-call `std::vector<float>` scratch allocations with
-//     reusable scratch buffers owned by the runtime weights / decode
-//     state. That change introduces *cross-call state* that doesn't
-//     exist today. Without an explicit determinism gate, a leaked
-//     scratch entry (e.g. a residual non-zero from the previous call's
-//     softmax denominator) could silently bias the next call's output
-//     in a way the existing parity-vs-NeMo gate (`max_abs < 5e-3`)
-//     happens to swallow.
-//
-//   * The existing `test-tdt-encoder-parity` /
-//     `test-tdt-decoder-parity` / `test-sortformer-parity` /
-//     `test-eou-streaming` harnesses each load the model once and
-//     run the decode pipeline once, so they wouldn't catch a
-//     "second-call drift" the way a multi-call gate does.
-//
-// What this asserts:
-//
-//   1. For each model type (CTC / TDT / EOU / Sortformer):
-//        * Engine::transcribe(samples, sr) (or Engine::diarize(samples,
-//          sr) for Sortformer) called N=5 times in a row produces
-//          byte-equal output every call. For CTC/TDT/EOU we compare
-//          token_ids (exact integer match) AND the textual transcript;
-//          for Sortformer we compare speaker_probs (bit-equal float
-//          buffer) AND the segment list (start/end/speaker_id).
-//
-//   2. Encoder cache hit ratio: total wall time of run K ≤ total wall
-//      time of run 0 × 1.10. This catches the tangentially-related
-//      regression where a buffer-reuse change accidentally rebuilds
-//      the encoder graph each call (since the encoder is shared across
-//      all four decoder paths, but its cache key is independent of
-//      which decoder is wired up).
-//
-// What this does NOT assert:
-//
-//   * Anything about the *correctness* of the output vs. NeMo —
-//     `test-tdt-decoder-parity`, `test-tdt-encoder-parity`,
-//     `test-sortformer-parity`, `test-eou-streaming` cover that and
-//     are explicitly orthogonal to this gate.
-//   * Anything about per-call timing within a single run — that's
-//     the job of `test-perf-regression` (which is currently
-//     CTC/TDT/EOU only; Sortformer's diarize path is gated separately
-//     here purely on determinism, since there's no perf harness that
-//     understands `Engine::diarize`).
+// Decoder determinism across repeated transcribe/diarize calls on one Engine.
 //
 // Usage:
-//   test-decoder-determinism --model <gguf> --wav <wav> [--runs N] [--n-gpu-layers N]
+//   test-decoder-determinism --model <gguf> --wav <wav> [--runs N] [--threads N]
+//       [--n-gpu-layers N] [--cache-hit-ratio R] [--prewarm]
+//       [--prewarm-audio-seconds F] [--cold-overhead-max R] [--verbose]
 //
-// Returns 0 on success, non-zero on parity failure or setup error.
+// Exit 0 on success; non-zero on failure or invalid arguments.
 
 #include "parakeet/engine.h"
 

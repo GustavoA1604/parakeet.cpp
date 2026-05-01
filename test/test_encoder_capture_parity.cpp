@@ -1,30 +1,9 @@
-// Internal regression gate for the round-1 capture_intermediates
-// flag. The flag was added on `run_encoder()` to let the
-// production transcribe / diarize / streaming paths skip 7 host-bound
-// `ggml_backend_tensor_get` round-trips per inference. The shipped
-// behaviour relies on the invariant:
+// Encoder capture parity: run_encoder with capture=true vs false yields identical encoder_out and logits.
 //
-//   For any (model, mel) combination, run_encoder(..., capture=true)
-//   and run_encoder(..., capture=false) must produce IDENTICAL
-//   `encoder_out` and `logits` outputs. Only the per-stage capture
-//   tensors (subsampling_out, block_0_post_*, block_0_out,
-//   block_last_out) differ -- they are populated when capture=true
-//   and left empty when capture=false.
+// Usage:
+//   test-encoder-capture-parity --model <gguf> --wav <wav>
 //
-// This test exercises that invariant directly: same model, same mel,
-// two `run_encoder` calls with the flag flipped, asserted bit-equal
-// on the two output tensors plus the contract on the capture vectors.
-//
-// Without this gate, a future refactor that subtly changes the
-// capture-skip path (e.g. reordering tensor-get calls, accidentally
-// stripping `ggml_set_output` markings on the wrong nodes) could
-// produce slightly different `encoder_out` bytes that the existing
-// test-streaming gate happens to argmax-collapse into the same
-// transcript -- masking a real numerical drift.
-//
-// Built as `test-encoder-capture-parity` via the
-// PARAKEET_BUILD_TESTS block. Takes the same `--model` /
-// `--wav` args as test-encoder.
+// Exit 0 on success; non-zero on failure or invalid arguments.
 
 #include "parakeet_ctc.h"
 #include "mel_preprocess.h"

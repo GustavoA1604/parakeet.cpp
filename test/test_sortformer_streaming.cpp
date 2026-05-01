@@ -1,3 +1,10 @@
+// Sortformer streaming session sanity (Mode 3-style chunking).
+//
+// Usage:
+//   test-sortformer-streaming [--model <gguf>] [--wav <wav>]
+//
+// Exit 0 on success or skip when defaults missing; non-zero on failure.
+
 #include "parakeet/engine.h"
 
 #include <atomic>

@@ -1,13 +1,12 @@
 // CPU vs Vulkan encoder bisect.
 //
+// Loads the model on CPU and Vulkan, runs both encoders on identical mel, and
+// reports per-stage parity (max abs diff + relative L2).
+//
 // Usage:
 //   test-vk-vs-cpu <gguf> <wav>
 //
-// Loads the same model twice (once CPU, once Vulkan), computes mel from the
-// wav on the CPU side, runs both encoders on that identical mel input, and
-// reports per-stage parity (max abs diff + relative L2) so we can see exactly
-// at which encoder stage the Vulkan path starts producing garbage on this
-// hardware.
+// Exit 0 on success; non-zero on failure or invalid arguments.
 
 #include "parakeet_ctc.h"
 #include "mel_preprocess.h"

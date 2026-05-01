@@ -1,22 +1,11 @@
-// TDT decoder parity test.
+// TDT decoder parity vs reference token IDs (NeMo dump or cross-backend).
 //
-// Validates the TDT decoder by running the same WAV through `tdt_greedy_decode`
-// once and comparing the produced token-ID stream against a reference list.
-//
-// The reference can come from two sources:
-//   1. NeMo (preferred): produced by `scripts/dump-tdt-reference.py`, which
-//      writes `<ref-dir>/token_ids.npy`. This is the strongest gate: it
-//      proves the C++ greedy loop matches the NeMo reference bit-for-bit.
-//   2. A second internal run on the alternate backend, when one is available.
-//      This catches CPU-vs-Metal divergence in the new ggml graph path.
-//
-// Greedy TDT decoding is deterministic, so an exact integer match is the
-// correct invariant. We do NOT compare logits in float — only the token IDs.
+// Greedy decoding is deterministic; this compares integer token IDs only.
 //
 // Usage:
 //   test-tdt-decoder-parity <gguf> <wav> [<ref-dir>]
 //
-// Returns 0 on success, non-zero on parity failure or setup error.
+// Exit 0 on success; non-zero on failure or invalid arguments.
 
 #include "parakeet_ctc.h"
 #include "parakeet_tdt.h"

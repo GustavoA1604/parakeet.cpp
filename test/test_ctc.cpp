@@ -1,3 +1,12 @@
+// CTC greedy decode parity vs dumped NeMo logits.
+//
+// Replays reference logits through the C++ decoder and checks the transcript.
+//
+// Usage:
+//   test-ctc <parakeet-ctc.gguf> <reference-logits.npy> [<decoded.txt>]
+//
+// Exit 0 on success; non-zero on failure or invalid arguments.
+
 #include "parakeet_ctc.h"
 #include "sentencepiece_bpe.h"
 

@@ -1,3 +1,10 @@
+// EOU streaming parity across transcribe, transcribe_stream, and stream_start.
+//
+// Usage:
+//   test-eou-streaming --model <parakeet-eou.gguf> --wav <input.wav> [--threads N] [--n-gpu-layers N] [--verbose]
+//
+// Exit 0 on success; non-zero on failure or invalid arguments.
+
 #include "parakeet/engine.h"
 
 #include <cstdio>

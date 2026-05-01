@@ -1,3 +1,10 @@
+// TDT encoder parity vs NeMo reference tensors under ref-dir/.
+//
+// Usage:
+//   test-tdt-encoder-parity <parakeet-tdt.gguf> <wav> <ref-dir>
+//
+// Exit 0 on success; non-zero on failure or invalid arguments.
+
 #include "parakeet_ctc.h"
 #include "mel_preprocess.h"
 

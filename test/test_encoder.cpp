@@ -1,3 +1,10 @@
+// Encoder stage parity vs NeMo reference tensors under reference-dir/.
+//
+// Usage:
+//   test-encoder <parakeet-ctc.gguf> <reference-dir> [n_gpu_layers]
+//
+// Exit 0 on success; non-zero on failure or invalid arguments.
+
 #include "parakeet_ctc.h"
 #include "mel_preprocess.h"
 

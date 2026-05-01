@@ -1,3 +1,10 @@
+// Streaming API parity: Mode 2 vs Mode 1 and Mode 3 error handling.
+//
+// Usage:
+//   test-streaming --model <parakeet-ctc.gguf> --wav <input.wav> [--threads N] [--n-gpu-layers N] [--verbose]
+//
+// Exit 0 on success; non-zero on failure or invalid arguments.
+
 #include "parakeet/engine.h"
 
 #include <algorithm>

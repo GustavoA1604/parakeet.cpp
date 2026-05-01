@@ -1,17 +1,12 @@
-// Light-weight perf-regression smoke for the audit/optimization pass.
-// Runs the public Engine::transcribe() path N times and asserts:
-//   1. Every run produces the byte-equal reference transcript.
-//   2. The encoder graph cache hits after the first call (subsequent
-//      `enc_ms` values are at most 1.05x the median of the warm runs).
-//   3. The total wall time stays within an explicit ceiling
-//      (passed in via --max-encoder-ms, default 600 ms on Q8_0 CPU).
+// Perf regression smoke for repeated Engine transcribe/diarize calls.
 //
-// Build target: test-perf-regression (added in CMakeLists.txt). Used to
-// catch silent perf regressions introduced by the optimization sweep
-// (e.g. cache-key mismatches that re-build the graph every call,
-// extra per-call allocations, accidentally re-enabled per-stage tensor
-// captures on the production transcribe path, ...). Designed to run in
-// well under a minute on a 16-thread Ryzen.
+// Asserts stable transcript or Sortformer fingerprint, encoder cache reuse, and
+// optional timing ceilings (see --help).
+//
+// Usage:
+//   test-perf-regression --model <gguf> --wav <wav> [options]
+//
+// Exit 0 on success; non-zero on regression or invalid arguments.
 
 #include "parakeet/engine.h"
 

@@ -1,3 +1,10 @@
+// Sortformer encoder and head parity vs NeMo reference tensors.
+//
+// Usage:
+//   test-sortformer-parity <sortformer.gguf> <wav> <ref-dir> [--enc-rel-tol R] [--probs-abs-tol R]
+//
+// Exit 0 on success; non-zero on failure or invalid arguments.
+
 #include "parakeet_ctc.h"
 #include "parakeet_sortformer.h"
 #include "mel_preprocess.h"

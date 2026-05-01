@@ -1,34 +1,11 @@
-// Internal regression gate for the round-2 mel preprocess sweep.
-// Three sections:
+// Mel preprocess regression tests (FFT spectrum, MelState, repeated-call invariance).
 //
-//   1. Real-FFT power-spectrum parity: rebuild the textbook radix-2
-//      complex FFT on real input here in the test, run both the
-//      reference and the production `compute_log_mel` against the
-//      *same* synthetic signal, and assert the resulting log-mel
-//      output stays bit-equal across many invocations. This catches
-//      future modifications to `rfft_power_radix2` or the twiddle
-//      cache that drift the spectrum without breaking the existing
-//      end-to-end transcript gate.
+// Pure unit test; no GGUF or weights.
 //
-//   2. MelState stateful-vs-stateless equivalence: run both
-//      `compute_log_mel` overloads on identical input and assert
-//      every output sample is bit-equal. Catches state contamination
-//      bugs in any future MelState refactor.
+// Usage:
+//   test-mel-fft-parity
 //
-//   3. MelState repeated-call invariance: drive the stateful overload
-//      N times with the same input and assert every output is
-//      bit-equal to the first. Catches scratch-buffer leak / dirty-
-//      state bugs that only show up after the first call.
-//
-// Pure unit test -- needs no GGUF, no model weights, no NeMo
-// reference. Builds + runs in milliseconds. Built as
-// `test-mel-fft-parity` via the `PARAKEET_BUILD_TESTS` block in
-// the parent CMakeLists.txt.
-//
-// The synthetic MelConfig uses a Hann analysis window (matches NeMo
-// shape) but a deterministic non-NeMo filterbank (m + 1.0 / (k + 1)),
-// since the test only cares about internal consistency, not parity
-// with the NeMo PyTorch reference (that's `test-mel`'s job).
+// Exit 0 on success; non-zero on failure.
 
 #include "mel_preprocess.h"
 
