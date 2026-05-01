@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
-"""Pure-PyTorch reference encoder that loads weights directly from our GGUF.
+"""Pure-PyTorch FastConformer encoder with weights loaded from a parakeet GGUF.
 
-Validates two things at once:
-
-  1. GGUF tensor layout semantics (shapes, transposes, BN fuse, f16 round-trip)
-     match what the C++ side will read.
-  2. Our understanding of NeMo's FastConformer-CTC forward is correct, by
-     producing intermediate tensors that should match NeMo's dumps.
-
-If this script passes against the NeMo `.npy` references, then:
-
-  - The C++ ggml port has a line-by-line spec to mirror.
-  - Any C++ bug surfaces as a divergence from THIS script, not from NeMo.
+Compare tensor outputs to ``dump-ctc-reference.py`` artifacts to validate GGUF layout
+and the forward pass against NeMo references.
 
 Usage:
 

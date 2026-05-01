@@ -39,7 +39,7 @@ Each GGUF bundles weights, mel filterbank, and tokenizer as needed.
 ## Prerequisites
 
 - C++17, CMake ≥ 3.14  
-- Python (torch, `nemo_toolkit[asr]`, `gguf`, numpy, librosa, …) **only** for `scripts/convert-nemo-to-gguf.py` and `dump-*-reference.py`
+- Python (torch, `nemo_toolkit[asr]`, `gguf`, numpy, librosa, …) **only** for the scripts under §2 and §4 (`convert-nemo-to-gguf.py`, NeMo reference dumps, and the optional maintainer scripts listed at the end of §4).
 
 ## 1. Clone and build
 
@@ -209,7 +209,7 @@ Speaker-attributed transcription (CTC/TDT **`--model`** + Sortformer **`--diariz
 ```bash
 ./build/parakeet --model models/parakeet-tdt-0.6b-v3.q8_0.gguf \
   --diarization-model models/sortformer-4spk-v1.f16.gguf \
-  --wav meeting.wav --emit text
+  --wav test/samples/diarization-sample-16k.wav --emit text
 ```
 
 Benchmark timing (transcript printed once after stats):
@@ -286,6 +286,14 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+Optional maintainer scripts (not required for the workflow above):
+
+| Script | Role |
+|--------|------|
+| `verify-gguf-roundtrip.py` | Each GGUF tensor vs NeMo `state_dict` after the same layout rules as the converter; catches converter regressions. |
+| `ref-encoder-from-gguf.py` | PyTorch encoder from GGUF weights; diff vs `dump-ctc-reference.py` `.npy` outputs to debug layout. |
+| `streaming-reference.py` | Chunked CTC with context windows; sanity-check streaming-style output vs offline NeMo. |
+
 Missing fixtures **disable** individual tests (not fail). Labels: `ctest -L unit`, `-L fixture`, `-L perf`, `-L gpu`.
 
 | CMake cache var | Default | Contents |
@@ -312,7 +320,7 @@ Typical f16 stage rel vs NeMo (order of magnitude): mel ~1e-4 inner, blocks ~1e-
 | `include/parakeet/` | Public headers (`parakeet.h`, `engine.h`, `streaming.h`, …) |
 | `test/` | `test_*.cpp` CTest sources |
 | `examples/` | `live-mic`, `live-mic-attributed`, vendored miniaudio |
-| `scripts/` | Convert, dump references, `download-all-models.sh`, … |
+| `scripts/` | `setup-ggml.sh`, conversion, NeMo dumps, `download-all-models.sh`; optional tools in §4 |
 | `ggml/` | Pinned submodule (or `-DPARAKEET_USE_SYSTEM_GGML=ON`) |
 | `models/`, `artifacts/`, `test/samples/` | Local fixtures (not tracked) |
 | `PROGRESS.md` | Detailed history and parity notes |

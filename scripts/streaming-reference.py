@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
-"""Python reference for cache-aware inference on an offline Parakeet-CTC-0.6B.
+"""Python reference for chunked CTC inference with left/right context (offline weights).
 
-Implements the "chunking-with-context" streaming strategy (Phase 8.1a):
-
-    for each chunk k with [start_s, end_s):
-        window_start = max(0,        start_s - left_context_s)
-        window_end   = min(audio_end, end_s   + right_lookahead_s)
-        mel = parakeet.preprocessor(audio[window_start : window_end])
-        logits = encoder(mel) + ctc_head(...)                 # reuse offline weights
-        emit logits[frame(start_s - window_start) : frame(end_s - window_start)]
-
-Per-chunk prev_token is carried across chunk boundaries so the CTC greedy
-collapse gives the same transcript as a full-utterance offline pass (up to
-any accuracy hit from per-window CMVN + shortened attention context).
+For each chunk [start_s, end_s), uses audio [max(0,start-left), min(end+right,audio_end)],
+runs preprocessor + encoder + CTC on that window, emits logits for frames overlapping the chunk,
+and carries greedy previous-token state across chunks.
 
 Example:
 

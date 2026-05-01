@@ -2,8 +2,8 @@
 """Dump per-stage reference tensors from NeMo for Parakeet-TDT numerical parity.
 
 Produces a directory of .npy files + the NeMo reference transcript; used by
-the C++ TDT bring-up to validate encoder output and decoder state transitions
-bit-for-bit (at f16 quant precision):
+C++ tests (test-tdt-encoder-parity, test-tdt-decoder-parity) to validate encoder
+output and decoder state at f16 precision:
 
     <out>/
         mel.npy              (n_mels, T_mel)   post-preprocessor log-mel

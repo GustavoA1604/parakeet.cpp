@@ -24,10 +24,9 @@ conv module's BatchNorm for a LayerNorm and carries cache-aware streaming
 hyperparameters (att_context_size, subsampling-output cache lookback, and the
 chunk size used by the binding's reference EOU pipeline) in metadata.
 
-Footgun: the script's ``--hf-repo`` default is ``nvidia/parakeet-ctc-0.6b``,
-so when ``--ckpt`` points at a non-CTC path that does not exist locally
-**you must pass ``--hf-repo`` explicitly** -- otherwise the script will
-download the CTC checkpoint instead of the one named in ``--ckpt``.
+Warning: the script's ``--hf-repo`` default is ``nvidia/parakeet-ctc-0.6b``.
+When ``--ckpt`` names a non-CTC file that is not present locally, pass ``--hf-repo``
+explicitly or the downloader may fetch the default CTC checkpoint instead.
 
 Output GGUF layout (see src/parakeet_ctc.h / src/parakeet_tdt.h /
 src/parakeet_sortformer.h for the consumer structs):

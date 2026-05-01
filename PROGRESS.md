@@ -3155,9 +3155,8 @@ shifted the BD computation order; Metal was never tested.
 **What changed:** `CMakeLists.txt` now derives a per-backend
 default. When `GGML_METAL=ON` the option defaults to ON; CPU /
 CUDA / Vulkan / OpenCL keep their existing OFF default until each
-ships its own A/B (CUDA can be exercised through
-`scripts/bench-non-apple.sh` once a discrete-GPU host is
-available). No source files in `src/` changed — the
+ships its own A/B (CUDA can be exercised with a local `-DGGML_CUDA=ON` build
+and `parakeet --bench` when a discrete-GPU host is available). No source files in `src/` changed — the
 `#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN` branch in
 `parakeet_ctc.cpp::rel_pos_mha_graph` is what gets compiled in.
 

@@ -5,9 +5,8 @@ EOU = ``nvidia/parakeet_realtime_eou_120m-v1`` (FastConformer-RNN-T 120M,
 English, 17 encoder layers, ``att_context_size=[70, 1]`` chunked-limited,
 ``<EOU>`` end-of-utterance token).
 
-Produces a directory of .npy files + the NeMo *offline* reference transcript;
-consumed by the C++ EOU bring-up to validate encoder output and decoder state
-transitions bit-for-bit (at f16 quant precision):
+Produces a directory of .npy files + the NeMo *offline* reference transcript for
+C++ encoder/decoder parity tests:
 
     <out>/
         mel.npy              (n_mels, T_mel)   post-preprocessor log-mel (offline)
@@ -21,13 +20,9 @@ transitions bit-for-bit (at f16 quant precision):
                                                token (sanity check that our embed +
                                                LSTM matches NeMo)
 
-NeMo also exposes a ``model.encoder.cache_aware_stream_step`` chunked-limited
-streaming forward pass. This script intentionally does **not** dump references
-from that path: driving streaming-trained Parakeet checkpoints through
-chunked-limited streaming inference was evaluated and rejected on quality
-grounds (PROGRESS.md §8.5 case (A)). Adding back a streaming-reference dump
-here is a strong signal that someone is about to redo the rejected exploration;
-read PROGRESS.md §8.5 first.
+Uses full-utterance offline NeMo forward only. NeMo also offers ``cache_aware_stream_step``
+for chunked streaming; this script does not dump that path (the C++ stack validates against
+offline references).
 """
 
 import argparse
@@ -87,8 +82,7 @@ def main():
         np.save(args.out / "mel.npy", mel[0].detach().cpu().numpy().astype(np.float32))
         print(f"[eou-ref] mel: {tuple(mel.shape)} -> mel.npy", file=sys.stderr)
 
-        # Dump intermediates: post-subsampler (pre_encode output) and per-block
-        # outputs after blocks 0 and (n_layers-1) for parity bring-up.
+        # Post-subsampler and encoder taps for C++ encoder parity tests.
         intermediates = {}
 
         sub_out, sub_len = model.encoder.pre_encode(x=mel.transpose(1, 2), lengths=mel_len)
