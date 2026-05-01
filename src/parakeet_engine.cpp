@@ -65,6 +65,76 @@ struct Engine::Impl {
     Impl() = default;
 };
 
+// QVAC-18264 R4 — opt-in encoder prewarm. Runs one synthetic
+// forward pass through the encoder so the cold-graph-build cost is
+// amortised into Engine construction instead of warmup_1.
+//
+// What this catches across backends:
+//   * Metal: triggers MSL → MTLPipelineState compile.
+//   * OpenCL: triggers clBuildProgram for every kernel variant the
+//             encoder graph touches; binaries get cached via the
+//             QVAC-17997 program-binary-cache patch when
+//             GGML_OPENCL_CACHE_DIR is set, so subsequent processes
+//             skip even this prewarm cost.
+//   * Vulkan: triggers vkCreateGraphicsPipelines (matches what the
+//             QVAC-17872 ggml-vulkan-pipeline-cache patch caches).
+//   * CUDA: triggers cuGraphInstantiate.
+//   * CPU: pre-builds the ggml graph nodes + scratch + caches them
+//          via the same encoder_graphs LRU as a real call.
+//
+// Mel input is all-zero (filterbank output for a silent buffer is
+// the model's mel_floor / log_zero_guard, but for warmup we just
+// need any valid-shape input that flows through every node — zeros
+// are fine; log-mel of true zeros is effectively `log(eps)`, no NaN
+// risk because compute_log_mel + run_encoder both apply the model's
+// log_zero_guard from the GGUF metadata).
+//
+// Shape: `prewarm_audio_seconds * sample_rate` samples mapped to
+// `(prewarm_audio_seconds * sr / hop)` mel frames. Encoder cache
+// is shape-keyed on `(T_mel, layers, all_valid)`, so a real call
+// with a different T_mel will trigger a fresh graph build — but on
+// Metal/OpenCL/Vulkan the *kernel pipeline cache* is keyed on
+// kernel signature, not graph shape, so prewarm with any shape
+// still warms the relevant compile cost.
+//
+// Cost: typically 50-300 ms on the first construction; subsequent
+// constructions in the same process land near zero (encoder cache
+// + GPU pipeline cache hit).
+static void prewarm_encoder(ParakeetCtcModel & model, float audio_seconds) {
+    if (audio_seconds <= 0.0f) audio_seconds = 1.0f;
+
+    const int sr  = model.mel_cfg.sample_rate > 0 ? model.mel_cfg.sample_rate : 16000;
+    const int hop = model.mel_cfg.hop_length   > 0 ? model.mel_cfg.hop_length   : 160;
+
+    // Frame count derived directly from the audio-seconds knob; we
+    // skip compute_log_mel entirely (the host-side mel pipeline
+    // doesn't have any cold-build state worth amortising) and feed
+    // the encoder zeros at the correct shape.
+    const int n_frames = std::max(8,
+        (int) std::lround((double) audio_seconds * (double) sr / (double) hop));
+    const int n_mels   = model.mel_cfg.n_mels > 0 ? model.mel_cfg.n_mels : 80;
+
+    std::vector<float> zeros((size_t) n_frames * (size_t) n_mels, 0.0f);
+
+    EncoderOutputs out;
+    // capture_intermediates=false: production-shape call (no
+    // per-stage host roundtrips); same `false` the QVAC-17997 audit
+    // wired into Engine::transcribe_*. capture=false keeps the
+    // graph topology identical to a real call so the kernel
+    // pipeline cache hit is real.
+    if (int rc = run_encoder(model, zeros.data(), n_frames, n_mels, out,
+                             /*max_layers=*/-1,
+                             /*capture_intermediates=*/false); rc != 0) {
+        // Don't fail construction — the user's first transcribe
+        // call will surface the same error with full context.
+        // Just log so the field is observable.
+        std::fprintf(stderr,
+            "[parakeet] prewarm_encoder: run_encoder rc=%d (T_mel=%d, n_mels=%d) -- "
+            "first transcribe will pay the cold cost the prewarm was meant to cover\n",
+            rc, n_frames, n_mels);
+    }
+}
+
 Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
     pimpl_->opts = opts;
 
@@ -93,6 +163,10 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
     }
     if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
         pimpl_->sortformer_ready = true;
+    }
+
+    if (opts.prewarm) {
+        prewarm_encoder(pimpl_->model, opts.prewarm_audio_seconds);
     }
 }
 

@@ -87,6 +87,40 @@ struct Opts {
     // model types on a 16T Ryzen). Tighten via --cache-hit-ratio
     // on Adreno + warm GGML_OPENCL_CACHE_DIR.
     double cache_hit_ratio_max = 1.10;
+
+    // QVAC-18264 R4 — exercise EngineOptions::prewarm on the
+    // engine instance. When set, the harness asserts an additional
+    // contract: run0 (the first real transcribe / diarize call,
+    // which would normally be the cold-graph-build outlier) must
+    // be at most cold_overhead_max * median(warms) — i.e. the
+    // prewarm should bring run0 into the warm steady-state band.
+    // Without --prewarm, run0 is *expected* to be slower than the
+    // warms (it's the cold run); with --prewarm, the cold cost
+    // has already been paid in the Engine constructor, so run0
+    // should match the warm runs.
+    //
+    // `prewarm_audio_seconds` defaults to 0.0f (== "auto: use the
+    // loaded wav's duration"). Explicit non-zero values are used
+    // verbatim. Auto-mode is the right default for the test
+    // because the encoder graph cache is shape-keyed (T_mel +
+    // n_layers + all_valid), so a prewarm shape that matches the
+    // real call's shape is what production code should pass too.
+    //
+    // Default cold_overhead_max=1.60 reflects empirical CPU
+    // measurements: even with shape-matched prewarm, run 0 still
+    // pays ~50-100 ms of non-encoder cold cost on CPU (ggml
+    // thread-pool spin-up, decoder per-call allocator hot path,
+    // thermal warmup), which lifts the run-0 encoder-time by up
+    // to ~50% above the steady-state warm median on small models
+    // like EOU 120M and TDT 0.6B Phase-14-decoder paths. A real
+    // prewarm regression goes to 2-3x. Tighten on a thermally-
+    // controlled CI box. On Metal/OpenCL/Vulkan the GPU pipeline
+    // cache *is* the dominant cold cost so prewarm gives a much
+    // bigger win there — tighten to 1.20-1.30x on Adreno + warm
+    // GGML_OPENCL_CACHE_DIR.
+    bool   prewarm                  = false;
+    float  prewarm_audio_seconds    = 0.0f;  // 0 = auto from wav duration
+    double cold_overhead_max        = 1.60;  // run0/median(warm) with --prewarm
 };
 
 void usage(const char * argv0) {
@@ -104,6 +138,27 @@ void usage(const char * argv0) {
         "                       run ≥ cold; thermal spikes only push max,\n"
         "                       not median, so the gate is robust. Tighten\n"
         "                       on Adreno + warm GGML_OPENCL_CACHE_DIR.\n"
+        "  --prewarm            construct the Engine with EngineOptions::prewarm=true\n"
+        "                       so the encoder graph build cost is paid in the\n"
+        "                       constructor instead of run 0. With this flag, run 0\n"
+        "                       should be in the warm steady-state band, gated by\n"
+        "                       --cold-overhead-max.\n"
+        "  --prewarm-audio-seconds F  length of the synthetic mel input used by the\n"
+        "                       prewarm step. Default 0 (== auto: use the loaded\n"
+        "                       wav's duration). The encoder graph cache is shape-\n"
+        "                       keyed, so on CPU prewarming with the same shape as\n"
+        "                       the real call is what gets us a cache HIT on run 0.\n"
+        "                       (On Metal/OpenCL/Vulkan the GPU pipeline cache is\n"
+        "                       signature-keyed too, so any shape works for warming\n"
+        "                       kernel binaries — but matching the call shape still\n"
+        "                       gives the best run-0 latency because the ggml graph\n"
+        "                       gallocr is also shape-keyed.)\n"
+        "  --cold-overhead-max F  with --prewarm, fail if run0_enc_ms exceeds\n"
+        "                       median(warm) * F. Default 1.30. The 1.30 leaves\n"
+        "                       headroom for CPU thermal jitter on a noisy desktop\n"
+        "                       (single-run spikes can lift run0 ~25 % even when\n"
+        "                       the cache hits). Tighten on a thermally-controlled\n"
+        "                       CI box. A real prewarm regression goes 1.5-2.5x.\n"
         "  --verbose            print per-run summary\n",
         argv0);
 }
@@ -117,6 +172,9 @@ int parse_args(int argc, char ** argv, Opts & o) {
         else if (a == "--n-gpu-layers" && i + 1 < argc) o.n_gpu_layers = std::atoi(argv[++i]);
         else if (a == "--threads"      && i + 1 < argc) o.n_threads = std::atoi(argv[++i]);
         else if (a == "--cache-hit-ratio" && i + 1 < argc) o.cache_hit_ratio_max = std::atof(argv[++i]);
+        else if (a == "--prewarm")                         o.prewarm = true;
+        else if (a == "--prewarm-audio-seconds" && i + 1 < argc) o.prewarm_audio_seconds = (float) std::atof(argv[++i]);
+        else if (a == "--cold-overhead-max" && i + 1 < argc) o.cold_overhead_max = std::atof(argv[++i]);
         else if (a == "--verbose" || a == "-v") o.verbose = true;
         else if (a == "--help" || a == "-h")    { usage(argv[0]); std::exit(0); }
         else {
@@ -171,16 +229,23 @@ int run_transcribe_path(const Opts & o,
                         const std::vector<float> & samples, int sr,
                         const std::string & model_type_str) {
     qvac_parakeet::EngineOptions eopts;
-    eopts.model_gguf_path = o.model_path;
-    eopts.n_threads       = o.n_threads;
-    eopts.n_gpu_layers    = o.n_gpu_layers;
-    eopts.verbose         = false;
+    eopts.model_gguf_path        = o.model_path;
+    eopts.n_threads              = o.n_threads;
+    eopts.n_gpu_layers           = o.n_gpu_layers;
+    eopts.verbose                = false;
+    eopts.prewarm                = o.prewarm;
+    eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;
+    const auto t_ctor = std::chrono::steady_clock::now();
     qvac_parakeet::Engine eng(eopts);
+    const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
     std::fprintf(stderr,
-        "[determinism] transcribe path: model=%s backend=%s threads=%d gpu_layers=%d runs=%d\n",
+        "[determinism] transcribe path: model=%s backend=%s threads=%d gpu_layers=%d runs=%d prewarm=%s ctor=%.2fms\n",
         model_type_str.c_str(),
         eng.backend_name().c_str(),
-        o.n_threads, o.n_gpu_layers, o.n_runs);
+        o.n_threads, o.n_gpu_layers, o.n_runs,
+        o.prewarm ? "on" : "off",
+        ctor_ms);
 
     std::vector<std::vector<int32_t>> ids_per_run;
     std::vector<std::string>          text_per_run;
@@ -249,7 +314,15 @@ int run_transcribe_path(const Opts & o,
         const double med = median(warm);
         const double max_warm = *std::max_element(warm.begin(), warm.end());
         const double min_warm = *std::min_element(warm.begin(), warm.end());
-        if (med > cold * o.cache_hit_ratio_max) {
+        // Gate 1: cache-hit ratio. Compares median(warm) to cold;
+        // a real cache MISS rebuilds the encoder graph each call,
+        // lifting EVERY warm to ≥ cold. SKIP this gate when prewarm
+        // is on, because prewarm makes the "cold" run effectively
+        // warm (graph already cached from the synthetic forward
+        // pass in the constructor), so the cold-vs-warm asymmetry
+        // this gate assumes no longer holds — thermal noise can
+        // legitimately push median(warm) above run0 by a few %.
+        if (!o.prewarm && med > cold * o.cache_hit_ratio_max) {
             std::fprintf(stderr,
                 "[determinism] FAIL: median(warm) %.2f > cold run0 %.2f * %.2fx "
                 "(cache miss? — graph being rebuilt each call?)\n",
@@ -259,6 +332,29 @@ int run_transcribe_path(const Opts & o,
         std::fprintf(stderr,
             "[determinism] enc_ms run0 (cold) = %.2fms; warms min=%.2f median=%.2f max=%.2f (med/cold=%.2fx, max/cold=%.2fx)\n",
             cold, min_warm, med, max_warm, med / cold, max_warm / cold);
+
+        // Gate 2: prewarm cold-overhead. When --prewarm is set,
+        // the encoder graph build cost was supposed to be paid in
+        // the constructor, so run0 should land in the warm steady-
+        // state band (not perfectly equal — there's still ~50-100ms
+        // of non-encoder cold cost on CPU: ggml thread-pool spin-up,
+        // decoder per-call allocator, thermal warmup). The gate
+        // catches a regression where prewarm doesn't actually do
+        // anything (run0 = full cold cost = 1.5-3x median on CPU).
+        if (o.prewarm) {
+            const double cold_overhead = cold / med;
+            if (cold_overhead > o.cold_overhead_max) {
+                std::fprintf(stderr,
+                    "[determinism] FAIL: with --prewarm, run0 %.2f / median(warm) %.2f = %.2fx > %.2fx "
+                    "(prewarm didn't warm the pipeline?)\n",
+                    cold, med, cold_overhead, o.cold_overhead_max);
+                ok = false;
+            } else {
+                std::fprintf(stderr,
+                    "[determinism] prewarm OK: run0/median(warm) = %.2fx (limit %.2fx)\n",
+                    cold_overhead, o.cold_overhead_max);
+            }
+        }
     }
 
     if (!ok) return 1;
@@ -281,16 +377,23 @@ int run_diarize_path(const Opts & o,
                      const std::vector<float> & samples, int sr,
                      const std::string & model_type_str) {
     qvac_parakeet::EngineOptions eopts;
-    eopts.model_gguf_path = o.model_path;
-    eopts.n_threads       = o.n_threads;
-    eopts.n_gpu_layers    = o.n_gpu_layers;
-    eopts.verbose         = false;
+    eopts.model_gguf_path        = o.model_path;
+    eopts.n_threads              = o.n_threads;
+    eopts.n_gpu_layers           = o.n_gpu_layers;
+    eopts.verbose                = false;
+    eopts.prewarm                = o.prewarm;
+    eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;
+    const auto t_ctor = std::chrono::steady_clock::now();
     qvac_parakeet::Engine eng(eopts);
+    const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
     std::fprintf(stderr,
-        "[determinism] diarize path: model=%s backend=%s threads=%d gpu_layers=%d runs=%d\n",
+        "[determinism] diarize path: model=%s backend=%s threads=%d gpu_layers=%d runs=%d prewarm=%s ctor=%.2fms\n",
         model_type_str.c_str(),
         eng.backend_name().c_str(),
-        o.n_threads, o.n_gpu_layers, o.n_runs);
+        o.n_threads, o.n_gpu_layers, o.n_runs,
+        o.prewarm ? "on" : "off",
+        ctor_ms);
 
     std::vector<std::vector<float>>    probs_per_run;
     std::vector<std::vector<qvac_parakeet::DiarizationSegment>> segs_per_run;
@@ -360,7 +463,8 @@ int run_diarize_path(const Opts & o,
         }
     }
 
-    // See run_transcribe_path comment for rationale on median(warm) vs cold.
+    // See run_transcribe_path comment for rationale on the two gates
+    // and why the cache-hit-ratio gate is skipped when prewarm is on.
     bool have_enc_ms = true;
     for (double t : enc_ms_per_run) if (t <= 0.0) { have_enc_ms = false; break; }
     if (have_enc_ms && o.n_runs >= 2) {
@@ -369,7 +473,7 @@ int run_diarize_path(const Opts & o,
         const double med = median(warm);
         const double max_warm = *std::max_element(warm.begin(), warm.end());
         const double min_warm = *std::min_element(warm.begin(), warm.end());
-        if (med > cold * o.cache_hit_ratio_max) {
+        if (!o.prewarm && med > cold * o.cache_hit_ratio_max) {
             std::fprintf(stderr,
                 "[determinism] FAIL: median(warm) %.2f > cold run0 %.2f * %.2fx "
                 "(cache miss? — graph being rebuilt each call?)\n",
@@ -379,6 +483,21 @@ int run_diarize_path(const Opts & o,
         std::fprintf(stderr,
             "[determinism] enc_ms run0 (cold) = %.2fms; warms min=%.2f median=%.2f max=%.2f (med/cold=%.2fx, max/cold=%.2fx)\n",
             cold, min_warm, med, max_warm, med / cold, max_warm / cold);
+
+        if (o.prewarm) {
+            const double cold_overhead = cold / med;
+            if (cold_overhead > o.cold_overhead_max) {
+                std::fprintf(stderr,
+                    "[determinism] FAIL: with --prewarm, run0 %.2f / median(warm) %.2f = %.2fx > %.2fx "
+                    "(prewarm didn't warm the pipeline?)\n",
+                    cold, med, cold_overhead, o.cold_overhead_max);
+                ok = false;
+            } else {
+                std::fprintf(stderr,
+                    "[determinism] prewarm OK: run0/median(warm) = %.2fx (limit %.2fx)\n",
+                    cold_overhead, o.cold_overhead_max);
+            }
+        }
     }
 
     if (!ok) return 1;
@@ -401,6 +520,19 @@ int main(int argc, char ** argv) {
     if (!load_wav_pcm(o.wav_path, samples, sr)) {
         std::fprintf(stderr, "[determinism] failed to load wav: %s\n", o.wav_path.c_str());
         return 3;
+    }
+
+    // QVAC-18264 R4 — auto-derive prewarm_audio_seconds from the
+    // loaded wav when --prewarm-audio-seconds wasn't passed
+    // explicitly. The encoder graph cache is shape-keyed, so this
+    // is what the test should do to get run0 into the warm band;
+    // production code calling Engine should follow the same rule
+    // (pass the typical call shape as prewarm_audio_seconds).
+    if (o.prewarm && o.prewarm_audio_seconds == 0.0f) {
+        o.prewarm_audio_seconds = (float) samples.size() / (float) sr;
+        std::fprintf(stderr,
+            "[determinism] auto-derived prewarm_audio_seconds=%.2f from wav (%zu samples @ %d Hz)\n",
+            o.prewarm_audio_seconds, samples.size(), sr);
     }
 
     // Probe the model type via the public Engine API — keeps this

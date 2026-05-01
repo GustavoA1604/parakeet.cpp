@@ -437,6 +437,18 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         LABEL    "perf"
         ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+    # QVAC-18264 R4 — Sortformer dispatch path for the perf-regression
+    # harness. Same gates (cache-hit ratio, cold-overhead, mel-ms ceiling)
+    # as transcribe-path; the only difference is that
+    # `engine.diarize(wav)` produces a `DiarizationResult` instead of an
+    # `EngineResult`, and the deterministic comparison runs over a
+    # segment-list fingerprint rather than the transcript text.
+    if (EXISTS "${_qvp_sf_q8_gguf}" AND EXISTS "${_qvp_diar_wav}")
+        add_test(NAME test-perf-regression-sortformer
+            COMMAND $<TARGET_FILE:test-perf-regression>
+                "--model" "${_qvp_sf_q8_gguf}" "--wav" "${_qvp_diar_wav}")
+        set_property(TEST test-perf-regression-sortformer PROPERTY LABELS "perf")
+    endif()
 
     # Internal regression gate for the round-2 mel preprocess sweep
     # (real-FFT, MelState reuse). Pure unit test -- no GGUF needed.
