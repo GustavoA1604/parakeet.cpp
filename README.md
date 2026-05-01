@@ -1135,13 +1135,10 @@ parakeet.cpp/
                                    (skipped on EOU GGUFs that set normalize=NA)
     sentencepiece_bpe.{h,cpp}    SentencePiece BPE detokenizer (CTC + TDT + EOU)
     dr_wav.h                     vendored single-header WAV reader
-    test_*.cpp                   per-stage numerical-parity harnesses that live
-                                   alongside implementation (mel-fft-parity,
-                                   encoder-capture-parity, perf-regression)
-  tests/
-    test_*.cpp                   per-stage validation harnesses (mel, encoder,
-                                   ctc, tdt-encoder, sortformer, streaming,
-                                   eou-streaming, sortformer-streaming,
+  test/
+    test_*.cpp                   CTest harness sources (parity vs NeMo dumps,
+                                   streaming, capture-parity, mel-fft-parity,
+                                   perf-regression, decoder-determinism,
                                    vk-vs-cpu)
   include/parakeet/
     parakeet.h              umbrella aggregator: pulls in every per-concern

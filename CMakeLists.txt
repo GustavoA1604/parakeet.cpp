@@ -261,7 +261,7 @@ if (PARAKEET_BUILD_LIBRARY)
     #             `flash_attn_ext` for head_dim in
     #             {40,64,80,96,112,128,192,256}; first-Adreno bring-up
     #             should flip and bench. Vulkan validation harness
-    #             (tests/test_vk_vs_cpu.cpp) is the natural home for
+    #             (test/test_vk_vs_cpu.cpp) is the natural home for
     #             that A/B once a non-Tegra Vulkan device is available.
     if (GGML_METAL)
         set(PARAKEET_FLASH_ATTN_DEFAULT ON)
@@ -442,7 +442,7 @@ if (PARAKEET_BUILD_TESTS)
     set(_qvp_sf_ref        "${PARAKEET_TEST_REF_DIR}/sortformer-ref")
 
     add_executable(test-mel
-        tests/test_mel.cpp
+        test/test_mel.cpp
         src/mel_preprocess.cpp
         src/parakeet_ctc.cpp
         src/parakeet_log.cpp
@@ -456,7 +456,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_ctc_f16_gguf}" "${_qvp_jfk_wav}" "${_qvp_ctc_ref}/mel.npy")
 
     add_executable(test-encoder
-        tests/test_encoder.cpp
+        test/test_encoder.cpp
         src/parakeet_ctc.cpp
         src/parakeet_log.cpp
         src/mel_preprocess.cpp
@@ -470,7 +470,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_ctc_f16_gguf}" "${_qvp_ctc_ref}/mel.npy" "${_qvp_ctc_ref}/encoder_out.npy")
 
     add_executable(test-ctc
-        tests/test_ctc.cpp
+        test/test_ctc.cpp
         src/parakeet_ctc.cpp
         src/parakeet_log.cpp
         src/mel_preprocess.cpp
@@ -483,7 +483,7 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "${_qvp_ctc_q8_gguf}" "${_qvp_ctc_ref}/logits.npy" "${_qvp_ctc_ref}/decoded.txt"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_ctc_ref}/logits.npy" "${_qvp_ctc_ref}/decoded.txt")
 
-    add_executable(test-streaming tests/test_streaming.cpp)
+    add_executable(test-streaming test/test_streaming.cpp)
     target_link_libraries(test-streaming PRIVATE parakeet)
     target_include_directories(test-streaming PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-streaming)
@@ -492,7 +492,7 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
 
-    add_executable(test-eou-streaming tests/test_eou_streaming.cpp)
+    add_executable(test-eou-streaming test/test_eou_streaming.cpp)
     target_link_libraries(test-eou-streaming PRIVATE parakeet)
     target_include_directories(test-eou-streaming PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-eou-streaming)
@@ -501,7 +501,7 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_eou_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_eou_q8_gguf}" "${_qvp_jfk_wav}")
 
-    add_executable(test-sortformer-streaming tests/test_sortformer_streaming.cpp)
+    add_executable(test-sortformer-streaming test/test_sortformer_streaming.cpp)
     target_link_libraries(test-sortformer-streaming PRIVATE parakeet)
     target_include_directories(test-sortformer-streaming PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-sortformer-streaming)
@@ -510,7 +510,7 @@ if (PARAKEET_BUILD_TESTS)
         ARGS     "--model" "${_qvp_sfs_q8_gguf}" "--wav" "${_qvp_diar_wav}"
         REQUIRES "${_qvp_sfs_q8_gguf}" "${_qvp_diar_wav}")
 
-    add_executable(test-perf-regression src/test_perf_regression.cpp)
+    add_executable(test-perf-regression test/test_perf_regression.cpp)
     target_link_libraries(test-perf-regression PRIVATE parakeet)
     target_include_directories(test-perf-regression PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-perf-regression)
@@ -533,7 +533,7 @@ if (PARAKEET_BUILD_TESTS)
     # Internal regression gate for the round-2 mel preprocess sweep
     # (real-FFT, MelState reuse). Pure unit test -- no GGUF needed.
     add_executable(test-mel-fft-parity
-        src/test_mel_fft_parity.cpp
+        test/test_mel_fft_parity.cpp
         src/mel_preprocess.cpp
         src/parakeet_log.cpp)
     target_link_libraries(test-mel-fft-parity PRIVATE ggml)
@@ -545,7 +545,7 @@ if (PARAKEET_BUILD_TESTS)
     # Asserts run_encoder(capture=true) and (capture=false) produce
     # bit-equal encoder_out + logits on a CTC GGUF.
     add_executable(test-encoder-capture-parity
-        src/test_encoder_capture_parity.cpp
+        test/test_encoder_capture_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_log.cpp
         src/mel_preprocess.cpp
@@ -578,7 +578,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_sf_q8_gguf}" "${_qvp_diar_wav}")
 
     add_executable(test-tdt-encoder-parity
-        tests/test_tdt_encoder_parity.cpp
+        test/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
         src/parakeet_log.cpp
@@ -597,7 +597,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_tdt_f16_gguf}" "${_qvp_jfk_wav}" "${_qvp_tdt_ref}/encoder_out.npy")
 
     add_executable(test-tdt-decoder-parity
-        src/test_tdt_decoder_parity.cpp
+        test/test_tdt_decoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
         src/parakeet_log.cpp
@@ -616,7 +616,7 @@ if (PARAKEET_BUILD_TESTS)
         REQUIRES "${_qvp_tdt_q8_gguf}" "${_qvp_jfk_wav}")
 
     add_executable(test-sortformer-parity
-        tests/test_sortformer_parity.cpp
+        test/test_sortformer_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
         src/parakeet_log.cpp
@@ -641,7 +641,7 @@ if (PARAKEET_BUILD_TESTS)
     # existing per-stage parity tests (which load+decode once) wouldn't
     # see. Runs against any model type; switches to diarize() when the
     # GGUF declares Sortformer.
-    add_executable(test-decoder-determinism src/test_decoder_determinism.cpp)
+    add_executable(test-decoder-determinism test/test_decoder_determinism.cpp)
     target_link_libraries(test-decoder-determinism PRIVATE parakeet)
     target_include_directories(test-decoder-determinism PRIVATE include src ggml/include)
     parakeet_apply_ccache(test-decoder-determinism)
@@ -671,7 +671,7 @@ if (PARAKEET_BUILD_TESTS)
 
     if (GGML_VULKAN)
         add_executable(test-vk-vs-cpu
-            tests/test_vk_vs_cpu.cpp
+            test/test_vk_vs_cpu.cpp
             src/parakeet_ctc.cpp
             src/parakeet_log.cpp
             src/mel_preprocess.cpp

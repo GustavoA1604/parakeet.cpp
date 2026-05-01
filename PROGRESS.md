@@ -1085,7 +1085,7 @@ current behaviour.
 
 ### 7.6 — Validation harness `test-streaming`
 
-`src/test_streaming.cpp` runs on a loaded Engine and asserts:
+`test/test_streaming.cpp` runs on a loaded Engine and asserts:
 
 - Mode 1 reference: `transcribe()` produces the baseline text.
 - Mode 2 byte-equality: for `chunk_ms ∈ {250, 500, 1000, 2000, 4000}`
@@ -1297,7 +1297,7 @@ CLI:
   the `StreamingOptions` defaults.
 - `--emit text|jsonl` reused unchanged.
 
-Test harness (`src/test_streaming.cpp`) adds three Mode 3 configs on
+Test harness (`test/test_streaming.cpp`) adds three Mode 3 configs on
 `jfk.wav` (`chunk_ms × left_ms × right_ms ∈ {1000,2000,500},
 {2000,2000,1000}, {2000,5000,2000}`) plus a cancel-path assertion.
 PCM is fed in **random-size bursts (512-4000 samples)** via
@@ -1527,7 +1527,7 @@ that the loader reads with safe fallbacks.
 
 `scripts/dump-tdt-reference.py` dumps NeMo per-stage tensors (log-mel,
 encoder_out, LSTM init state, transcribe() text). New
-`src/test_tdt_encoder_parity.cpp` harness loads a TDT GGUF + wav +
+`test/test_tdt_encoder_parity.cpp` harness loads a TDT GGUF + wav +
 reference dir, runs the C++ encoder, compares.
 
 Results on jfk.wav:
@@ -2147,7 +2147,7 @@ Independent `--asr-n-gpu-layers` / `--diar-n-gpu-layers` allow
 splitting the two engines across CPU and GPU on machines where
 running both on the GPU would compete for resources.
 
-Testing: `src/test_sortformer_streaming.cpp` (built as
+Testing: `test/test_sortformer_streaming.cpp` (built as
 `test-sortformer-streaming` when `PARAKEET_BUILD_TESTS=ON`) feeds
 the multi-speaker sample in random burst sizes (1-5000 samples per
 `feed_pcm_f32()` call) and asserts:
@@ -2638,7 +2638,7 @@ through `StreamSession`, so `live-mic --model
 models/parakeet-eou-120m-v1.q8_0.gguf` works out of the box -- no
 new auto-detection logic was required.
 
-`test-eou-streaming` (new, `tests/test_eou_streaming.cpp`) asserts:
+`test-eou-streaming` (new, `test/test_eou_streaming.cpp`) asserts:
 
 - Mode 2 concatenated text **byte-equal** to the offline
   `Engine::transcribe()` reference;
@@ -2914,7 +2914,7 @@ slice in cache through both `joint_enc` and the surrounding
 
 ### 14.3 — parity gate
 
-`test-tdt-decoder-parity` (`src/test_tdt_decoder_parity.cpp`,
+`test-tdt-decoder-parity` (`test/test_tdt_decoder_parity.cpp`,
 linked under `PARAKEET_BUILD_TESTS`) runs the same WAV through
 `tdt_greedy_decode` twice — once with `n_gpu_layers=0` (scalar CPU
 fallback) and once with `n_gpu_layers=1` (ggml graph path on the
@@ -3332,12 +3332,12 @@ all stages passed
   Vulkan, BLAS, OpenCL). All test targets link this library so
   GPU code paths are compiled consistently.
 - `test-vk-vs-cpu` target gated behind `if (GGML_VULKAN)`.
-- Test sources moved from `src/test_*.cpp` to `tests/test_*.cpp`
+- Test sources live under `test/test_*.cpp`
   for cleaner repo organisation.
 
 ### 16.5 — test harness
 
-`tests/test_vk_vs_cpu.cpp` loads the same GGUF twice (CPU and
+`test/test_vk_vs_cpu.cpp` loads the same GGUF twice (CPU and
 Vulkan), runs both encoders on the same mel input, and compares
 9 intermediate stages. Each stage asserts `rel < 5e-2` and no
 NaN/Inf values. Exit code 1 on any failure.
