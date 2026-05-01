@@ -7,17 +7,17 @@ threshold.
 
 ## Phase 0 — scaffolding  _(done)_
 
-- Added `CMakeLists.txt` (`QVAC_PARAKEET_*` options,
-  `QVAC_PARAKEET_USE_SYSTEM_GGML` escape hatch, install rules producing
-  `qvac-parakeet::qvac-parakeet` so the eventual vcpkg port is a
+- Added `CMakeLists.txt` (`PARAKEET_*` options,
+  `PARAKEET_USE_SYSTEM_GGML` escape hatch, install rules producing
+  `parakeet::parakeet` so the eventual vcpkg port is a
   drop-in).
 - Added `scripts/setup-ggml.sh` pinned to the upstream ggml commit
   (`58c38058`).
 - Vendored `dr_wav.h` for wav I/O.
-- Public headers under `include/qvac-parakeet/` expose
-  `qvac_parakeet_cli_main`, `qvac_parakeet::ctc::Engine`, and the
+- Public headers under `include/parakeet/` expose
+  `parakeet_cli_main`, `parakeet::ctc::Engine`, and the
   one-shot `transcribe_wav` API. _(Post-v0.1.0-pre audit, the public
-  namespace is the flat `qvac_parakeet`; `qvac_parakeet::ctc::` is a
+  namespace is the flat `parakeet`; `parakeet::ctc::` is a
   backward-compat alias.)_
 - CLI + library + test harnesses build green on macOS (arm64).
 
@@ -41,7 +41,7 @@ threshold.
   tensor, fills the typed `SubsamplingWeights` / `BlockWeights` /
   `CtcHeadWeights` structs, and rejects any missing tensor with a
   clear error.
-- `qvac-parakeet --verbose` prints the full hyperparameter + tensor
+- `parakeet --verbose` prints the full hyperparameter + tensor
   summary (verified against `model_config.yaml`).
 
 ## Phase 2 — mel preprocessor parity  _(done)_
@@ -186,7 +186,7 @@ types) which the converter now emits alongside the raw proto bytes.
 End-to-end on `test/samples/jfk.wav`:
 
 ```
-$ ./build/qvac-parakeet --model models/parakeet-ctc-0.6b.gguf \
+$ ./build/parakeet --model models/parakeet-ctc-0.6b.gguf \
                        --wav   test/samples/jfk.wav --verbose
 [BENCH] load=126.9ms mel=12.9ms enc=913.4ms dec=0.2ms total=1053.6ms tokens=26
 and so my fellow americans ask not what your country can do for you ask what you can do for your country
@@ -255,7 +255,7 @@ Three non-timing-sensitive wins landed together:
      (was 4 via ggml-cpu's internal default).  `--threads N` still
      overrides.  On a 10-core M4 Air that's 10 threads by default.
      Worth ~10-12% on the encoder path in isolated measurements.
-  2. **`-O3 -ffast-math -funroll-loops`** on `libqvac-parakeet` in
+  2. **`-O3 -ffast-math -funroll-loops`** on `libparakeet` in
      Release builds (via `CMakeLists.txt` generator expressions;
      Debug/RelWithDebInfo unaffected).  Our pure-C++ FFT /
      filterbank-matmul / CMVN drops from ~14 ms to ~6 ms (2.3×).
@@ -930,7 +930,7 @@ shrink the model file and the unified-memory footprint.
   - ~~Test `ggml_flash_attn_ext` on Metal — likely a meaningful win given
     the fused softmax + V-multiply kernel, plus the dormant infra from
     Round 7 is already in place.~~ **Done** — see §15.8 below. Shipped
-    `QVAC_PARAKEET_FLASH_ATTN=ON` as the Metal default; encoder
+    `PARAKEET_FLASH_ATTN=ON` as the Metal default; encoder
     67.35 → 67.00 ms (−0.5 %) and inference 119.24 → 118.66 ms (−0.5 %)
     on M3 Ultra at byte-exact parity. CPU + CUDA + Vulkan + OpenCL keep
     the default OFF until each is A/B'd.
@@ -988,7 +988,7 @@ accuracy cost.
 
 ### 7.1 — Engine class implementation
 
-`include/qvac-parakeet/ctc/engine.h` was the declared-but-unimplemented
+`include/parakeet/ctc/engine.h` was the declared-but-unimplemented
 surface. Phase 7 lands the definition in `src/parakeet_engine.cpp`:
 
 - `Engine(const EngineOptions &)` loads the GGUF once via
@@ -1839,7 +1839,7 @@ Combines Sortformer (Phase 11) with a Parakeet ASR Engine to produce
 "who said what" output natively in C++. Mirrors the qvac binding's
 `quickstart-diarized.js` pattern, but in one binary and one CLI call.
 
-Public API (`include/qvac-parakeet/ctc/engine.h`):
+Public API (`include/parakeet/ctc/engine.h`):
 
     struct AttributedSegment { speaker_id; text; start_s; end_s; };
     struct AttributedTranscriptionOptions { diarization;
@@ -1873,7 +1873,7 @@ Pipeline (in `src/parakeet_engine.cpp`):
 
 CLI:
 
-  ./qvac-parakeet --model <asr.gguf> --diarization-model <sf.gguf> \
+  ./parakeet --model <asr.gguf> --diarization-model <sf.gguf> \
     --wav <multi-speaker.wav>
 
 Output formats:
@@ -2019,7 +2019,7 @@ Phase 11.11.2 (planned) is a multi-week effort to land the full NeMo
 11.11.1 ships a pragmatic streaming layer that reuses the existing
 offline `Engine::diarize()` path under a sliding-history window.
 
-API (in `include/qvac-parakeet/ctc/engine.h`):
+API (in `include/parakeet/ctc/engine.h`):
 
 ```cpp
 struct SortformerStreamingOptions {
@@ -2105,7 +2105,7 @@ Trade-offs (vs the planned full Phase 11.11.2 NeMo-style streaming):
 CLI:
 
 ```bash
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/sortformer-4spk-v1.f16.gguf \
     --pcm-in recording.raw --pcm-format s16le \
     --stream \
@@ -2148,7 +2148,7 @@ splitting the two engines across CPU and GPU on machines where
 running both on the GPU would compete for resources.
 
 Testing: `src/test_sortformer_streaming.cpp` (built as
-`test-sortformer-streaming` when `QVAC_PARAKEET_BUILD_TESTS=ON`) feeds
+`test-sortformer-streaming` when `PARAKEET_BUILD_TESTS=ON`) feeds
 the multi-speaker sample in random burst sizes (1-5000 samples per
 `feed_pcm_f32()` call) and asserts:
 - `>= 1` real segment callback received (`speaker_id >= 0`),
@@ -2599,7 +2599,7 @@ later wiring into the planned cross-engine `OnEndOfTurn` event.
 
 ### Phase 12.5 — streaming push API (Modes 2 + 3)  _(done; rolling-encoder Mode 3 is the chosen design -- chunked-limited streaming inference rejected, see §8.5)_
 
-Public API additions in `include/qvac-parakeet/ctc/engine.h`:
+Public API additions in `include/parakeet/ctc/engine.h`:
 
 ```cpp
 struct StreamingSegment {
@@ -2769,7 +2769,7 @@ consumer drives.
 
 ### Implementation
 
-- `include/qvac-parakeet/ctc/engine.h` -- new public types +
+- `include/parakeet/ctc/engine.h` -- new public types +
   `on_event` slots on both options structs + the `enable_energy_vad`
   knobs. Adding fields with defaults to a struct is forward-compatible
   for current consumers.
@@ -2915,7 +2915,7 @@ slice in cache through both `joint_enc` and the surrounding
 ### 14.3 — parity gate
 
 `test-tdt-decoder-parity` (`src/test_tdt_decoder_parity.cpp`,
-linked under `QVAC_PARAKEET_BUILD_TESTS`) runs the same WAV through
+linked under `PARAKEET_BUILD_TESTS`) runs the same WAV through
 `tdt_greedy_decode` twice — once with `n_gpu_layers=0` (scalar CPU
 fallback) and once with `n_gpu_layers=1` (ggml graph path on the
 compiled backend). Greedy TDT is fully deterministic, so the
@@ -3146,7 +3146,7 @@ Closes the lone bench-validation hole in PROGRESS §6.5 ("Test
 `ggml_flash_attn_ext` on Metal — likely a meaningful win"). The
 infra has been dormant since the Round 7 audit (§5.13), gated
 behind `#ifdef PARAKEET_EXPERIMENTAL_FLASH_ATTN` in
-`rel_pos_mha_graph()` and surfaced as the `QVAC_PARAKEET_FLASH_ATTN`
+`rel_pos_mha_graph()` and surfaced as the `PARAKEET_FLASH_ATTN`
 CMake option (off by default everywhere). Round 7 only A/B'd it on
 CPU, where it regressed encoder by +3.1 % because the cast-to-f16
 of the relative-position bias `bd_final` mask before softmax
@@ -3328,7 +3328,7 @@ all stages passed
 ### 16.4 — build system changes
 
 - `CMakeLists.txt`: centralised `GGML_USE_*` defines into an
-  `INTERFACE` library `qvac-parakeet-backend-defs` (CUDA, Metal,
+  `INTERFACE` library `parakeet-backend-defs` (CUDA, Metal,
   Vulkan, BLAS, OpenCL). All test targets link this library so
   GPU code paths are compiled consistently.
 - `test-vk-vs-cpu` target gated behind `if (GGML_VULKAN)`.

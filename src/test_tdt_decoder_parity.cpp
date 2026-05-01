@@ -99,7 +99,7 @@ int transcribe_tdt(const std::string & gguf_path,
                    int                 n_gpu_layers,
                    std::vector<int32_t> & out_tokens,
                    std::string         & out_text) {
-    using namespace qvac_parakeet;
+    using namespace parakeet;
 
     ParakeetCtcModel model;
     if (int rc = load_from_gguf(gguf_path, model, /*n_threads=*/0,

@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 EnergyVad::EnergyVad(int sample_rate, int window_ms, int hangover_ms,
                      float threshold_db) {

@@ -86,7 +86,7 @@ int main(int argc, char ** argv) {
         else if (a == "--probs-abs-tol") probs_abs_tol = std::atof(argv[++i]);
     }
 
-    using namespace qvac_parakeet;
+    using namespace parakeet;
     std::fprintf(stderr, "[sf-parity] loading %s\n", gguf_path.c_str());
     ParakeetCtcModel model;
     // Force CPU encoder: this harness gates operator parity vs NeMo's FP32

@@ -19,7 +19,7 @@ struct gguf_context;
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 // Encoder + per-engine head hyperparameters loaded from GGUF metadata.
 //

@@ -38,7 +38,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 // Per-layer LSTM weights, dequantised to host f32. Local to the EOU
 // runtime which still uses the scalar-CPU decode path.

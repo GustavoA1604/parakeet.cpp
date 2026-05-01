@@ -23,7 +23,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 struct SortformerDiarizationOptions {
     float threshold = 0.5f;

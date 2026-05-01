@@ -1,8 +1,8 @@
 // miniaudio implementation lives in examples/miniaudio_impl.cpp.
 #include "miniaudio.h"
 
-#include "qvac-parakeet/engine.h"
-#include "qvac-parakeet/attributed.h"
+#include "parakeet/engine.h"
+#include "parakeet/attributed.h"
 #include "ggml.h"
 
 #include <atomic>
@@ -195,7 +195,7 @@ int main(int argc, char ** argv) {
 
     if (args.list_devices) return list_devices_and_exit();
 
-    using namespace qvac_parakeet;
+    using namespace parakeet;
 
     std::fprintf(stderr, "[live-mic-attributed] loading ASR  %s\n", args.asr_model_path.c_str());
     EngineOptions asr_eopts;

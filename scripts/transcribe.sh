@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Thin convenience wrapper around ./build/qvac-parakeet that fills in the
+# Thin convenience wrapper around ./build/parakeet that fills in the
 # pinned model path.  Equivalent to:
 #
-#     ./build/qvac-parakeet --model models/parakeet-ctc-0.6b.gguf --wav "$1"
+#     ./build/parakeet --model models/parakeet-ctc-0.6b.gguf --wav "$1"
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODEL_DEFAULT="${REPO_ROOT}/models/parakeet-ctc-0.6b.gguf"
-BIN_DEFAULT="${REPO_ROOT}/build/qvac-parakeet"
+BIN_DEFAULT="${REPO_ROOT}/build/parakeet"
 
 if [ "$#" -lt 1 ]; then
-    echo "usage: $0 <input.wav> [model.gguf] [qvac-parakeet binary]" >&2
+    echo "usage: $0 <input.wav> [model.gguf] [parakeet binary]" >&2
     exit 2
 fi
 

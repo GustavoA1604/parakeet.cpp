@@ -25,7 +25,7 @@ streaming-trained encoder reuses the same C++ graph as the offline
 CTC / TDT encoders), same GGUF schema. Model identity lives entirely in
 `parakeet.model.type` + the encoder hyperparameters.
 
-All public entry points sit on a single `qvac_parakeet::Engine`
+All public entry points sit on a single `parakeet::Engine`
 that auto-dispatches on `parakeet.model.type`:
 
 - `Engine::transcribe()` -- one-shot wav -> text. CTC, TDT, or EOU.
@@ -177,7 +177,7 @@ cmake --build build-metal -j$(sysctl -n hw.ncpu)
 # whole encoder to the compiled-in GPU backend. The flag is named for
 # compatibility with llama.cpp / whisper.cpp; partial-layer offload
 # is not implemented (encoder is small enough to fit on one device).
-./build-metal/qvac-parakeet \
+./build-metal/parakeet \
     --n-gpu-layers 1 \
     --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --wav   test/samples/jfk.wav
@@ -191,7 +191,7 @@ This produces the main binary plus per-stage validation harnesses:
 
 | Binary                            | What it does |
 |-----------------------------------|--------------|
-| `build/qvac-parakeet`             | End-to-end CLI: wav / raw PCM -> text (CTC + TDT + EOU) or speaker segments (Sortformer). Auto-routes on GGUF metadata. Supports `--stream` (Mode 2/3 transcription, sliding-history Sortformer streaming), `--diarization-model PATH` (combined ASR + Sortformer attribution), `--bench`, `--profile`. EOU streaming JSON output includes a `is_eou_boundary` flag per segment. |
+| `build/parakeet`             | End-to-end CLI: wav / raw PCM -> text (CTC + TDT + EOU) or speaker segments (Sortformer). Auto-routes on GGUF metadata. Supports `--stream` (Mode 2/3 transcription, sliding-history Sortformer streaming), `--diarization-model PATH` (combined ASR + Sortformer attribution), `--bench`, `--profile`. EOU streaming JSON output includes a `is_eou_boundary` flag per segment. |
 | `build/live-mic`                  | Live microphone session for either transcription (CTC/TDT/EOU) or diarization (Sortformer). Auto-detects from the GGUF. |
 | `build/live-mic-attributed`       | Live microphone with simultaneous ASR + Sortformer; tags each transcript segment with the speaker whose live diarization range overlaps it the most. `--accumulate` collapses output to one line per speaker. |
 | `build/test-mel`                  | 16 kHz log-mel parity vs NeMo `AudioToMelSpectrogramPreprocessor`. |
@@ -207,23 +207,23 @@ This produces the main binary plus per-stage validation harnesses:
 
 ### Build options worth knowing
 
-- `-DQVAC_PARAKEET_BUILD_TESTS=ON` (default ON in standalone): builds
+- `-DPARAKEET_BUILD_TESTS=ON` (default ON in standalone): builds
   the `test-*` parity + streaming harnesses listed above.
-- `-DQVAC_PARAKEET_BUILD_EXAMPLES=ON` (default `QVAC_PARAKEET_STANDALONE_DEFAULT`,
+- `-DPARAKEET_BUILD_EXAMPLES=ON` (default `PARAKEET_STANDALONE_DEFAULT`,
   i.e. ON for top-level `cmake -S . -B build` but OFF when consumed as
   a sub-project): builds `live-mic` + `live-mic-attributed`.
-- `-DQVAC_PARAKEET_USE_SYSTEM_GGML=ON`: link against an installed
+- `-DPARAKEET_USE_SYSTEM_GGML=ON`: link against an installed
   ggml instead of the pinned clone in `ggml/`.
-- `-DQVAC_PARAKEET_GGML_LIB_PREFIX=ON` (default ON, has no effect when
-  `QVAC_PARAKEET_USE_SYSTEM_GGML=ON`): rename the bundled ggml shared
-  / static libraries to `libqvac-parakeet-ggml-*.{so,dylib,a}` (Windows:
-  `qvac-parakeet-ggml-*.dll` + `libqvac-parakeet-ggml-*.dll.a`). Only
+- `-DPARAKEET_GGML_LIB_PREFIX=ON` (default ON, has no effect when
+  `PARAKEET_USE_SYSTEM_GGML=ON`): rename the bundled ggml shared
+  / static libraries to `libparakeet-ggml-*.{so,dylib,a}` (Windows:
+  `parakeet-ggml-*.dll` + `libparakeet-ggml-*.dll.a`). Only
   the produced filenames change; the CMake target names (`ggml`,
   `ggml-base`, `ggml-cpu`, `ggml-opencl`, ...) and the C symbols
   (`ggml_*`) are kept upstream-compatible. The rename prevents
   shared-library filename collisions when multiple addons that bundle
   different ggml versions are loaded into the same process. Pass
-  `-DQVAC_PARAKEET_GGML_LIB_PREFIX=OFF` to keep upstream filenames
+  `-DPARAKEET_GGML_LIB_PREFIX=OFF` to keep upstream filenames
   (e.g. when you want a single shared `libggml.so` consumed by every
   in-process addon).
 - `-DGGML_METAL=ON` / `-DGGML_VULKAN=ON` / `-DGGML_OPENCL=ON`: pick
@@ -319,7 +319,7 @@ bit-equal to NeMo PyTorch reference at every tier tested, including
 `q4_0`. To reproduce / compare across GGUF tiers and backends:
 
 ```bash
-./build/qvac-parakeet --model models/parakeet-ctc-0.6b.q8_0.gguf \
+./build/parakeet --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --wav test/samples/sample-16k.wav \
     --bench --bench-runs 15 --bench-warmup 5 \
     --bench-json artifacts/bench/my-q8_0.json
@@ -329,7 +329,7 @@ For per-sub-stage encoder profiling (subsampling / CTC head / per-block
 times across `n_layers = {0, 1, N/2, N}`):
 
 ```bash
-./build/qvac-parakeet --model models/parakeet-ctc-0.6b.q8_0.gguf \
+./build/parakeet --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --wav test/samples/sample-16k.wav \
     --profile --profile-runs 5 --profile-warmup 2
 ```
@@ -430,7 +430,7 @@ steps. Token-ID stream is byte-equal between the two paths
 ### Quickstart: wav -> text
 
 ```bash
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --wav   test/samples/jfk.wav
 ```
@@ -451,7 +451,7 @@ sample rate -- omitting it falls back to the model's rate with a
 warning, and a mismatched rate fails fast (resampling is not yet wired):
 
 ```bash
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --pcm-in recording.raw \
     --pcm-format s16le \   # or f32le; defaults to s16le
@@ -485,7 +485,7 @@ shift slightly when the encoder context window changes.
 From the CLI:
 
 ```bash
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --pcm-in recording.raw --pcm-format s16le \
     --stream --stream-chunk-ms 1000 \
@@ -531,7 +531,7 @@ context at chunk boundaries hurts more than denying past context).
 From the CLI (simulates a live producer feeding the same wav in blocks):
 
 ```bash
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/parakeet-ctc-0.6b.q8_0.gguf \
     --pcm-in recording.raw --pcm-format s16le \
     --stream --stream-duplex \
@@ -591,7 +591,7 @@ CLI examples on `jfk.wav` (the JFK quote ends naturally with one
 
 ```bash
 # Offline transcription (matches NeMo offline reference bit-for-bit):
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/parakeet-eou-120m-v1.q8_0.gguf \
     --wav   test/samples/jfk.wav
 # -> "and so my fellow americans ask not what your country can do for
@@ -599,7 +599,7 @@ CLI examples on `jfk.wav` (the JFK quote ends naturally with one
 
 # Mode 2 streaming with chunked emit + JSON output (last chunk gets
 # is_eou_boundary=true because the model emits <EOU> at end-of-quote):
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/parakeet-eou-120m-v1.q8_0.gguf \
     --wav   test/samples/jfk.wav \
     --stream --stream-chunk-ms 1500 --emit jsonl
@@ -609,7 +609,7 @@ CLI examples on `jfk.wav` (the JFK quote ends naturally with one
 #    {"chunk":7,...,"is_eou_boundary":true, "text":" country"}
 
 # Mode 3 live duplex (push API; same audio -> same transcript):
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/parakeet-eou-120m-v1.q8_0.gguf \
     --wav   test/samples/jfk.wav \
     --stream --stream-duplex \
@@ -690,7 +690,7 @@ session->finalize();
 CLI:
 
 ```bash
-./build/qvac-parakeet \
+./build/parakeet \
     --model models/sortformer-4spk-v1.f16.gguf \
     --pcm-in recording.raw --pcm-format s16le \
     --stream \
@@ -884,12 +884,12 @@ The fixture roots are CMake cache vars so prebuilt mirrors can drop in:
 
 | Variable | Default | Holds |
 |----------|---------|-------|
-| `QVAC_PARAKEET_TEST_MODEL_DIR` | `${CMAKE_SOURCE_DIR}/models`       | `*.gguf` checkpoints |
-| `QVAC_PARAKEET_TEST_AUDIO_DIR` | `${CMAKE_SOURCE_DIR}/test/samples` | `*.wav` fixtures |
-| `QVAC_PARAKEET_TEST_REF_DIR`   | `${CMAKE_SOURCE_DIR}/artifacts`    | NeMo `.npy` dumps (`{ctc,tdt,eou,sortformer}-ref/`) |
+| `PARAKEET_TEST_MODEL_DIR` | `${CMAKE_SOURCE_DIR}/models`       | `*.gguf` checkpoints |
+| `PARAKEET_TEST_AUDIO_DIR` | `${CMAKE_SOURCE_DIR}/test/samples` | `*.wav` fixtures |
+| `PARAKEET_TEST_REF_DIR`   | `${CMAKE_SOURCE_DIR}/artifacts`    | NeMo `.npy` dumps (`{ctc,tdt,eou,sortformer}-ref/`) |
 
 Override at configure time, e.g.
-`-DQVAC_PARAKEET_TEST_MODEL_DIR=/srv/parakeet/models`.
+`-DPARAKEET_TEST_MODEL_DIR=/srv/parakeet/models`.
 
 ### Per-stage parity, manual
 
@@ -1031,7 +1031,7 @@ fully stable Sortformer streaming speaker IDs).
 Headline highlights (per phase, one bullet each; PROGRESS.md `§N.x`
 has the full round-by-round journal):
 
-- **Parity (Phase 4)**: `qvac-parakeet --model ... --wav ...` produces
+- **Parity (Phase 4)**: `parakeet --model ... --wav ...` produces
   the expected transcript end-to-end, matching NeMo PyTorch
   bit-equivalently on `jfk.wav` and `sample-16k.wav` at every quant
   tier (f16 through Q4_0) on both CPU and Metal backends. Per-stage
@@ -1108,12 +1108,12 @@ Sortformer streaming (NeMo-style spkcache).
 parakeet.cpp/
   ggml/                          pristine ggml clone (not tracked; populated
                                    by scripts/setup-ggml.sh, or skipped entirely
-                                   when building with -DQVAC_PARAKEET_USE_SYSTEM_GGML=ON)
+                                   when building with -DPARAKEET_USE_SYSTEM_GGML=ON)
   src/
     main.cpp                     CLI (wav / raw PCM -> text or speaker segments,
                                    + Mode 2/3 transcription streaming, sliding-history
-                                   diarization streaming, attribution) + qvac_parakeet_cli_main
-    cli_main.cpp                 thin main() -> qvac_parakeet_cli_main shim
+                                   diarization streaming, attribution) + parakeet_cli_main
+    cli_main.cpp                 thin main() -> parakeet_cli_main shim
     parakeet_ctc.{h,cpp}         GGUF loader + FastConformer encoder ggml graph
                                    + CTC head + greedy decode (shared by all engines;
                                    model_type field selects the decoder; LN-in-conv
@@ -1143,13 +1143,13 @@ parakeet.cpp/
                                    ctc, tdt-encoder, sortformer, streaming,
                                    eou-streaming, sortformer-streaming,
                                    vk-vs-cpu)
-  include/qvac-parakeet/
-    qvac-parakeet.h              umbrella aggregator: pulls in every per-concern
+  include/parakeet/
+    parakeet.h              umbrella aggregator: pulls in every per-concern
                                    header below in one #include.
-    export.h                     QVAC_PARAKEET_API symbol-visibility decorator
+    export.h                     PARAKEET_API symbol-visibility decorator
                                    (mirrors LLAMA_API / WHISPER_API).
-    cli.h                        qvac_parakeet_cli_main C entry point.
-    log.h                        qvac_parakeet_log_set host log sink (signature
+    cli.h                        parakeet_cli_main C entry point.
+    log.h                        parakeet_log_set host log sink (signature
                                    is ggml_log_callback so the same shim demuxes
                                    parakeet + ggml + sibling libraries).
     engine.h                     persistent multi-engine Engine class + Options /

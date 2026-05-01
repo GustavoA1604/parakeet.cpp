@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 // Default log-zero guard used when the GGUF metadata key
 // `parakeet.preproc.log_zero_guard_value` is absent. This is exactly

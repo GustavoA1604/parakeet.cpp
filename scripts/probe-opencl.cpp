@@ -6,7 +6,7 @@
 //   cc -DCL_TARGET_OPENCL_VERSION=300 scripts/probe-opencl.cpp -lOpenCL -lstdc++ -o /tmp/probe-opencl
 //   /tmp/probe-opencl
 //
-// Built only when -DQVAC_PARAKEET_BUILD_TOOLS=ON.
+// Built only when -DPARAKEET_BUILD_TOOLS=ON.
 
 #include <CL/cl.h>
 #include <cstdio>

@@ -18,12 +18,12 @@
 //     starting position so it can stamp transitions with a stable
 //     timestamp across `feed_pcm_*()` calls.
 //
-// Not exposed via the public include/qvac-parakeet/ headers; this is an
+// Not exposed via the public include/parakeet/ headers; this is an
 // internal helper used by `StreamSession::Impl`.
 
 #include <cstdint>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 class EnergyVad {
 public:

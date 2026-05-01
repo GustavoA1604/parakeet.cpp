@@ -57,7 +57,7 @@
 //
 // Returns 0 on success, non-zero on parity failure or setup error.
 
-#include "qvac-parakeet/engine.h"
+#include "parakeet/engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -228,7 +228,7 @@ double median(std::vector<double> v) {
 int run_transcribe_path(const Opts & o,
                         const std::vector<float> & samples, int sr,
                         const std::string & model_type_str) {
-    qvac_parakeet::EngineOptions eopts;
+    parakeet::EngineOptions eopts;
     eopts.model_gguf_path        = o.model_path;
     eopts.n_threads              = o.n_threads;
     eopts.n_gpu_layers           = o.n_gpu_layers;
@@ -236,7 +236,7 @@ int run_transcribe_path(const Opts & o,
     eopts.prewarm                = o.prewarm;
     eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;
     const auto t_ctor = std::chrono::steady_clock::now();
-    qvac_parakeet::Engine eng(eopts);
+    parakeet::Engine eng(eopts);
     const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
     std::fprintf(stderr,
@@ -255,7 +255,7 @@ int run_transcribe_path(const Opts & o,
     enc_ms_per_run.reserve(o.n_runs);
 
     for (int k = 0; k < o.n_runs; ++k) {
-        qvac_parakeet::EngineResult r =
+        parakeet::EngineResult r =
             eng.transcribe_samples(samples.data(), (int) samples.size(), sr);
         if (o.verbose) {
             std::fprintf(stderr,
@@ -366,8 +366,8 @@ int run_transcribe_path(const Opts & o,
 
 // ---------- Determinism for Sortformer (diarize path) ----------
 
-bool sort_seg_eq(const qvac_parakeet::DiarizationSegment & a,
-                 const qvac_parakeet::DiarizationSegment & b) {
+bool sort_seg_eq(const parakeet::DiarizationSegment & a,
+                 const parakeet::DiarizationSegment & b) {
     return a.speaker_id == b.speaker_id &&
            a.start_s == b.start_s &&
            a.end_s   == b.end_s;
@@ -376,7 +376,7 @@ bool sort_seg_eq(const qvac_parakeet::DiarizationSegment & a,
 int run_diarize_path(const Opts & o,
                      const std::vector<float> & samples, int sr,
                      const std::string & model_type_str) {
-    qvac_parakeet::EngineOptions eopts;
+    parakeet::EngineOptions eopts;
     eopts.model_gguf_path        = o.model_path;
     eopts.n_threads              = o.n_threads;
     eopts.n_gpu_layers           = o.n_gpu_layers;
@@ -384,7 +384,7 @@ int run_diarize_path(const Opts & o,
     eopts.prewarm                = o.prewarm;
     eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;
     const auto t_ctor = std::chrono::steady_clock::now();
-    qvac_parakeet::Engine eng(eopts);
+    parakeet::Engine eng(eopts);
     const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
     std::fprintf(stderr,
@@ -396,16 +396,16 @@ int run_diarize_path(const Opts & o,
         ctor_ms);
 
     std::vector<std::vector<float>>    probs_per_run;
-    std::vector<std::vector<qvac_parakeet::DiarizationSegment>> segs_per_run;
+    std::vector<std::vector<parakeet::DiarizationSegment>> segs_per_run;
     std::vector<double>                enc_ms_per_run;
     probs_per_run.reserve(o.n_runs);
     segs_per_run.reserve(o.n_runs);
     enc_ms_per_run.reserve(o.n_runs);
 
     for (int k = 0; k < o.n_runs; ++k) {
-        qvac_parakeet::DiarizationResult r =
+        parakeet::DiarizationResult r =
             eng.diarize_samples(samples.data(), (int) samples.size(), sr,
-                                qvac_parakeet::DiarizationOptions{});
+                                parakeet::DiarizationOptions{});
         if (o.verbose) {
             std::fprintf(stderr,
                 "[determinism]   run %d/%d  enc_ms=%.2f  decode_ms=%.2f  total_ms=%.2f  "
@@ -537,13 +537,13 @@ int main(int argc, char ** argv) {
 
     // Probe the model type via the public Engine API — keeps this
     // test linked through the public library boundary, mirroring how
-    // the production qvac-parakeet CLI uses it.
-    qvac_parakeet::EngineOptions probe_eopts;
+    // the production parakeet CLI uses it.
+    parakeet::EngineOptions probe_eopts;
     probe_eopts.model_gguf_path = o.model_path;
     probe_eopts.n_threads       = o.n_threads;
     probe_eopts.n_gpu_layers    = o.n_gpu_layers;
     probe_eopts.verbose         = false;
-    qvac_parakeet::Engine probe(probe_eopts);
+    parakeet::Engine probe(probe_eopts);
     const std::string mt = probe.model_type();
     std::fprintf(stderr, "[determinism] model_type=%s\n", mt.c_str());
 

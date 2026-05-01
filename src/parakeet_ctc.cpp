@@ -34,7 +34,7 @@
 #include <thread>
 #include <vector>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 struct EncoderGraph {
     ggml_context * graph_ctx = nullptr;
@@ -179,15 +179,15 @@ ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
             if (verbose) PARAKEET_LOG_WARN(
                 "parakeet: OpenCL device '%s' is Adreno 6xx; "
                 "forcing CPU fallback (7xx/8xx/X1E supported, set "
-                "QVAC_PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
+                "PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
                 reported);
-            const char * override_env = getenv("QVAC_PARAKEET_ALLOW_ADRENO_6XX");
+            const char * override_env = getenv("PARAKEET_ALLOW_ADRENO_6XX");
             if (!override_env || override_env[0] != '1') {
                 ggml_backend_free(b);
                 return nullptr;
             }
             if (verbose) PARAKEET_LOG_INFO(
-                "parakeet: QVAC_PARAKEET_ALLOW_ADRENO_6XX=1 set; "
+                "parakeet: PARAKEET_ALLOW_ADRENO_6XX=1 set; "
                 "keeping OpenCL backend on '%s' anyway\n", reported);
         }
         if (verbose) {

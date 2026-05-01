@@ -33,7 +33,7 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 struct ggml_backend_buffer;
 typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 // Per-layer host-dequantised LSTM weights, used by the CPU fallback path
 // (per-step ggml-graph dispatch on the CPU backend has too much overhead

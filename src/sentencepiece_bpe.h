@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 struct BpeVocab {
     std::vector<std::string> pieces;

@@ -2,7 +2,7 @@
 
 #include <string>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 std::string detokenize(const BpeVocab & vocab,
                        const std::vector<int32_t> & token_ids) {

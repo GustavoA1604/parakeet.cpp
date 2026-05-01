@@ -1,8 +1,8 @@
-#include "qvac-parakeet/cli.h"
-#include "qvac-parakeet/engine.h"
-#include "qvac-parakeet/streaming.h"
-#include "qvac-parakeet/diarization.h"
-#include "qvac-parakeet/attributed.h"
+#include "parakeet/cli.h"
+#include "parakeet/engine.h"
+#include "parakeet/streaming.h"
+#include "parakeet/diarization.h"
+#include "parakeet/attributed.h"
 
 #include "parakeet_ctc.h"
 #include "parakeet_log.h"
@@ -62,7 +62,7 @@ void print_usage(const char * argv0) {
         "                       partial layer offload is not implemented.\n"
         "                       OpenCL note: ggml-opencl is tuned for Adreno (Android);\n"
         "                       on commodity desktop GPUs build with\n"
-        "                       -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF (the qvac-parakeet\n"
+        "                       -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF (the parakeet\n"
         "                       patch under patches/ relaxes the upstream Adreno-only\n"
         "                       device whitelist for dev/CI parity testing). Production\n"
         "                       Adreno deployments leave both at their defaults.\n"
@@ -200,7 +200,7 @@ int load_raw_pcm(const std::string & path,
     return 5;
 }
 
-void emit_segment(const qvac_parakeet::StreamingSegment & seg,
+void emit_segment(const parakeet::StreamingSegment & seg,
                   const std::string & format) {
     if (format == "jsonl") {
         std::printf("{\"chunk\":%d,\"start\":%.3f,\"end\":%.3f,\"is_final\":%s,"
@@ -262,7 +262,7 @@ struct ExtraCliOpts {
     // CLI flags so bench scripts can A/B them without `env VAR=… ./binary`.
     // All four are read by ggml-opencl via getenv() and (for the cache
     // dir) by `patches/ggml-opencl-program-binary-cache.patch`. Applied
-    // via `setenv()` BEFORE any qvac_parakeet API call so the backend
+    // via `setenv()` BEFORE any parakeet API call so the backend
     // init cascade picks them up. Empty string for any field => leave
     // the existing process-env value untouched (do not setenv).
     std::string opencl_cache_dir;
@@ -336,7 +336,7 @@ AggStats aggregate(std::vector<double> v) {
 }
 
 // Private CLI options struct -- this binary's parsed flags only. The
-// public C++ API (qvac_parakeet::EngineOptions) doesn't carry the wav
+// public C++ API (parakeet::EngineOptions) doesn't carry the wav
 // path because it's a property of each transcribe() call, not the
 // loaded engine; the CLI happens to want both in one bag during arg
 // parsing so we keep a tiny local struct.
@@ -350,7 +350,7 @@ struct CliOpts {
 
 }
 
-extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
+extern "C" int parakeet_cli_main(int argc, char ** argv) {
     CliOpts      opts;
     ExtraCliOpts extra;
 
@@ -360,7 +360,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
             print_usage(argv[0]);
             return 0;
         } else if (a == "--version") {
-            std::printf("qvac-parakeet 0.1.0\n");
+            std::printf("parakeet 0.1.0\n");
             return 0;
         } else if (a == "--model" && i + 1 < argc) {
             opts.model_gguf_path = argv[++i];
@@ -452,7 +452,7 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
         return 2;
     }
 
-    using namespace qvac_parakeet;
+    using namespace parakeet;
     using clock = std::chrono::steady_clock;
 
     // Apply CLI -> $GGML_OPENCL_* env overrides before any backend init
@@ -873,8 +873,8 @@ extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
 
         const int T_enc = n_frames_tmp / 8;
         PARAKEET_LOG_INFO("\n[profile] sub-stage breakdown of a single conformer block (T_enc=%d)\n", T_enc);
-        qvac_parakeet::BlockSubstageTimes sub;
-        if (qvac_parakeet::profile_block_substages(model, T_enc,
+        parakeet::BlockSubstageTimes sub;
+        if (parakeet::profile_block_substages(model, T_enc,
                 extra.profile_warmup, extra.profile_runs, sub) == 0) {
             const double sum = sub.ff1_ms + sub.attn_ms + sub.conv_ms + sub.ff2_ms + sub.norm_out_ms;
             auto row = [&](const char * label, double ms) {

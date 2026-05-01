@@ -100,7 +100,7 @@ int main(int argc, char ** argv) {
     const std::string ref_dir   = argv[3];
 
     std::fprintf(stderr, "[tdt-parity] loading %s\n", gguf_path.c_str());
-    using namespace qvac_parakeet;
+    using namespace parakeet;
     ParakeetCtcModel model;
     // Force CPU encoder: this harness gates operator parity vs NeMo's FP32
     // reference; backend-induced drift (CPU<->GPU) is gated separately by

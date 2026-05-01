@@ -101,8 +101,8 @@ int main(int argc, char ** argv) {
         expected_path = dir + "/decoded.txt";
     }
 
-    qvac_parakeet::ParakeetCtcModel model;
-    if (int rc = qvac_parakeet::load_from_gguf(gguf_path, model,
+    parakeet::ParakeetCtcModel model;
+    if (int rc = parakeet::load_from_gguf(gguf_path, model,
                                                /*n_threads=*/0,
                                                /*n_gpu_layers=*/0,
                                                /*verbose=*/false); rc != 0) {
@@ -110,7 +110,7 @@ int main(int argc, char ** argv) {
                      gguf_path.c_str(), rc);
         return 3;
     }
-    if (model.model_type != qvac_parakeet::ParakeetModelType::CTC) {
+    if (model.model_type != parakeet::ParakeetModelType::CTC) {
         std::fprintf(stderr,
             "[test-ctc] %s is not a CTC GGUF (model_type=%d). The CTC parity harness\n"
             "          only applies to parakeet-ctc-* checkpoints; use test-tdt-encoder-parity\n"
@@ -140,9 +140,9 @@ int main(int argc, char ** argv) {
         return 7;
     }
 
-    std::vector<int32_t> ids = qvac_parakeet::ctc_greedy_decode(
+    std::vector<int32_t> ids = parakeet::ctc_greedy_decode(
         logits.data(), n_frames, model.vocab_size, model.blank_id);
-    const std::string text = qvac_parakeet::detokenize(model.vocab, ids);
+    const std::string text = parakeet::detokenize(model.vocab, ids);
 
     std::string expected = read_text_file(expected_path);
     std::fprintf(stderr, "[test-ctc] gguf=%s\n", gguf_path.c_str());

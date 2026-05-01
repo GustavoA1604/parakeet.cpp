@@ -1,7 +1,7 @@
-#include "qvac-parakeet/engine.h"
-#include "qvac-parakeet/streaming.h"
-#include "qvac-parakeet/diarization.h"
-#include "qvac-parakeet/attributed.h"
+#include "parakeet/engine.h"
+#include "parakeet/streaming.h"
+#include "parakeet/diarization.h"
+#include "parakeet/attributed.h"
 
 #include "parakeet_ctc.h"
 #include "parakeet_tdt.h"
@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 namespace {
 
@@ -146,7 +146,7 @@ Engine::Engine(const EngineOptions & opts) : pimpl_(std::make_unique<Impl>()) {
                                   opts.n_gpu_layers,
                                   opts.verbose);
     if (rc != 0) {
-        throw std::runtime_error("qvac_parakeet::Engine: failed to load GGUF '" +
+        throw std::runtime_error("parakeet::Engine: failed to load GGUF '" +
                                  opts.model_gguf_path +
                                  "' (rc=" + std::to_string(rc) + ")");
     }
@@ -218,7 +218,7 @@ EngineResult Engine::transcribe(const std::string & wav_path) {
     std::vector<float> samples;
     int sr = 0;
     if (int rc = load_wav_mono_f32(wav_path, samples, sr); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe: failed to load wav '" +
+        throw std::runtime_error("parakeet::Engine::transcribe: failed to load wav '" +
                                  wav_path + "' (rc=" + std::to_string(rc) + ")");
     }
     return transcribe_samples(samples.data(), (int) samples.size(), sr);
@@ -226,16 +226,16 @@ EngineResult Engine::transcribe(const std::string & wav_path) {
 
 EngineResult Engine::transcribe_samples(const float * samples, int n_samples, int sample_rate) {
     if (!samples || n_samples <= 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: empty input");
+        throw std::runtime_error("parakeet::Engine::transcribe_samples: empty input");
     }
     if (sample_rate != pimpl_->model.mel_cfg.sample_rate) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: input is " +
+        throw std::runtime_error("parakeet::Engine::transcribe_samples: input is " +
                                  std::to_string(sample_rate) + " Hz but model expects " +
                                  std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
     }
     if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
         throw std::runtime_error(
-            "qvac_parakeet::Engine::transcribe_samples: loaded GGUF is a Sortformer "
+            "parakeet::Engine::transcribe_samples: loaded GGUF is a Sortformer "
             "diarization model; call Engine::diarize() (or transcribe_with_speakers "
             "with a separate ASR engine) instead.");
     }
@@ -250,7 +250,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
     int n_mel_frames = 0;
     if (int rc = compute_log_mel(samples, n_samples, pimpl_->model.mel_cfg,
                                  pimpl_->mel_state, mel, n_mel_frames); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: compute_log_mel failed (rc=" +
+        throw std::runtime_error("parakeet::Engine::transcribe_samples: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double preprocess_ms = ms_since(t_mel);
@@ -261,7 +261,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
                              pimpl_->model.mel_cfg.n_mels, enc_out,
                              /*max_layers=*/-1,
                              /*capture_intermediates=*/false); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: run_encoder failed (rc=" +
+        throw std::runtime_error("parakeet::Engine::transcribe_samples: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double encoder_ms = ms_since(t_enc);
@@ -276,7 +276,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
                                        enc_out.encoder_out.data(),
                                        enc_out.n_enc_frames, enc_out.d_model,
                                        dopts, dres); rc != 0) {
-            throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: tdt_greedy_decode failed (rc=" +
+            throw std::runtime_error("parakeet::Engine::transcribe_samples: tdt_greedy_decode failed (rc=" +
                                      std::to_string(rc) + ")");
         }
         ids  = std::move(dres.token_ids);
@@ -289,7 +289,7 @@ EngineResult Engine::transcribe_samples(const float * samples, int n_samples, in
                                        enc_out.encoder_out.data(),
                                        enc_out.n_enc_frames, enc_out.d_model,
                                        dopts, dres); rc != 0) {
-            throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples: eou_greedy_decode failed (rc=" +
+            throw std::runtime_error("parakeet::Engine::transcribe_samples: eou_greedy_decode failed (rc=" +
                                      std::to_string(rc) + ")");
         }
         ids  = std::move(dres.token_ids);
@@ -321,7 +321,7 @@ EngineResult Engine::transcribe_stream(const std::string & wav_path,
     std::vector<float> samples;
     int sr = 0;
     if (int rc = load_wav_mono_f32(wav_path, samples, sr); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_stream: failed to load wav '" +
+        throw std::runtime_error("parakeet::Engine::transcribe_stream: failed to load wav '" +
                                  wav_path + "' (rc=" + std::to_string(rc) + ")");
     }
     return transcribe_samples_stream(samples.data(), (int) samples.size(), sr,
@@ -334,19 +334,19 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
                                                const StreamingOptions & opts,
                                                StreamingCallback on_segment) {
     if (!samples || n_samples <= 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: empty input");
+        throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: empty input");
     }
     if (sample_rate != pimpl_->model.mel_cfg.sample_rate) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: input is " +
+        throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: input is " +
                                  std::to_string(sample_rate) + " Hz but model expects " +
                                  std::to_string(pimpl_->model.mel_cfg.sample_rate) + " Hz");
     }
     if (opts.sample_rate != 0 && opts.sample_rate != sample_rate) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
+        throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: "
                                  "StreamingOptions.sample_rate must match the input sample_rate");
     }
     if (opts.chunk_ms <= 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
+        throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: "
                                  "StreamingOptions.chunk_ms must be > 0");
     }
     if (pimpl_->model.model_type == ParakeetModelType::SORTFORMER) {
@@ -365,7 +365,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
     int n_mel_frames = 0;
     if (int rc = compute_log_mel(samples, n_samples, pimpl_->model.mel_cfg,
                                  pimpl_->mel_state, mel, n_mel_frames); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: compute_log_mel failed (rc=" +
+        throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: compute_log_mel failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double preprocess_ms = ms_since(t_mel);
@@ -376,7 +376,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
                              pimpl_->model.mel_cfg.n_mels, enc_out,
                              /*max_layers=*/-1,
                              /*capture_intermediates=*/false); rc != 0) {
-        throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: run_encoder failed (rc=" +
+        throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: run_encoder failed (rc=" +
                                  std::to_string(rc) + ")");
     }
     const double encoder_ms = ms_since(t_enc);
@@ -430,7 +430,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
                                            win_enc, end - start, enc_out.d_model,
                                            dopts, tdt_state, win_tokens, steps);
                 rc != 0) {
-                throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
+                throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: "
                                          "tdt_decode_window failed (rc=" + std::to_string(rc) + ")");
             }
         } else if (is_eou) {
@@ -445,7 +445,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
                                            dopts, eou_state,
                                            win_tokens, win_segments, steps);
                 rc != 0) {
-                throw std::runtime_error("qvac_parakeet::Engine::transcribe_samples_stream: "
+                throw std::runtime_error("parakeet::Engine::transcribe_samples_stream: "
                                          "eou_decode_window failed (rc=" + std::to_string(rc) + ")");
             }
             eou_boundaries_in_chunk = static_cast<int>(win_segments.size());

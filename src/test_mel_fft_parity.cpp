@@ -22,7 +22,7 @@
 //
 // Pure unit test -- needs no GGUF, no model weights, no NeMo
 // reference. Builds + runs in milliseconds. Built as
-// `test-mel-fft-parity` via the `QVAC_PARAKEET_BUILD_TESTS` block in
+// `test-mel-fft-parity` via the `PARAKEET_BUILD_TESTS` block in
 // the parent CMakeLists.txt.
 //
 // The synthetic MelConfig uses a Hann analysis window (matches NeMo
@@ -91,16 +91,16 @@ std::vector<float> make_synthetic_filterbank(int n_mels, int n_bins) {
     return fb;
 }
 
-qvac_parakeet::MelConfig make_test_cfg() {
-    qvac_parakeet::MelConfig cfg;
+parakeet::MelConfig make_test_cfg() {
+    parakeet::MelConfig cfg;
     cfg.sample_rate = 16000;
     cfg.n_fft       = 512;
     cfg.win_length  = 400;
     cfg.hop_length  = 160;
     cfg.n_mels      = 80;
     cfg.preemph     = 0.97f;
-    cfg.log_zero_guard_value = qvac_parakeet::kDefaultLogZeroGuard;
-    cfg.normalize   = qvac_parakeet::MelNormalize::PerFeature;
+    cfg.log_zero_guard_value = parakeet::kDefaultLogZeroGuard;
+    cfg.normalize   = parakeet::MelNormalize::PerFeature;
 
     cfg.window     = make_hann_window(cfg.win_length);
     cfg.filterbank = make_synthetic_filterbank(cfg.n_mels, cfg.n_fft / 2 + 1);
@@ -132,9 +132,9 @@ void report_first_diff(const std::vector<float> & a, const std::vector<float> & 
     }
 }
 
-int section_repeated_call_invariance(const qvac_parakeet::MelConfig & cfg,
+int section_repeated_call_invariance(const parakeet::MelConfig & cfg,
                                      const std::vector<float> & signal) {
-    using namespace qvac_parakeet;
+    using namespace parakeet;
 
     MelState                state;
     std::vector<float>      first_mel;
@@ -169,9 +169,9 @@ int section_repeated_call_invariance(const qvac_parakeet::MelConfig & cfg,
     return 0;
 }
 
-int section_stateful_vs_stateless_parity(const qvac_parakeet::MelConfig & cfg,
+int section_stateful_vs_stateless_parity(const parakeet::MelConfig & cfg,
                                          const std::vector<float> & signal) {
-    using namespace qvac_parakeet;
+    using namespace parakeet;
 
     std::vector<float> mel_stateless;
     int                n_frames_stateless = 0;
@@ -269,9 +269,9 @@ void reference_complex_fft_power(const float * __restrict x_real, int n_fft,
 // frame here, run the reference complex FFT, and compute the same
 // "sum of all bins under unit filterbank" scalar. These two scalars
 // must agree to ULP scale.
-int section_real_fft_parity(const qvac_parakeet::MelConfig & cfg,
+int section_real_fft_parity(const parakeet::MelConfig & cfg,
                             const std::vector<float> & signal) {
-    using namespace qvac_parakeet;
+    using namespace parakeet;
 
     // Single-frame config: filterbank that's "row 0 = ones, rest = 0";
     // log-mel of that single mel bin per frame is log(sum_k power[t, k]).
@@ -367,7 +367,7 @@ int section_real_fft_parity(const qvac_parakeet::MelConfig & cfg,
 }
 
 int main(int /*argc*/, char ** /*argv*/) {
-    using namespace qvac_parakeet;
+    using namespace parakeet;
 
     const MelConfig cfg = make_test_cfg();
     const std::vector<float> signal = make_signal(cfg.sample_rate); // 1 sec

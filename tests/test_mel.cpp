@@ -94,7 +94,7 @@ int main(int argc, char ** argv) {
     const std::string wav_path  = argv[2];
     const std::string ref_path  = argv[3];
 
-    using namespace qvac_parakeet;
+    using namespace parakeet;
 
     ParakeetCtcModel model;
     if (int rc = load_from_gguf(gguf_path, model, 0, 0, true); rc != 0) return rc;

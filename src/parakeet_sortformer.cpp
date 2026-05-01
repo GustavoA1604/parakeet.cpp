@@ -10,7 +10,7 @@
 #include <cstdio>
 #include <vector>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 namespace {
 

@@ -14,7 +14,7 @@ index 96942915..7c2e4bc2 100644
  #include <charconv>
  #include <mutex>
  
-+// qvac-parakeet patch: persistent kernel binary cache support. The
++// parakeet patch: persistent kernel binary cache support. The
 +// helpers below sit on POSIX file primitives (mkdir/unlink/fsync) but
 +// also need to build on MinGW / MSVC where those names map to the
 +// `_`-prefixed Windows variants and mkdir takes a single argument.
@@ -47,7 +47,7 @@ index 96942915..7c2e4bc2 100644
    return text;
  }
  
-+// qvac-parakeet patch: persistent OpenCL kernel-binary cache.
++// parakeet patch: persistent OpenCL kernel-binary cache.
 +// ggml-opencl as shipped at this commit JIT-compiles every embedded
 +// kernel via `clBuildProgram(clCreateProgramWithSource)` on each cold
 +// start. On Adreno that's tens of seconds of shader compile per
@@ -241,7 +241,7 @@ index 96942915..7c2e4bc2 100644
  
      program_size = strlen(program_buffer);
  
-+    // qvac-parakeet patch: try the persistent cache first.
++    // parakeet patch: try the persistent cache first.
 +    const std::string cache_dir = opencl_cache_dir(dev);
 +    const std::string cache_key = cache_dir.empty()
 +        ? std::string()
@@ -259,7 +259,7 @@ index 96942915..7c2e4bc2 100644
          exit(1);
      }
  
-+    // qvac-parakeet patch: save the freshly compiled binary. Fast path
++    // parakeet patch: save the freshly compiled binary. Fast path
 +    // (cache hit) above avoids re-compiling next time. Failures here
 +    // are non-fatal -- next process just re-pays the compile cost.
 +    opencl_save_program_binary(p, dev, cache_dir, cache_key);

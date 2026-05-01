@@ -13,7 +13,7 @@
 // captures on the production transcribe path, ...). Designed to run in
 // well under a minute on a 16-thread Ryzen.
 
-#include "qvac-parakeet/engine.h"
+#include "parakeet/engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -110,7 +110,7 @@ int main(int argc, char ** argv) {
     }
     if (o.model_path.empty() || o.wav_path.empty()) { usage(argv[0]); return 2; }
 
-    qvac_parakeet::EngineOptions eopts;
+    parakeet::EngineOptions eopts;
     eopts.model_gguf_path        = o.model_path;
     eopts.n_threads              = o.n_threads;
     eopts.n_gpu_layers           = o.n_gpu_layers;
@@ -119,7 +119,7 @@ int main(int argc, char ** argv) {
     eopts.prewarm_audio_seconds  = o.prewarm_audio_seconds;
 
     const auto t_ctor = std::chrono::steady_clock::now();
-    qvac_parakeet::Engine engine(eopts);
+    parakeet::Engine engine(eopts);
     const double ctor_ms = std::chrono::duration_cast<std::chrono::microseconds>(
                                std::chrono::steady_clock::now() - t_ctor).count() / 1000.0;
     std::fprintf(stderr, "[test-perf-regression] engine ctor=%.2fms (prewarm=%s)\n",
@@ -150,7 +150,7 @@ int main(int argc, char ** argv) {
     // gate (every run identical) catches numerical drift the same
     // way the transcribe-path text comparison does.
     auto sortformer_fingerprint =
-        [](const qvac_parakeet::DiarizationResult & r) -> std::string {
+        [](const parakeet::DiarizationResult & r) -> std::string {
             // (n_segments, n_speaker_probs_floats, sum_of_speaker_ids,
             //  max_end_s × 100 rounded; the *100 keeps two decimals
             //  without making it locale-dependent.)

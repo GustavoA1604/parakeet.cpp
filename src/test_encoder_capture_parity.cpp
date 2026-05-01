@@ -23,7 +23,7 @@
 // transcript -- masking a real numerical drift.
 //
 // Built as `test-encoder-capture-parity` via the
-// QVAC_PARAKEET_BUILD_TESTS block. Takes the same `--model` /
+// PARAKEET_BUILD_TESTS block. Takes the same `--model` /
 // `--wav` args as test-encoder.
 
 #include "parakeet_ctc.h"
@@ -90,7 +90,7 @@ int main(int argc, char ** argv) {
     }
     if (model_path.empty() || wav_path.empty()) { usage(argv[0]); return 2; }
 
-    using namespace qvac_parakeet;
+    using namespace parakeet;
 
     ParakeetCtcModel model;
     if (int rc = load_from_gguf(model_path, model, /*n_threads=*/0,

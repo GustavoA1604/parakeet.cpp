@@ -16,7 +16,7 @@
 #   2. Runs test-tdt-decoder-parity on each available build (CPU vs
 #      graph-path token-id parity gate).  Decoder is byte-exact
 #      across all backends by design (parity test is the gate).
-#   3. Runs qvac-parakeet --bench on each build, with --bench-warmup 3
+#   3. Runs parakeet --bench on each build, with --bench-warmup 3
 #      --bench-runs 10 by default, and writes the JSON to
 #      artifacts/bench/<backend>-phase15.json.
 #   4. Pretty-prints the (decode, encoder, inference) means + stdevs
@@ -62,7 +62,7 @@ build_one() {
         echo "${backend}: cmake configure failed; skipping" >&2
         return 1
     fi
-    if ! cmake --build "$build" --target qvac-parakeet test-tdt-decoder-parity \
+    if ! cmake --build "$build" --target parakeet test-tdt-decoder-parity \
             -j 2>&1 | tail -10; then
         echo "${backend}: build failed; skipping" >&2
         return 1
@@ -85,7 +85,7 @@ run_one() {
 
     echo
     echo "=== ${backend^^}: bench ==="
-    "$build/qvac-parakeet" \
+    "$build/parakeet" \
         --bench --bench-json "$json" \
         --model "$GGUF" --wav "$WAV" \
         --n-gpu-layers 1 \

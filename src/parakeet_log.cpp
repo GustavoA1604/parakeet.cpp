@@ -1,6 +1,6 @@
 #include "parakeet_log.h"
 
-#include "qvac-parakeet/log.h"
+#include "parakeet/log.h"
 
 #include <atomic>
 #include <cstdarg>
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace qvac_parakeet {
+namespace parakeet {
 
 namespace {
 
@@ -57,7 +57,7 @@ void log_impl(ggml_log_level level, const char * fmt, ...) {
 
 }
 
-extern "C" QVAC_PARAKEET_API void qvac_parakeet_log_set(ggml_log_callback cb,
+extern "C" PARAKEET_API void parakeet_log_set(ggml_log_callback cb,
                                                         void *            user_data) {
-    qvac_parakeet::log_set_callback(cb, user_data);
+    parakeet::log_set_callback(cb, user_data);
 }

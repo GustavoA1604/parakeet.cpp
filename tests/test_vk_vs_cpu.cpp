@@ -81,8 +81,8 @@ int main(int argc, char ** argv) {
     const std::string gguf_path = argv[1];
     const std::string wav_path  = argv[2];
 
-    using namespace qvac_parakeet;
-    using namespace qvac_parakeet;
+    using namespace parakeet;
+    using namespace parakeet;
 
     // ---- load CPU model ----
     std::fprintf(stderr, "[*] loading CPU model...\n");
