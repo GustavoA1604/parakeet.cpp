@@ -93,18 +93,27 @@ void dequantize_to_f32(const ggml_tensor * t, std::vector<float> & out) {
 }
 
 // ---- Scalar host-side LSTM step (CPU fallback) ----
+//
+// QVAC-18264 — `layer_input_scratch` is a caller-owned reusable
+// buffer matching the EOU path. The CPU fallback path runs on
+// CPU-only Engine builds where the per-step graph dispatch latency
+// dominates GPU graphs; this lifts ~250 emission-step `std::vector
+// <float>(H_pred=640)` allocations per utterance out of the hot loop.
+// gemv_f32 writes every output byte before any read, so re-using the
+// scratch buffer is byte-equal to the per-call allocation.
 void host_lstm_step(const TdtRuntimeWeights & W,
                     const float * __restrict x_input,
                     float * __restrict h_state,
                     float * __restrict c_state,
-                    std::vector<float> & scratch) {
+                    std::vector<float> & scratch,
+                    std::vector<float> & layer_input_scratch) {
     const int H = W.H_pred;
     const int L = W.L;
     const int G = 4 * H;
     scratch.resize((size_t) G);
+    layer_input_scratch.resize((size_t) H);
 
     const float * x = x_input;
-    std::vector<float> layer_input(H);
 
     for (int layer = 0; layer < L; ++layer) {
         const auto & w = W.host_lstm[layer];
@@ -125,8 +134,8 @@ void host_lstm_step(const TdtRuntimeWeights & W,
             c_l[i] = c_new;
             h_new[i] = o_g * std::tanh(c_new);
         }
-        std::memcpy(layer_input.data(), h_new, (size_t) H * sizeof(float));
-        x = layer_input.data();
+        std::memcpy(layer_input_scratch.data(), h_new, (size_t) H * sizeof(float));
+        x = layer_input_scratch.data();
     }
 }
 
@@ -136,25 +145,28 @@ void host_lstm_step(const TdtRuntimeWeights & W,
 // hoisting this matmul to a full-window precompute regresses on CPU due to
 // loss of cache locality for small (~250) windows; the original per-step
 // path is faster on M-series CPUs.
+// QVAC-18264 — same caller-owned-scratch pattern as host_lstm_step.
+// gemv_f32 writes every output byte before any read, so re-using
+// `tmp_scratch` across emission steps is byte-equal to the per-call
+// allocation.
 void host_joint_step(const TdtRuntimeWeights & W,
                      const float * __restrict enc_frame,
                      const float * __restrict pred,
                      std::vector<float> & hidden,
-                     std::vector<float> & logits) {
+                     std::vector<float> & logits,
+                     std::vector<float> & tmp_scratch) {
     const int H  = W.H_joint;
     const int Hp = W.H_pred;
     const int De = W.D_enc;
     const int Vo = W.V_out;
 
     hidden.resize(H);
+    tmp_scratch.resize(H);
     gemv_f32(W.host_joint_enc_w.data(), enc_frame, W.host_joint_enc_b.data(),
              hidden.data(), H, De);
-    {
-        std::vector<float> tmp(H);
-        gemv_f32(W.host_joint_pred_w.data(), pred, W.host_joint_pred_b.data(),
-                 tmp.data(), H, Hp);
-        for (int i = 0; i < H; ++i) hidden[i] += tmp[i];
-    }
+    gemv_f32(W.host_joint_pred_w.data(), pred, W.host_joint_pred_b.data(),
+             tmp_scratch.data(), H, Hp);
+    for (int i = 0; i < H; ++i) hidden[i] += tmp_scratch[i];
     for (int i = 0; i < H; ++i) hidden[i] = std::max(0.0f, hidden[i]);
 
     logits.resize(Vo);
@@ -836,8 +848,10 @@ void tdt_init_state(TdtRuntimeWeights & W, int blank_id, TdtDecodeState & state)
         state.c_state.assign((size_t) L * H, 0.0f);
         state.pred_out.assign(H, 0.0f);
         std::vector<float> scratch;
+        std::vector<float> layer_input_scratch;
         const float * embed_row = W.embed.data() + (size_t) blank_id * H;
-        host_lstm_step(W, embed_row, state.h_state.data(), state.c_state.data(), scratch);
+        host_lstm_step(W, embed_row, state.h_state.data(), state.c_state.data(),
+                       scratch, layer_input_scratch);
         std::memcpy(state.pred_out.data(),
                     state.h_state.data() + (size_t) (L - 1) * H,
                     (size_t) H * sizeof(float));
@@ -883,6 +897,8 @@ int tdt_decode_window(const ParakeetCtcModel & model,
 
     std::vector<float> logits((size_t) V_out);
     std::vector<float> scratch_lstm;
+    std::vector<float> scratch_lstm_layer_input;
+    std::vector<float> scratch_joint_tmp;
     std::vector<float> scratch_joint_hidden;
 
     int t = 0;
@@ -914,7 +930,7 @@ int tdt_decode_window(const ParakeetCtcModel & model,
         } else {
             const float * enc_frame = encoder_out_window + (size_t) t * D_enc;
             host_joint_step(W, enc_frame, state.pred_out.data(),
-                            scratch_joint_hidden, logits);
+                            scratch_joint_hidden, logits, scratch_joint_tmp);
             best_token   = argmax_f32(logits.data(), V_p1);
             best_dur_idx = argmax_f32(logits.data() + V_p1, D_n);
         }
@@ -939,7 +955,7 @@ int tdt_decode_window(const ParakeetCtcModel & model,
         } else {
             const float * embed_row = W.embed.data() + (size_t) best_token * H_pred;
             host_lstm_step(W, embed_row, state.h_state.data(), state.c_state.data(),
-                           scratch_lstm);
+                           scratch_lstm, scratch_lstm_layer_input);
             std::memcpy(state.pred_out.data(),
                         state.h_state.data() + (size_t) (L - 1) * H_pred,
                         (size_t) H_pred * sizeof(float));

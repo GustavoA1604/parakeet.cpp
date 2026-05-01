@@ -437,6 +437,18 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         LABEL    "perf"
         ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+    # QVAC-18264 R4 — Sortformer dispatch path for the perf-regression
+    # harness. Same gates (cache-hit ratio, cold-overhead, mel-ms ceiling)
+    # as transcribe-path; the only difference is that
+    # `engine.diarize(wav)` produces a `DiarizationResult` instead of an
+    # `EngineResult`, and the deterministic comparison runs over a
+    # segment-list fingerprint rather than the transcript text.
+    if (EXISTS "${_qvp_sf_q8_gguf}" AND EXISTS "${_qvp_diar_wav}")
+        add_test(NAME test-perf-regression-sortformer
+            COMMAND $<TARGET_FILE:test-perf-regression>
+                "--model" "${_qvp_sf_q8_gguf}" "--wav" "${_qvp_diar_wav}")
+        set_property(TEST test-perf-regression-sortformer PROPERTY LABELS "perf")
+    endif()
 
     # Internal regression gate for the round-2 mel preprocess sweep
     # (real-FFT, MelState reuse). Pure unit test -- no GGUF needed.
@@ -465,6 +477,28 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+    # QVAC-18264 — same capture-parity contract on TDT/EOU/Sortformer.
+    # Registered separately (not via qvac_parakeet_register_test) so
+    # each is auto-skipped via the EXISTS guard when the GGUF isn't
+    # present, without spuriously DISABLING the CTC variant.
+    if (EXISTS "${_qvp_tdt_q8_gguf}" AND EXISTS "${_qvp_jfk_wav}")
+        add_test(NAME test-encoder-capture-parity-tdt
+            COMMAND $<TARGET_FILE:test-encoder-capture-parity>
+                "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}")
+        set_property(TEST test-encoder-capture-parity-tdt PROPERTY LABELS "fixture")
+    endif()
+    if (EXISTS "${_qvp_eou_q8_gguf}" AND EXISTS "${_qvp_jfk_wav}")
+        add_test(NAME test-encoder-capture-parity-eou
+            COMMAND $<TARGET_FILE:test-encoder-capture-parity>
+                "--model" "${_qvp_eou_q8_gguf}" "--wav" "${_qvp_jfk_wav}")
+        set_property(TEST test-encoder-capture-parity-eou PROPERTY LABELS "fixture")
+    endif()
+    if (EXISTS "${_qvp_sf_q8_gguf}" AND EXISTS "${_qvp_diar_wav}")
+        add_test(NAME test-encoder-capture-parity-sortformer
+            COMMAND $<TARGET_FILE:test-encoder-capture-parity>
+                "--model" "${_qvp_sf_q8_gguf}" "--wav" "${_qvp_diar_wav}")
+        set_property(TEST test-encoder-capture-parity-sortformer PROPERTY LABELS "fixture")
+    endif()
 
     add_executable(test-tdt-encoder-parity
         tests/test_tdt_encoder_parity.cpp
@@ -525,6 +559,43 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "${_qvp_sf_f16_gguf}" "${_qvp_diar_wav}" "${_qvp_sf_ref}"
         REQUIRES "${_qvp_sf_f16_gguf}" "${_qvp_diar_wav}" "${_qvp_sf_ref}/encoder_out.npy")
+
+    # QVAC-18264 — decoder determinism gate. Runs each decoder N times
+    # against the same encoder output and asserts byte-equal results
+    # across all repetitions. Catches buffer-reuse correctness bugs
+    # (residual scratch state leaking into the next call) that the
+    # existing per-stage parity tests (which load+decode once) wouldn't
+    # see. Runs against any model type; switches to diarize() when the
+    # GGUF declares Sortformer.
+    add_executable(test-decoder-determinism src/test_decoder_determinism.cpp)
+    target_link_libraries(test-decoder-determinism PRIVATE qvac-parakeet)
+    target_include_directories(test-decoder-determinism PRIVATE include src ggml/include)
+    qvac_parakeet_apply_ccache(test-decoder-determinism)
+    qvac_parakeet_register_test(test-decoder-determinism
+        LABEL    "fixture"
+        ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
+        REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
+    # Per-model-type instances so ctest exercises each path. Each is
+    # individually DISABLED when its GGUF isn't present, so a fresh
+    # checkout with only ctc.q8_0.gguf cached still gives a green ctest.
+    if (EXISTS "${_qvp_tdt_q8_gguf}" AND EXISTS "${_qvp_jfk_wav}")
+        add_test(NAME test-decoder-determinism-tdt
+            COMMAND $<TARGET_FILE:test-decoder-determinism>
+                "--model" "${_qvp_tdt_q8_gguf}" "--wav" "${_qvp_jfk_wav}")
+        set_property(TEST test-decoder-determinism-tdt PROPERTY LABELS "fixture")
+    endif()
+    if (EXISTS "${_qvp_eou_q8_gguf}" AND EXISTS "${_qvp_jfk_wav}")
+        add_test(NAME test-decoder-determinism-eou
+            COMMAND $<TARGET_FILE:test-decoder-determinism>
+                "--model" "${_qvp_eou_q8_gguf}" "--wav" "${_qvp_jfk_wav}")
+        set_property(TEST test-decoder-determinism-eou PROPERTY LABELS "fixture")
+    endif()
+    if (EXISTS "${_qvp_sf_q8_gguf}" AND EXISTS "${_qvp_diar_wav}")
+        add_test(NAME test-decoder-determinism-sortformer
+            COMMAND $<TARGET_FILE:test-decoder-determinism>
+                "--model" "${_qvp_sf_q8_gguf}" "--wav" "${_qvp_diar_wav}")
+        set_property(TEST test-decoder-determinism-sortformer PROPERTY LABELS "fixture")
+    endif()
 
     if (GGML_VULKAN)
         add_executable(test-vk-vs-cpu

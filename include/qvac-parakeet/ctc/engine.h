@@ -101,6 +101,34 @@ struct EngineOptions {
     int n_threads    = 0;
 
     bool verbose     = false;
+
+    // QVAC-18264 R4 — opt-in cold-start mitigation.
+    //
+    // When `prewarm == true`, the Engine constructor runs one
+    // synthetic forward pass through the encoder (and, on TDT
+    // GGUFs, through the per-step LSTM/joint graphs too) using a
+    // `prewarm_audio_seconds`-long all-zero mel input. The
+    // intent is to amortise the *first-call* cold cost into
+    // construction:
+    //
+    //   * Metal:   triggers the MSL → MTLPipelineState compile.
+    //   * OpenCL:  triggers `clBuildProgram` for every kernel
+    //              variant the encoder graph touches; binaries
+    //              get cached via the QVAC-17997 program-binary-
+    //              cache patch when GGML_OPENCL_CACHE_DIR is set.
+    //   * Vulkan:  triggers vkCreateGraphicsPipelines (matches
+    //              what the QVAC-17872 ggml-vulkan-pipeline-cache
+    //              patch does for chatterbox).
+    //   * CUDA:    triggers cuGraphInstantiate.
+    //   * CPU:     pre-builds the ggml graph nodes + scratch.
+    //
+    // Default off (back-compat: callers who wanted the old
+    // first-call-pays-cold behaviour keep getting it). Adds the
+    // cold-start cost to construction time instead of first
+    // transcribe; useful for embedded / interactive UX where
+    // first-utterance latency is the user-perceived metric.
+    bool  prewarm                = false;
+    float prewarm_audio_seconds  = 1.0f;
 };
 
 // Resolved compute device the Engine is actually running on, after the
