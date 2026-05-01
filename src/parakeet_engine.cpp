@@ -1,4 +1,7 @@
-#include "qvac-parakeet/ctc/engine.h"
+#include "qvac-parakeet/engine.h"
+#include "qvac-parakeet/streaming.h"
+#include "qvac-parakeet/diarization.h"
+#include "qvac-parakeet/attributed.h"
 
 #include "parakeet_ctc.h"
 #include "parakeet_tdt.h"
@@ -65,7 +68,7 @@ struct Engine::Impl {
     Impl() = default;
 };
 
-// QVAC-18264 R4 — opt-in encoder prewarm. Runs one synthetic
+// Opt-in encoder prewarm. Runs one synthetic
 // forward pass through the encoder so the cold-graph-build cost is
 // amortised into Engine construction instead of warmup_1.
 //
@@ -73,11 +76,10 @@ struct Engine::Impl {
 //   * Metal: triggers MSL → MTLPipelineState compile.
 //   * OpenCL: triggers clBuildProgram for every kernel variant the
 //             encoder graph touches; binaries get cached via the
-//             QVAC-17997 program-binary-cache patch when
-//             GGML_OPENCL_CACHE_DIR is set, so subsequent processes
-//             skip even this prewarm cost.
+//             program-binary-cache patch when GGML_OPENCL_CACHE_DIR 
+//             is set, so subsequent processes skip even this prewarm cost.
 //   * Vulkan: triggers vkCreateGraphicsPipelines (matches what the
-//             QVAC-17872 ggml-vulkan-pipeline-cache patch caches).
+//             ggml-vulkan-pipeline-cache patch caches).
 //   * CUDA: triggers cuGraphInstantiate.
 //   * CPU: pre-builds the ggml graph nodes + scratch + caches them
 //          via the same encoder_graphs LRU as a real call.
@@ -118,7 +120,7 @@ static void prewarm_encoder(ParakeetCtcModel & model, float audio_seconds) {
 
     EncoderOutputs out;
     // capture_intermediates=false: production-shape call (no
-    // per-stage host roundtrips); same `false` the QVAC-17997 audit
+    // per-stage host roundtrips); same `false` the audit
     // wired into Engine::transcribe_*. capture=false keeps the
     // graph topology identical to a real call so the kernel
     // pipeline cache hit is real.

@@ -100,7 +100,7 @@ int main(int argc, char ** argv) {
     const std::string ref_dir   = argv[2];
     const int n_gpu_layers = (argc >= 4) ? std::atoi(argv[3]) : 0;
 
-    using namespace qvac_parakeet::ctc;
+    using namespace qvac_parakeet;
 
     ParakeetCtcModel model;
     if (int rc = load_from_gguf(gguf_path, model, 0, n_gpu_layers, true); rc != 0) return rc;

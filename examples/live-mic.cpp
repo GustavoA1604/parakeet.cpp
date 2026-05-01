@@ -3,7 +3,7 @@
 // on the single-translation-unit MINIAUDIO_IMPLEMENTATION macro.
 #include "miniaudio.h"
 
-#include "qvac-parakeet/ctc/engine.h"
+#include "qvac-parakeet/engine.h"
 #include "ggml.h"
 
 #include <atomic>

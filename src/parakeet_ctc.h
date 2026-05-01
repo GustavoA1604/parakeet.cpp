@@ -394,11 +394,4 @@ int profile_block_substages(ParakeetCtcModel & model,
                             int timed_runs,
                             BlockSubstageTimes & out);
 
-// Backward-compat: the public namespace was `qvac_parakeet::ctc` through
-// v0.1.0-pre. Make the legacy qualifier resolve to the new flat namespace
-// so existing translation units (and out-of-tree consumers) keep building.
-namespace ctc {
-    using namespace ::qvac_parakeet;
-}
-
 }

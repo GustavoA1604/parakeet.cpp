@@ -1,4 +1,4 @@
-// QVAC-18264 — decoder determinism regression gate.
+// Decoder determinism regression gate.
 //
 // Asserts that running the same decoder N times against the same encoder
 // output produces byte-equal results every time, and that the public
@@ -57,7 +57,7 @@
 //
 // Returns 0 on success, non-zero on parity failure or setup error.
 
-#include "qvac-parakeet/ctc/engine.h"
+#include "qvac-parakeet/engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -88,7 +88,7 @@ struct Opts {
     // on Adreno + warm GGML_OPENCL_CACHE_DIR.
     double cache_hit_ratio_max = 1.10;
 
-    // QVAC-18264 R4 — exercise EngineOptions::prewarm on the
+    // Exercise EngineOptions::prewarm on the
     // engine instance. When set, the harness asserts an additional
     // contract: run0 (the first real transcribe / diarize call,
     // which would normally be the cold-graph-build outlier) must
@@ -522,7 +522,7 @@ int main(int argc, char ** argv) {
         return 3;
     }
 
-    // QVAC-18264 R4 — auto-derive prewarm_audio_seconds from the
+    // Auto-derive prewarm_audio_seconds from the
     // loaded wav when --prewarm-audio-seconds wasn't passed
     // explicitly. The encoder graph cache is shape-keyed, so this
     // is what the test should do to get run0 into the warm band;

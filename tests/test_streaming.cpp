@@ -1,4 +1,4 @@
-#include "qvac-parakeet/ctc/engine.h"
+#include "qvac-parakeet/engine.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-using namespace qvac_parakeet::ctc;
+using namespace qvac_parakeet;
 
 namespace {
 

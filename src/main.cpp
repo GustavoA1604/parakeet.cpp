@@ -1,6 +1,8 @@
-#include "qvac-parakeet/qvac-parakeet.h"
-#include "qvac-parakeet/ctc/pipeline.h"
-#include "qvac-parakeet/ctc/engine.h"
+#include "qvac-parakeet/cli.h"
+#include "qvac-parakeet/engine.h"
+#include "qvac-parakeet/streaming.h"
+#include "qvac-parakeet/diarization.h"
+#include "qvac-parakeet/attributed.h"
 
 #include "parakeet_ctc.h"
 #include "parakeet_log.h"
@@ -333,10 +335,23 @@ AggStats aggregate(std::vector<double> v) {
     return s;
 }
 
+// Private CLI options struct -- this binary's parsed flags only. The
+// public C++ API (qvac_parakeet::EngineOptions) doesn't carry the wav
+// path because it's a property of each transcribe() call, not the
+// loaded engine; the CLI happens to want both in one bag during arg
+// parsing so we keep a tiny local struct.
+struct CliOpts {
+    std::string model_gguf_path;
+    std::string wav_path;
+    int  n_threads    = 0;
+    int  n_gpu_layers = 0;
+    bool verbose      = false;
+};
+
 }
 
 extern "C" int qvac_parakeet_cli_main(int argc, char ** argv) {
-    qvac_parakeet::TranscribeOptions opts;
+    CliOpts      opts;
     ExtraCliOpts extra;
 
     for (int i = 1; i < argc; ++i) {

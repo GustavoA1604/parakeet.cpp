@@ -1,6 +1,6 @@
 #include "parakeet_log.h"
 
-#include "qvac-parakeet/qvac-parakeet.h"
+#include "qvac-parakeet/log.h"
 
 #include <atomic>
 #include <cstdarg>

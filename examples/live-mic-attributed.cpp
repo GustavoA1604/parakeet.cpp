@@ -1,7 +1,8 @@
 // miniaudio implementation lives in examples/miniaudio_impl.cpp.
 #include "miniaudio.h"
 
-#include "qvac-parakeet/ctc/engine.h"
+#include "qvac-parakeet/engine.h"
+#include "qvac-parakeet/attributed.h"
 #include "ggml.h"
 
 #include <atomic>

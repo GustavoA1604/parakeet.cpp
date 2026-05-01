@@ -13,7 +13,7 @@
 // captures on the production transcribe path, ...). Designed to run in
 // well under a minute on a 16-thread Ryzen.
 
-#include "qvac-parakeet/ctc/engine.h"
+#include "qvac-parakeet/engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -44,7 +44,7 @@ struct Opts {
     // `clBuildProgram` hot path resurfaces).
     double max_mel_ms = 0.0;
     double max_cold_overhead_ratio = 0.0; // 0 = disabled
-    // QVAC-18264 R4 — pass-through to EngineOptions::prewarm. With
+    // Pass-through to EngineOptions::prewarm. With
     // prewarm on, the constructor pays the cold-graph-build cost so
     // warmup_1 should be in the warm steady-state band; gate
     // `--max-cold-overhead-ratio` is the suggested validation.

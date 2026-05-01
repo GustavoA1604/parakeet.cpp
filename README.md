@@ -1113,7 +1113,6 @@ parakeet.cpp/
     main.cpp                     CLI (wav / raw PCM -> text or speaker segments,
                                    + Mode 2/3 transcription streaming, sliding-history
                                    diarization streaming, attribution) + qvac_parakeet_cli_main
-                                   + transcribe_wav (CTC-only one-shot helper)
     cli_main.cpp                 thin main() -> qvac_parakeet_cli_main shim
     parakeet_ctc.{h,cpp}         GGUF loader + FastConformer encoder ggml graph
                                    + CTC head + greedy decode (shared by all engines;
@@ -1145,16 +1144,29 @@ parakeet.cpp/
                                    eou-streaming, sortformer-streaming,
                                    vk-vs-cpu)
   include/qvac-parakeet/
-    qvac-parakeet.h              CLI entry (qvac_parakeet_cli_main) + library overview
-    ctc/engine.h                 persistent multi-engine Engine umbrella + StreamSession +
-                                   SortformerStreamSession + transcribe_with_speakers.
-                                   The header path "ctc/" is historical -- the API now
-                                   covers CTC, TDT, EOU, and Sortformer GGUFs.
-                                   StreamingSegment carries is_eou_boundary +
-                                   eot_confidence (EOU-only fields; reserved for
-                                   Phase 13 cross-engine OnEndOfTurn event).
-    ctc/pipeline.h               one-shot wav -> text API (CTC GGUFs only;
-                                   hard-errors on TDT/EOU/Sortformer)
+    qvac-parakeet.h              umbrella aggregator: pulls in every per-concern
+                                   header below in one #include.
+    export.h                     QVAC_PARAKEET_API symbol-visibility decorator
+                                   (mirrors LLAMA_API / WHISPER_API).
+    cli.h                        qvac_parakeet_cli_main C entry point.
+    log.h                        qvac_parakeet_log_set host log sink (signature
+                                   is ggml_log_callback so the same shim demuxes
+                                   parakeet + ggml + sibling libraries).
+    engine.h                     persistent multi-engine Engine class + Options /
+                                   Result / BackendDevice. Auto-routes on GGUF
+                                   metadata across CTC, TDT, EOU, Sortformer.
+    streaming.h                  StreamingOptions / StreamingSegment / StreamSession
+                                   + cross-engine StreamEvent / VadState /
+                                   StreamEventType (EOU `<EOU>` -> EndOfTurn,
+                                   Sortformer threshold-cross -> VadStateChanged,
+                                   opt-in energy-VAD on CTC/TDT).
+    diarization.h                DiarizationOptions / Result + SortformerStreamingOptions
+                                   / SortformerStreamSession (Phase 11.11.1
+                                   sliding-history live diarization).
+    attributed.h                 transcribe_with_speakers + AttributedSegment /
+                                   AttributedTranscriptionOptions / Result --
+                                   composes Sortformer + an ASR Engine into
+                                   per-segment {speaker, text, start, end}.
   examples/
     live-mic.cpp                 live microphone -> transcription (CTC/TDT/EOU) or live
                                    diarization (Sortformer); auto-detects the GGUF.

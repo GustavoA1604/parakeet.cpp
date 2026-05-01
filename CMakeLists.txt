@@ -133,7 +133,6 @@ endif()
 set(QVAC_PARAKEET_LIB_SOURCES
     src/parakeet_ctc.cpp
     src/parakeet_engine.cpp
-    src/parakeet_pipeline.cpp
     src/parakeet_tdt.cpp
     src/parakeet_eou.cpp
     src/parakeet_sortformer.cpp
@@ -437,7 +436,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         LABEL    "perf"
         ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
-    # QVAC-18264 R4 — Sortformer dispatch path for the perf-regression
+    # Sortformer dispatch path for the perf-regression
     # harness. Same gates (cache-hit ratio, cold-overhead, mel-ms ceiling)
     # as transcribe-path; the only difference is that
     # `engine.diarize(wav)` produces a `DiarizationResult` instead of an
@@ -477,7 +476,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         LABEL    "fixture"
         ARGS     "--model" "${_qvp_ctc_q8_gguf}" "--wav" "${_qvp_jfk_wav}"
         REQUIRES "${_qvp_ctc_q8_gguf}" "${_qvp_jfk_wav}")
-    # QVAC-18264 — same capture-parity contract on TDT/EOU/Sortformer.
+    # Same capture-parity contract on TDT/EOU/Sortformer.
     # Registered separately (not via qvac_parakeet_register_test) so
     # each is auto-skipped via the EXISTS guard when the GGUF isn't
     # present, without spuriously DISABLING the CTC variant.
@@ -504,7 +503,6 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         tests/test_tdt_encoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
-        src/parakeet_pipeline.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
@@ -524,7 +522,6 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         src/test_tdt_decoder_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
-        src/parakeet_pipeline.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
@@ -544,7 +541,6 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         tests/test_sortformer_parity.cpp
         src/parakeet_ctc.cpp
         src/parakeet_engine.cpp
-        src/parakeet_pipeline.cpp
         src/parakeet_log.cpp
         src/parakeet_tdt.cpp
         src/parakeet_eou.cpp
@@ -560,7 +556,7 @@ if (QVAC_PARAKEET_BUILD_TESTS)
         ARGS     "${_qvp_sf_f16_gguf}" "${_qvp_diar_wav}" "${_qvp_sf_ref}"
         REQUIRES "${_qvp_sf_f16_gguf}" "${_qvp_diar_wav}" "${_qvp_sf_ref}/encoder_out.npy")
 
-    # QVAC-18264 — decoder determinism gate. Runs each decoder N times
+    # Decoder determinism gate. Runs each decoder N times
     # against the same encoder output and asserts byte-equal results
     # across all repetitions. Catches buffer-reuse correctness bugs
     # (residual scratch state leaking into the next call) that the

@@ -1,4 +1,4 @@
-#include "qvac-parakeet/ctc/engine.h"
+#include "qvac-parakeet/engine.h"
 
 #include <atomic>
 #include <cstdio>
@@ -58,7 +58,7 @@ bool load_wav_pcm16le_mono(const std::string & path, std::vector<float> & sample
     return true;
 }
 
-using namespace qvac_parakeet::ctc;
+using namespace qvac_parakeet;
 
 int run_basic(const std::string & gguf_path, const std::string & wav_path) {
 
