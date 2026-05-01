@@ -80,8 +80,7 @@ struct Engine::Impl {
 //             encoder graph touches; binaries get cached via the
 //             program-binary-cache patch when GGML_OPENCL_CACHE_DIR 
 //             is set, so subsequent processes skip even this prewarm cost.
-//   * Vulkan: triggers vkCreateGraphicsPipelines (matches what the
-//             ggml-vulkan-pipeline-cache patch caches).
+//   * Vulkan: triggers vkCreateGraphicsPipelines.
 //   * CUDA: triggers cuGraphInstantiate.
 //   * CPU: pre-builds the ggml graph nodes + scratch + caches them
 //          via the same encoder_graphs LRU as a real call.

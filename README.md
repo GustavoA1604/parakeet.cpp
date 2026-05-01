@@ -5,7 +5,7 @@
 ## Supported checkpoints
 
 | HF repo | Decoder | Mel | `d_model × n_layers` | Vocab | Params | GGUF size | RTF (Metal) | Languages |
-|-|-|-|-|-|-|-|-|-|
+|---|---|---|---|---|---|---|---|---|
 | `nvidia/parakeet-ctc-0.6b`    | CTC  | 80  | 1024 × 24 | 1024 | 600 M  | 697 MiB q8_0 / 1.3 GiB f16  | 0.014-0.046 | English only |
 | `nvidia/parakeet-ctc-1.1b`    | CTC  | 80  | 1024 × 42 | 1024 | 1.1 B  | 1217 MiB q8_0               | 0.026-0.074 | English only |
 | `nvidia/parakeet-tdt-0.6b-v3` | TDT  | 128 | 1024 × 24 | 8192 | 600 M  | 715 MiB q8_0 / 1.34 GiB f16 | 0.006 (q8_0, end-to-end Metal — ~160× realtime, fused LSTM+joint decoder) | ~25 languages + PnC |
@@ -38,7 +38,7 @@ Each GGUF bundles weights, mel filterbank, and tokenizer as needed.
 
 ## Prerequisites
 
-- C++17, CMake ≥ 3.14  
+- C++17, CMake ≥ 3.20  
 - Python (torch, `nemo_toolkit[asr]`, `gguf`, numpy, librosa, …) **only** for the scripts under §2 and §4 (`convert-nemo-to-gguf.py`, NeMo reference dumps, and the optional maintainer scripts listed at the end of §4).
 
 ## 1. Clone and build
@@ -78,12 +78,18 @@ Run with GPU layers:
 
 **Useful CMake options**
 
-| Flag | Meaning |
-|------|---------|
-| `PARAKEET_BUILD_TESTS` | `test-*` harnesses (default ON in standalone) |
-| `PARAKEET_BUILD_EXAMPLES` | `live-mic`, `live-mic-attributed` |
-| `PARAKEET_USE_SYSTEM_GGML` | Link system ggml instead of `ggml/` submodule |
-| `PARAKEET_GGML_LIB_PREFIX` | Prefix bundled ggml libs as `parakeet-ggml-*` (default ON) to avoid DLL name clashes |
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `PARAKEET_BUILD_LIBRARY` | `ON` | Build the `parakeet` library (linkage follows `BUILD_SHARED_LIBS`; defaults to STATIC when unset) |
+| `PARAKEET_BUILD_EXECUTABLES` | `ON` standalone / `OFF` subdir | `parakeet-cli` (binary `parakeet`) |
+| `PARAKEET_BUILD_TESTS` | `ON` standalone / `OFF` subdir | `test-*` parity / unit harnesses |
+| `PARAKEET_BUILD_EXAMPLES` | `ON` standalone / `OFF` subdir | `live-mic`, `live-mic-attributed` |
+| `PARAKEET_INSTALL` | `ON` | Generate `install` rules + the `parakeet-cpp` CMake package config |
+| `PARAKEET_USE_SYSTEM_GGML` | `OFF` | Link system ggml instead of `ggml/` submodule |
+| `PARAKEET_GGML_LIB_PREFIX` | `ON` | Prefix bundled ggml libs as `parakeet-ggml-*` (no-op when `PARAKEET_USE_SYSTEM_GGML=ON`) |
+| `PARAKEET_OPENMP` | `ON` (auto-OFF on Windows non-MinGW) | Try `find_package(OpenMP)` and link the parakeet target against it |
+| `PARAKEET_FLASH_ATTN` | `ON` on Metal, `OFF` elsewhere | Fused flash-attn in the encoder MHA (per-backend A/B pending) |
+| `PARAKEET_CCACHE` | `ON` | Use ccache as compiler launcher for parakeet targets when found |
 
 With tests enabled, the build emits **`parakeet`** (CLI), **`test-mel`**, **`test-encoder`**, **`test-streaming`**, **`test-vk-vs-cpu`** (if Vulkan), etc. Full list is in CMake / build output.
 
@@ -192,14 +198,14 @@ Offline one-shot:
 Mode 2 streaming + JSON (EOU shows **`is_eou_boundary`** on the closing chunk when applicable):
 
 ```bash
-./build/parakeet --model models/parakeet-eou-120m-v1.q8_0.gguf --wav test/samples/jfk.wav \
+./build/parakeet --model models/parakeet_realtime_eou_120m-v1.q8_0.gguf --wav test/samples/jfk.wav \
   --stream --stream-chunk-ms 1500 --emit jsonl
 ```
 
 Sortformer sliding-window streaming from file:
 
 ```bash
-./build/parakeet --model models/sortformer-4spk-v1.f16.gguf \
+./build/parakeet --model models/diar_sortformer_4spk-v1.f16.gguf \
   --pcm-in speech.raw --pcm-format s16le --pcm-rate 16000 \
   --stream --stream-chunk-ms 2000 --stream-history-ms 30000 --emit text
 ```
@@ -208,7 +214,7 @@ Speaker-attributed transcription (CTC/TDT **`--model`** + Sortformer **`--diariz
 
 ```bash
 ./build/parakeet --model models/parakeet-tdt-0.6b-v3.q8_0.gguf \
-  --diarization-model models/sortformer-4spk-v1.f16.gguf \
+  --diarization-model models/diar_sortformer_4spk-v1.f16.gguf \
   --wav test/samples/diarization-sample-16k.wav --emit text
 ```
 
@@ -245,7 +251,7 @@ Enable with **`cmake -DPARAKEET_BUILD_EXAMPLES=ON`**. Produces **`live-mic`** an
 ./build/live-mic --list-devices
 ./build/live-mic --model models/parakeet-ctc-0.6b.q8_0.gguf --n-gpu-layers 1 \
   --chunk-ms 1000 --left-context-ms 5000 --right-lookahead-ms 1000
-./build/live-mic --model models/sortformer-4spk-v1.f16.gguf \
+./build/live-mic --model models/diar_sortformer_4spk-v1.f16.gguf \
   --chunk-ms 2000 --history-ms 30000
 ```
 
@@ -263,7 +269,7 @@ Enable with **`cmake -DPARAKEET_BUILD_EXAMPLES=ON`**. Produces **`live-mic`** an
 ```bash
 ./build/live-mic-attributed \
   --asr-model models/parakeet-tdt-0.6b-v3.q8_0.gguf \
-  --diar-model models/sortformer-4spk-v1.f16.gguf \
+  --diar-model models/diar_sortformer_4spk-v1.f16.gguf \
   --asr-chunk-ms 1000 --asr-left-context-ms 5000 --asr-right-lookahead-ms 1000 \
   --diar-chunk-ms 2000 --diar-history-ms 30000
 ```
@@ -316,12 +322,15 @@ Typical f16 stage rel vs NeMo (order of magnitude): mel ~1e-4 inner, blocks ~1e-
 
 | Path | Role |
 |------|------|
+| `CMakeLists.txt` | Top-level build (library, CLI, tests, examples, install/package config) |
+| `cmake/` | Package-config template (`parakeet-cppConfig.cmake.in`) |
 | `src/` | Engine, decoders, mel, CLI |
 | `include/parakeet/` | Public headers (`parakeet.h`, `engine.h`, `streaming.h`, …) |
 | `test/` | `test_*.cpp` CTest sources |
 | `examples/` | `live-mic`, `live-mic-attributed`, vendored miniaudio |
 | `scripts/` | `setup-ggml.sh`, conversion, NeMo dumps, `download-all-models.sh`; optional tools in §4 |
-| `ggml/` | Pinned submodule (or `-DPARAKEET_USE_SYSTEM_GGML=ON`) |
+| `patches/` | ggml patches applied by `setup-ggml.sh` (filename-prefix loader, OpenCL relax, OpenCL kernel-binary cache) |
+| `ggml/` | Pinned upstream clone (or `-DPARAKEET_USE_SYSTEM_GGML=ON`) |
 | `models/`, `artifacts/`, `test/samples/` | Local fixtures (not tracked) |
 | `PROGRESS.md` | Detailed history and parity notes |
 

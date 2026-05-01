@@ -68,13 +68,13 @@ void gemv_add_f32(const float * __restrict W, const float * __restrict x,
     }
 }
 
-// QVAC-18264 — `layer_input_scratch` lifted out of the per-call
-// allocator. EOU emits ~250 tokens per 11s utterance, each calling
-// lstm_step once, so a single-decode allocation count of 250 vs. 1
-// at H_pred=640 (2.5 KB each) shaves ~1.6 MB of malloc/free traffic
-// off the inner loop.  Byte-equal output: each call resizes to H
-// and the inner gemv writes every byte before reading, so no stale
-// state can leak between calls.
+// `layer_input_scratch` lifted out of the per-call allocator. EOU
+// emits ~250 tokens per 11s utterance, each calling lstm_step once,
+// so a single-decode allocation count of 250 vs. 1 at H_pred=640
+// (2.5 KB each) shaves ~1.6 MB of malloc/free traffic off the inner
+// loop. Byte-equal output: each call resizes to H and the inner gemv
+// writes every byte before reading, so no stale state can leak
+// between calls.
 void lstm_step(const EouRuntimeWeights & W,
                const float * __restrict x_input,
                float * __restrict h_state,
@@ -115,11 +115,11 @@ void lstm_step(const EouRuntimeWeights & W,
     }
 }
 
-// QVAC-18264 — `tmp_scratch` lifted out of the per-call allocator.
-// Same rationale as `lstm_step`: ~250 calls per utterance, each
-// previously fresh-allocating an H-sized vector. gemv_f32 writes
-// every output byte before any read, so re-using the buffer is
-// byte-equal to the per-call allocation.
+// `tmp_scratch` lifted out of the per-call allocator. Same rationale
+// as `lstm_step`: ~250 calls per utterance, each previously
+// fresh-allocating an H-sized vector. gemv_f32 writes every output
+// byte before any read, so re-using the buffer is byte-equal to the
+// per-call allocation.
 void joint_step(const EouRuntimeWeights & W,
                 const float * __restrict enc,
                 const float * __restrict pred,
@@ -286,7 +286,7 @@ int eou_decode_window(const ParakeetCtcModel & model,
 
             // <EOU>: flush the current segment, reset LSTM state, drop
             // back to the blank token as the predictor input. Match the
-            // binding's eouDecodeChunk semantics: do NOT feed `<EOU>`
+            // NeMo `eouDecodeChunk` reference: do NOT feed `<EOU>`
             // back into the predictor; reset h/c to zero and lastToken
             // to blank.
             if (best == eou) {
@@ -310,8 +310,8 @@ int eou_decode_window(const ParakeetCtcModel & model,
                 break;
             }
 
-            // Skip any other special token defensively (e.g. <unk>); same
-            // policy as the binding's `isSpecialToken` check.
+            // Skip any other special token defensively (e.g. <unk>);
+            // any vocab piece wrapped in `<...>` is treated as special.
             if (best >= 0 && (size_t) best < n_vocab) {
                 const std::string & piece = model.vocab.pieces[best];
                 if (!piece.empty() && piece.front() == '<' && piece.back() == '>') {

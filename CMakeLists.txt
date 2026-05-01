@@ -1,10 +1,11 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.20)
 project(parakeet-cpp LANGUAGES C CXX VERSION 0.1.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(PARAKEET_STANDALONE_DEFAULT ON)
@@ -19,7 +20,7 @@ option(PARAKEET_BUILD_EXAMPLES    "parakeet: build standalone examples (live-mic
 option(PARAKEET_INSTALL           "parakeet: generate install rules"                                 ON)
 option(PARAKEET_USE_SYSTEM_GGML   "parakeet: use system-installed GGML library"                      OFF)
 option(PARAKEET_CCACHE            "parakeet: use ccache as compiler launcher if available"           ON)
-option(PARAKEET_GGML_LIB_PREFIX   "parakeet: rename bundled ggml libraries to libparakeet-ggml-* (filename only; CMake target names and C symbols are unchanged). Prevents shared-library filename collisions when multiple addons that vendor different ggml versions are loaded into the same process. Has no effect when PARAKEET_USE_SYSTEM_GGML=ON." ON)
+option(PARAKEET_GGML_LIB_PREFIX   "parakeet: rename bundled ggml libraries to libparakeet-ggml-* (filename only; CMake target names and C symbols are unchanged). Prevents shared-library filename collisions when multiple consumers that vendor different ggml versions are loaded into the same host process. Has no effect when PARAKEET_USE_SYSTEM_GGML=ON." ON)
 
 # ccache shaves ~30 % off iterative rebuild time on developer machines.
 # Opt-out via -DPARAKEET_CCACHE=OFF for clean reproducibility runs.
@@ -145,6 +146,21 @@ if (PARAKEET_GGML_LIB_PREFIX AND NOT PARAKEET_USE_SYSTEM_GGML)
             parakeet_apply_ggml_prefix(${_qpgp_target})
         endforeach()
     endif()
+    # Renaming the bundled backend .so/.dll files alone is not enough:
+    # ggml's runtime loader (`ggml_backend_load_best`) hard-codes the
+    # `libggml-` / `ggml-` filename prefix when scanning for backends
+    # under `GGML_BACKEND_DL=ON`. The companion patch
+    # `patches/ggml-backend-reg-filename-prefix.patch` adds a
+    # `GGML_BACKEND_DL_PROJECT_PREFIX` macro to that loader; defining
+    # it here teaches the runtime to look for our prefixed filenames
+    # instead. Otherwise the renamed .so/.dll files exist on disk but
+    # are never discovered, and Vulkan/OpenCL/CUDA backends silently
+    # fail to load.
+    if (TARGET ggml)
+        target_compile_definitions(ggml PRIVATE
+            GGML_BACKEND_DL_PROJECT_PREFIX="parakeet-"
+        )
+    endif()
     message(STATUS "parakeet: bundled ggml libraries will be emitted as libparakeet-ggml-* (set PARAKEET_GGML_LIB_PREFIX=OFF to keep upstream filenames)")
 endif()
 
@@ -200,16 +216,16 @@ set(PARAKEET_LIB_SOURCES
     src/energy_vad.cpp
     # Lives in the library so `parakeet_cli_main` (declared in
     # the umbrella header `parakeet.h`) is actually a library
-    # symbol that addon hosts can link against. The CLI executable
-    # below is a thin shim that just calls into it.
+    # symbol that consumers / host applications can link against.
+    # The CLI executable below is a thin shim that just calls into it.
     src/main.cpp
 )
 
 if (PARAKEET_BUILD_LIBRARY)
     # Honour BUILD_SHARED_LIBS when set explicitly; otherwise default to
-    # STATIC. Matches the contract qvac-fabric-llm.cpp's `llama` target
-    # uses (BUILD_SHARED_LIBS-driven) so consumers building a shared
-    # parakeet alongside a shared llama see the same shape.
+    # STATIC. Same shape as the standard llama-style library contract
+    # (BUILD_SHARED_LIBS-driven), so consumers that build other ggml-
+    # based libraries shared see a consistent linkage selector.
     if (DEFINED BUILD_SHARED_LIBS)
         add_library(parakeet ${PARAKEET_LIB_SOURCES})
     else()
@@ -234,6 +250,15 @@ if (PARAKEET_BUILD_LIBRARY)
 
     target_link_libraries(parakeet PRIVATE parakeet-backend-defs)
 
+    # Single source of truth for the version string the CLI prints
+    # under `--version`. Kept PRIVATE because it only drives the in-
+    # library `main.cpp` impl; consumers that need a runtime version
+    # can read it via the public API surface or the CMake package
+    # version file (`parakeet-cppConfigVersion.cmake`).
+    target_compile_definitions(parakeet PRIVATE
+        PARAKEET_VERSION="${PROJECT_VERSION}"
+    )
+
     # `PARAKEET_EXPERIMENTAL_FLASH_ATTN` gates the rel-pos MHA
     # fused-attention path in `parakeet_ctc.cpp`. Per-backend defaults:
     #
@@ -242,8 +267,7 @@ if (PARAKEET_BUILD_LIBRARY)
     #             (-0.39 ms / -0.6 %), inference 119.24 -> 118.84 ms
     #             (-0.40 ms / -0.34 %), parity gates byte-exact (TDT
     #             decoder 95 tokens; encoder-capture 258048 + 258300
-    #             floats bit-equal). Closes PROGRESS Section 6.5
-    #             "likely a meaningful win on Metal" follow-up.
+    #             floats bit-equal).
     #             `kernel_flash_attn_ext_f32_dk128_dv128` is the kernel
     #             actually loaded; head_dim 128 covers parakeet-{ctc,
     #             tdt,eou} d_model=1024/n_heads=8 and parakeet-tdt-1.1b
@@ -254,8 +278,8 @@ if (PARAKEET_BUILD_LIBRARY)
     #             `parakeet_ctc.cpp::rel_pos_mha_graph`).
     #   - CPU:    OFF. Cast-to-f16 of the BD mask before softmax
     #             measurably changed accumulator order and showed
-    #             +3.1 % encoder regression in Round 7 audit; risks
-    #             the bit-equal-NeMo gate.
+    #             +3.1 % encoder regression on the CPU parity sweep;
+    #             risks the bit-equal-NeMo gate.
     #   - Others: OFF until backend-specific A/B. ggml-opencl supports
     #             `flash_attn_ext` for head_dim in
     #             {40,64,80,96,112,128,192,256}; first-Adreno bring-up
@@ -277,14 +301,23 @@ if (PARAKEET_BUILD_LIBRARY)
         EXPORT_NAME parakeet
         CXX_VISIBILITY_PRESET    hidden
         VISIBILITY_INLINES_HIDDEN ON
+        # VERSION drives the full filename suffix on Linux/macOS shared
+        # libs (libparakeet.so.0.1.0); SOVERSION drives the symlink the
+        # dynamic loader actually opens (libparakeet.so.0). Pinning
+        # SOVERSION to 0 (rather than ${PROJECT_VERSION_MAJOR}) keeps
+        # the ABI tag stable across pre-1.0 PROJECT_VERSION bumps so
+        # downstream consumers do not need to re-link on every patch
+        # release. Both properties are no-ops for STATIC builds.
+        VERSION   ${PROJECT_VERSION}
+        SOVERSION 0
     )
 
-    # Symbol-export contract for shared builds. Mirrors the
-    # LLAMA_SHARED / LLAMA_BUILD pair from qvac-fabric-llm.cpp:
-    # PUBLIC define so consumers see the import side of PARAKEET_API,
-    # PRIVATE define inside the library's TUs to flip Windows from
-    # `dllimport` to `dllexport`. Both no-ops in static builds (the
-    # default), so static consumers see exactly the same surface as before.
+    # Symbol-export contract for shared builds. Standard llama-style
+    # `*_SHARED` / `*_BUILD` pair: PUBLIC define so consumers see the
+    # import side of PARAKEET_API, PRIVATE define inside the library's
+    # TUs to flip Windows from `dllimport` to `dllexport`. Both no-ops
+    # in static builds (the default), so static consumers see exactly
+    # the same surface as before.
     get_target_property(_parakeet_type parakeet TYPE)
     if (_parakeet_type STREQUAL "SHARED_LIBRARY")
         target_compile_definitions(parakeet PUBLIC  PARAKEET_SHARED)
@@ -335,14 +368,15 @@ if (PARAKEET_BUILD_TESTS)
     set(PARAKEET_TEST_AUDIO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/test/samples"  CACHE PATH "parakeet: directory containing .wav fixtures used by the test suite")
     set(PARAKEET_TEST_REF_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/artifacts"     CACHE PATH "parakeet: directory containing NeMo .npy reference dumps (scripts/dump-*-reference.py)")
 
-    # Helper: register a built test target with CTest. Mirrors the
-    # `llama_test()` shape used by qvac-fabric-llm.cpp so `ctest` against
-    # the build dir surfaces every harness, with labels that allow filtering
-    # (e.g. `ctest -L cpu` to skip GPU-only tests on CI fleets without
-    # the matching backend). The optional REQUIRES list names paths that
-    # must exist at configure time; if any is missing the test is still
-    # registered (so it shows up in `ctest -N`) but marked DISABLED so a
-    # missing reference dump shows as "Not Run" rather than a failure.
+    # Helper: register a built test target with CTest. Same shape as
+    # the standard llama-style `llama_test()` macro: every harness
+    # ends up surfaced via `ctest` against the build dir, with labels
+    # that allow filtering (e.g. `ctest -L cpu` to skip GPU-only tests
+    # on CI fleets without the matching backend). The optional REQUIRES
+    # list names paths that must exist at configure time; if any is
+    # missing the test is still registered (so it shows up in
+    # `ctest -N`) but marked DISABLED so a missing reference dump
+    # shows as "Not Run" rather than a failure.
     function(parakeet_register_test target)
         cmake_parse_arguments(QPRT "" "LABEL;EXE" "ARGS;REQUIRES" ${ARGN})
         if (NOT DEFINED QPRT_LABEL)
@@ -731,18 +765,103 @@ if (PARAKEET_BUILD_EXAMPLES)
 endif()
 
 if (PARAKEET_INSTALL AND PARAKEET_BUILD_LIBRARY)
-    install(TARGETS parakeet
+    # Re-install the bundled ggml targets into a `ggml-targets` export
+    # set so `install(EXPORT parakeet-cpp-targets)` can resolve the
+    # `parakeet PUBLIC ggml` link as the namespaced `ggml::ggml`.
+    # Without this, CMake refuses to generate parakeet-cpp-targets.cmake
+    # because the in-tree `ggml` target is not part of any export set.
+    # Replicates the standard
+    # `install(TARGETS ggml ggml-base EXPORT ggml-targets)` pattern
+    # that downstream ggml-based projects ship in their own CMake
+    # (e.g. llama.cpp); we add it here at the parakeet level because
+    # the upstream ggml at the pinned commit installs ggml without
+    # an EXPORT clause. The bundled ggml's hand-written
+    # ggml-config.cmake (find_library + UNKNOWN IMPORTED) still
+    # ships and is what's loaded via find_dependency(ggml) -- we
+    # don't replace it; the new ggml-targets.cmake just carries the
+    # export so CMake's cross-package reference check passes here.
+    if (NOT PARAKEET_USE_SYSTEM_GGML)
+        set(_parakeet_ggml_export_targets ggml ggml-base)
+        if (DEFINED GGML_AVAILABLE_BACKENDS)
+            list(APPEND _parakeet_ggml_export_targets ${GGML_AVAILABLE_BACKENDS})
+        endif()
+        # No PUBLIC_HEADER DESTINATION here: the bundled ggml's own
+        # `install(TARGETS ggml LIBRARY PUBLIC_HEADER)` already copies
+        # the ggml/include/*.h headers into the install tree (relative
+        # paths resolve against ggml/CMakeLists.txt's source dir). If
+        # we duplicated the PUBLIC_HEADER install here, the same
+        # relative paths would be re-resolved against the parakeet
+        # source dir and `cmake --install` would fail with
+        # "file INSTALL cannot find <root>/include/ggml.h: File exists".
+        # CMake emits a developer warning ("PUBLIC_HEADER files but no
+        # PUBLIC_HEADER DESTINATION") about the gap, which is benign
+        # here -- ggml's own rule still publishes the headers. Keep
+        # the rule minimal: we only need EXPORT + library destinations
+        # so `parakeet-cpp-targets` can resolve the namespaced
+        # `ggml::ggml` link without rebuilding the headers install.
+        install(TARGETS ${_parakeet_ggml_export_targets}
+            EXPORT ggml-targets
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+        install(EXPORT ggml-targets
+            FILE ggml-targets.cmake
+            NAMESPACE ggml::
+            DESTINATION ${CMAKE_INSTALL_DATADIR}/ggml
+        )
+        unset(_parakeet_ggml_export_targets)
+    endif()
+
+    # Export the parakeet target via an install(EXPORT ...) set so the
+    # generated parakeet-cpp-targets.cmake carries the correct shape
+    # for whatever linkage the build produced (STATIC vs SHARED, with
+    # IMPORTED_IMPLIB on Windows shared builds, etc.). Hand-writing
+    # a STATIC IMPORTED stub here would silently mis-resolve the
+    # downstream target on every shared / Windows install and is the
+    # bug this replaces. Same pattern as the standard llama-style
+    # `install(EXPORT <project>-targets NAMESPACE <project>::)` flow.
+    # parakeet-backend-defs is an INTERFACE library that carries the
+    # GGML_USE_* compile defines; for STATIC parakeet builds the
+    # PRIVATE link bleeds into the interface (static archives don't
+    # carry transitive PRIVATE deps the way shared libs do), so the
+    # exporter would otherwise refuse with
+    # "requires target parakeet-backend-defs that is not in any export set".
+    install(TARGETS parakeet parakeet-backend-defs
+        EXPORT parakeet-cpp-targets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
     install(DIRECTORY include/parakeet
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
         FILES_MATCHING PATTERN "*.h"
     )
+
+    set(PARAKEET_CONFIG_INSTALL_DIR ${CMAKE_INSTALL_DATADIR}/parakeet-cpp)
+
+    install(EXPORT parakeet-cpp-targets
+        FILE parakeet-cpp-targets.cmake
+        NAMESPACE parakeet::
+        DESTINATION ${PARAKEET_CONFIG_INSTALL_DIR}
+    )
+
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/parakeet-cppConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-cppConfig.cmake
+        INSTALL_DESTINATION ${PARAKEET_CONFIG_INSTALL_DIR}
+    )
+
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-cppConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+    )
+
     install(FILES
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/parakeet-cppConfig.cmake
-        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/parakeet-cppConfigVersion.cmake
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/parakeet-cpp
+        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-cppConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/parakeet-cppConfigVersion.cmake
+        DESTINATION ${PARAKEET_CONFIG_INSTALL_DIR}
     )
 endif()

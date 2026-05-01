@@ -95,9 +95,7 @@ struct EngineOptions {
     //              variant the encoder graph touches; binaries
     //              get cached via the program-binary-cache patch 
     //              when GGML_OPENCL_CACHE_DIR is set.
-    //   * Vulkan:  triggers vkCreateGraphicsPipelines (matches
-    //              what the ggml-vulkan-pipeline-cache patch does
-    //              for chatterbox).
+    //   * Vulkan:  triggers vkCreateGraphicsPipelines.
     //   * CUDA:    triggers cuGraphInstantiate.
     //   * CPU:     pre-builds the ggml graph nodes + scratch.
     //

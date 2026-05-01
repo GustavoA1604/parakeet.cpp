@@ -836,11 +836,17 @@ Silicon.  End-to-end on the M4 Air GPU:
 
 ### 6.1 — wire-up
 
-  - `init_gpu_backend(n_gpu_layers, verbose)` helper chooses CUDA →
-    Metal → Vulkan → CPU based on compile flags and returns
-    `nullptr` when `n_gpu_layers <= 0` or no GPU backend is
-    compiled in. Matches the convention used by `llama.cpp` and
-    `whisper.cpp`.
+  - `init_gpu_backend(n_gpu_layers, verbose)` helper drives
+    `ggml_backend_load_all()` once, then walks the registry in
+    registration order (CUDA → Metal → Vulkan → OpenCL → ...) and
+    picks the first GPU/IGPU device via `ggml_backend_dev_init`,
+    returning `nullptr` when `n_gpu_layers <= 0` or the registry has
+    no usable GPU device. Same shape under both `GGML_BACKEND_DL=ON`
+    (the dynamic-loader mode embedded host applications use; backends
+    are dlopened at runtime)
+    and `GGML_BACKEND_DL=OFF` (statically linked; load_all is a
+    no-op). Matches the registry-walk convention used by
+    `llama.cpp` and `whisper.cpp`.
   - `Impl::backend_active` pointer — one of CPU or GPU — drives
     `ggml_backend_alloc_ctx_tensors`, `ggml_backend_graph_compute`,
     and the per-call `safe_set` tensor uploads.  All weights live on
@@ -1277,8 +1283,8 @@ through a borrowed pointer. Key pieces:
   leading-space invariant that bit Mode 2 in §7.3.
 - Segment timestamps: `start_s = emitted_samples / sr`,
   `end_s = (emitted_samples + consumed_chunk_samples) / sr`, absolute
-  from the start of the session. Matches what the binding's
-  `TranscriptionSegment { start, end, toAppend }` expects.
+  from the start of the session. Same shape any external streaming
+  consumer would expect (`{ start, end, text/toAppend }`).
 - `StreamingOptions::left_context_ms` and `right_lookahead_ms`
   landed on the public API (defaults 10000 / 2000 respectively, the
   winners from §8.1's sweep).
@@ -1836,8 +1842,7 @@ has O(T^2) attention with no chunking. At T=4099 (5.5 min) that's
 ### Phase 11.10 — speaker-attributed transcription _(done)_
 
 Combines Sortformer (Phase 11) with a Parakeet ASR Engine to produce
-"who said what" output natively in C++. Mirrors the qvac binding's
-`quickstart-diarized.js` pattern, but in one binary and one CLI call.
+"who said what" output natively in C++ in one binary and one CLI call.
 
 Public API (`include/parakeet/ctc/engine.h`):
 
@@ -2284,30 +2289,17 @@ through chunked-limited streaming inference is a quality regression
 on the targets this repo cares about. The decoder + joint mirror
 TDT minus the duration head.
 
-**API target.** The binding's JS surface for EOU today (`index.d.ts`)
-is intentionally minimal: just the same generic transcription pipeline
-as TDT/CTC with `modelType: 'eou'`. Full enumeration:
+**API target.** The reference EOU surface emits `TranscriptionSegment`
+records with only `text` populated (no per-segment timestamps, no
+utterance-boundary event), so the C++ Engine deliberately preserves
+that shape rather than synthesising fields from intermediate state.
 
-- Constructor: `new TranscriptionParakeet({ files: { eouEncoder,
-  eouDecoder, tokenizer }, config: { parakeetConfig: { modelType: 'eou',
-  maxThreads, sampleRate, channels, captionEnabled, timestampsEnabled,
-  seed } } })`.
-- Lifecycle: `activate()`, `loadWeights()`, `pause/unpause()`,
-  `reload()`, `cancel()`, `destroy()`.
-- Streaming I/O: `append({ type: 'audio', data: ArrayBuffer })` (any
-  chunk size, addon batches internally) + `append({ type: 'end of
-  job' })`. Output via callback as `TranscriptionSegment[]`
-  (`{ text, start, end, toAppend }`). **`start`/`end` are not populated
-  for EOU** -- only `text`.
-- No EOU-specific events (utterance boundary not surfaced to JS),
-  no partial/final distinction, no per-segment IDs.
+C++ pipeline this maps to (matching the upstream NeMo `processEOU`
+reference):
 
-C++ pipeline this maps to (matching `processEOU` in the binding's
-`ParakeetModel.cpp`):
-
-1. mel(128) over the full input audio (offline; binding accumulates
-   the addon's append-queue until `end of job`, then mels the whole
-   buffer).
+1. mel(128) over the full input audio (offline; the reference
+   implementation accumulates an append-queue until end-of-job, then
+   mels the whole buffer).
 2. Walk mel in fixed 25-frame slices (`encoder_chunk_mel_frames=25`);
    skip trailing slice if `< 10` frames and not first.
 3. Per slice: cache-aware encoder forward with running
@@ -2409,7 +2401,7 @@ what you can do for your country<EOU>
 The trailing literal `<EOU>` is the joint network emitting the EOU
 token at end-of-utterance and is exactly the signal the C++ decoder
 will key on for `\n` segment-flush + LSTM state reset (per the
-binding's `eouDecodeChunk` semantics).
+upstream NeMo `eouDecodeChunk` reference).
 
 `scripts/verify-gguf-roundtrip.py` learned to dispatch on
 `parakeet.model.type`: `build_expected_eou()` recreates the EOU tensor
@@ -2574,19 +2566,19 @@ carry decoder state across chunked calls.
 
 `eou_decode_window()` runs greedy RNN-T over a span of encoder
 frames with up to `max_symbols_per_step=5` symbols per encoder step
-(matches the binding's `EOU_MAX_SYMBOLS_PER_STEP`). Per emitted
-token:
+(matches the upstream NeMo `EOU_MAX_SYMBOLS_PER_STEP` constant). Per
+emitted token:
 
 - `<blank>` (id 1026) -> break out of inner loop, advance encoder.
 - `<EOB>` (id 1025) -> training-time block boundary marker; treated
-  as a no-op skip. Same policy as the binding.
+  as a no-op skip, same policy as the NeMo reference.
 - `<EOU>` (id 1024) -> flush the in-progress segment to
   `out_segments`, **zero h/c state**, set `last_token = blank`,
   re-prime the predictor with the blank embedding, break out of
-  inner loop. The state reset is the binding's
-  `eouDecodeChunk` reset semantics carried through verbatim.
+  inner loop. The state reset is the NeMo `eouDecodeChunk` reset
+  semantics carried through verbatim.
 - Any other special token (vocabulary entry of the form
-  `<...>`) -> defensive break (matches the binding's
+  `<...>`) -> defensive break (matches the NeMo reference's
   `isSpecialToken` skip).
 - Otherwise: append to `out_tokens`, feed back into the LSTM,
   update `pred_out` for the next joint call.
@@ -2779,8 +2771,8 @@ consumer drives.
   Speaking immediately on threshold-crossing; fall back to Silent
   only after `hangover_ms` of below-threshold audio. Default
   `-35 dBFS / 30 ms / 200 ms` is tuned for clean 16 kHz mono speech.
-  Not exposed in the public headers (would force the binding to
-  pin to our implementation; shape may evolve).
+  Not exposed in the public headers (would force consumers to pin
+  to this implementation; shape may evolve).
 
 - `src/parakeet_engine.cpp`:
   - `StreamSession::Impl` gains a `unique_ptr<EnergyVad>` member
@@ -2829,7 +2821,7 @@ Numbers on `jfk.wav` (sanity check):
 
 - **Single struct + enum, not separate event types.** Keeps the
   callback signature trivial (`void(const StreamEvent&)`) which
-  maps cleanly through the binding's N-API ABI without per-type
+  maps cleanly through any C/C++/FFI ABI without per-type
   wrappers. Costs a few unused fields per event; cheap.
 - **Engines fire what they natively know.** EOU has the `<EOU>`
   token and fires only `EndOfTurn`; Sortformer has speaker probs

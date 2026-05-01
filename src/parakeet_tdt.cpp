@@ -3,11 +3,11 @@
 #include "parakeet_tdt.h"
 #include "parakeet_log.h"
 #include "sentencepiece_bpe.h"
+#include "backend_util.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <chrono>
@@ -96,13 +96,13 @@ void dequantize_to_f32(const ggml_tensor * t, std::vector<float> & out) {
 
 // ---- Scalar host-side LSTM step (CPU fallback) ----
 //
-// QVAC-18264 — `layer_input_scratch` is a caller-owned reusable
-// buffer matching the EOU path. The CPU fallback path runs on
-// CPU-only Engine builds where the per-step graph dispatch latency
-// dominates GPU graphs; this lifts ~250 emission-step `std::vector
-// <float>(H_pred=640)` allocations per utterance out of the hot loop.
-// gemv_f32 writes every output byte before any read, so re-using the
-// scratch buffer is byte-equal to the per-call allocation.
+// `layer_input_scratch` is a caller-owned reusable buffer matching the
+// EOU path. The CPU fallback path runs on CPU-only Engine builds
+// where the per-step graph dispatch latency dominates GPU graphs;
+// this lifts ~250 emission-step `std::vector<float>(H_pred=640)`
+// allocations per utterance out of the hot loop. gemv_f32 writes
+// every output byte before any read, so re-using the scratch buffer
+// is byte-equal to the per-call allocation.
 void host_lstm_step(const TdtRuntimeWeights & W,
                     const float * __restrict x_input,
                     float * __restrict h_state,
@@ -147,8 +147,8 @@ void host_lstm_step(const TdtRuntimeWeights & W,
 // hoisting this matmul to a full-window precompute regresses on CPU due to
 // loss of cache locality for small (~250) windows; the original per-step
 // path is faster on M-series CPUs.
-// QVAC-18264 — same caller-owned-scratch pattern as host_lstm_step.
-// gemv_f32 writes every output byte before any read, so re-using
+// Same caller-owned-scratch pattern as host_lstm_step. gemv_f32
+// writes every output byte before any read, so re-using
 // `tmp_scratch` across emission steps is byte-equal to the per-call
 // allocation.
 void host_joint_step(const TdtRuntimeWeights & W,
@@ -505,8 +505,8 @@ const TdtRuntimeWeights::EncProjGraph * get_enc_proj_graph(TdtRuntimeWeights & r
 }
 
 bool compute_graph(TdtRuntimeWeights & rt, ggml_cgraph * cg) {
-    if (rt.n_threads > 0 && ggml_backend_is_cpu(rt.backend)) {
-        ggml_backend_cpu_set_n_threads(rt.backend, rt.n_threads);
+    if (rt.n_threads > 0 && backend_is_cpu(rt.backend)) {
+        backend_set_n_threads(rt.backend, rt.n_threads);
     }
     return ggml_backend_graph_compute(rt.backend, cg) == GGML_STATUS_SUCCESS;
 }
@@ -617,7 +617,7 @@ int tdt_prepare_runtime(const ParakeetCtcModel & model, TdtRuntimeWeights & W) {
     // ~6x vs. a hand-rolled scalar gemv loop, so CPU keeps the legacy path.
     // GPU backends (Metal / CUDA / Vulkan) win even with per-step dispatch
     // because of native quantised matmul and faster argmax / large gemvs.
-    W.use_graphs = !ggml_backend_is_cpu(W.backend);
+    W.use_graphs = !backend_is_cpu(W.backend);
 
     if (!W.use_graphs) {
         // ---- CPU fallback: dequantise weights to host f32 ----

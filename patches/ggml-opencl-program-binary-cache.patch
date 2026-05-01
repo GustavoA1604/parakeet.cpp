@@ -64,10 +64,10 @@ index 96942915..7c2e4bc2 100644
 +// cache directory writable, the helper logs a warning and falls
 +// through to source compile silently.
 +//
-+// The downstream qvac llamacpp-llm addon already plumbs
-+// `GGML_OPENCL_CACHE_DIR` via `setenv()` for the Android Adreno path
-+// (see `LlamaLazyInitializeBackend.cpp`), so this patch makes that
-+// env-var contract finally take effect for parakeet too.
++// Hosts that already `setenv("GGML_OPENCL_CACHE_DIR", ...)` to point
++// the runtime at a writable location (typical pattern on Android
++// Adreno deployments) get the cache for free; this patch makes that
++// env-var contract take effect rather than being ignored upstream.
 +
 +static uint64_t fnv1a_hash64(const void * data, size_t n) {
 +    const uint8_t * p = static_cast<const uint8_t *>(data);

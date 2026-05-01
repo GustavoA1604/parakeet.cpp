@@ -2,19 +2,26 @@
 
 `ggml` is vendored as a pristine upstream clone (see the top-level
 [`README.md`](../README.md) and [`scripts/setup-ggml.sh`](../scripts/setup-ggml.sh)),
-so any fixes we need in it live here as standalone patches and are
-applied after the clone.
+so the local fixes parakeet.cpp depends on live here as standalone
+patches and are applied after the clone.
 
-Two patches ship today:
+Three patches ship today:
 
-1. [`ggml-opencl-allow-non-adreno.patch`](#ggml-opencl-allow-non-adrenopatch)
+1. [`ggml-backend-reg-filename-prefix.patch`](#ggml-backend-reg-filename-prefixpatch)
+   — teaches `ggml_backend_load_best()` to honour a compile-time
+   `GGML_BACKEND_DL_PROJECT_PREFIX` macro, so renaming the bundled
+   backend .so/.dll files (parakeet does this to avoid colliding with
+   another consumer's `libggml-*` files in the same host process) does
+   not break runtime backend discovery under `GGML_BACKEND_DL=ON`.
+   No-op when the macro is undefined.
+2. [`ggml-opencl-allow-non-adreno.patch`](#ggml-opencl-allow-non-adrenopatch)
    — lets the OpenCL backend bring up on commodity desktop GPUs
    (NVIDIA, AMD, Apple) so `parakeet.cpp` can be built and parity-
    tested with `-DGGML_OPENCL=ON` outside Adreno-only environments.
    No-op on real Adreno targets (the patch only relaxes the rejection
    of unknown GPU vendors and the assertion in
    `ggml_backend_opencl_init()` when no devices were found).
-2. [`ggml-opencl-program-binary-cache.patch`](#ggml-opencl-program-binary-cachepatch)
+3. [`ggml-opencl-program-binary-cache.patch`](#ggml-opencl-program-binary-cachepatch)
    — adds a persistent on-disk cache for compiled OpenCL kernel
    binaries, removing the multi-second `clBuildProgram` wave at every
    cold start. Honours `$GGML_OPENCL_CACHE_DIR`, with
@@ -65,6 +72,7 @@ upstream commit), the script is effectively:
 ```bash
 git clone https://github.com/ggml-org/ggml.git ggml
 cd ggml && git checkout $GGML_COMMIT
+git apply ../patches/ggml-backend-reg-filename-prefix.patch
 git apply ../patches/ggml-opencl-allow-non-adreno.patch
 git apply ../patches/ggml-opencl-program-binary-cache.patch
 ```
@@ -76,13 +84,51 @@ cleanly:
 
 ```bash
 (cd ggml && git status --short)
-# Expected: 1 modified file under ggml/src/ggml-opencl/
-# (both patches stack on the same file; they don't conflict)
+# Expected: 2 modified files
+#   ggml/src/ggml-backend-reg.cpp     (filename-prefix patch)
+#   ggml/src/ggml-opencl/ggml-opencl.cpp  (both OpenCL patches stack on this file)
 ```
 
-CPU / CUDA / Metal / Vulkan builds get the pinned commit but no
-useful patch work: the OpenCL change is no-op for every other
-backend.
+CPU / CUDA / Metal / Vulkan builds get the pinned commit and the
+filename-prefix patch (which is a strict no-op when the host
+project does not define `GGML_BACKEND_DL_PROJECT_PREFIX`); the
+OpenCL changes are no-op for every other backend.
+
+## `ggml-backend-reg-filename-prefix.patch`
+
+Base commit: `58c38058` (`sync : llama.cpp`, 2026-04-09).
+
+Adds a single compile-time switch
+`GGML_BACKEND_DL_PROJECT_PREFIX` to `ggml_backend_load_best()` so
+the runtime backend-discovery walk can be retargeted at the
+filename prefix used by a host project that renames the bundled
+`libggml-*` files to avoid colliding with another consumer's
+`libggml-*` files in the same host process.
+
+Background: parakeet ships its bundled ggml backends as
+`libparakeet-ggml-*.{so,dll}` (CMake option
+`PARAKEET_GGML_LIB_PREFIX=ON`, default) so a host process that
+loads two consumers each vendoring its own ggml does not see a
+name clash on `libggml-vulkan.so` / `libggml-cuda.so` / etc.
+Without this patch, the rename works at link time but
+`ggml_backend_load_best()` still searches for `libggml-*.so` /
+`ggml-*.dll`, so under `GGML_BACKEND_DL=ON` the renamed files are
+on disk but never discovered and Vulkan/OpenCL/CUDA backends
+silently fail to load.
+
+| Symptom | Root cause | What this patch does |
+|---------|-----------|----------------------|
+| `parakeet-ggml-vulkan.so` (etc.) is on disk but ggml's loader never picks it up under `GGML_BACKEND_DL=ON` | `backend_filename_prefix()` hard-codes `libggml-` / `ggml-` and `ggml_backend_load_best` filters directory entries by that fixed prefix | Honour an optional compile-time `GGML_BACKEND_DL_PROJECT_PREFIX` string literal (e.g. `"parakeet-"`); when defined, the loader searches for `lib<prefix>ggml-*` / `<prefix>ggml-*` instead. Macro undefined ⇒ behaviour byte-equal to upstream. |
+
+The CMake side wires the macro from `PARAKEET_GGML_LIB_PREFIX`:
+when that option is on (the default), parakeet's top-level
+`CMakeLists.txt` does
+`target_compile_definitions(ggml PRIVATE GGML_BACKEND_DL_PROJECT_PREFIX="parakeet-")`
+on the `ggml` target (which is what compiles
+`ggml-backend-reg.cpp`). Consumers that prefer the upstream
+filenames (system ggml, single-consumer hosts) configure with
+`-DPARAKEET_GGML_LIB_PREFIX=OFF` and the macro stays undefined,
+so the loader behaviour matches stock ggml exactly.
 
 ## `ggml-opencl-allow-non-adreno.patch`
 
@@ -139,7 +185,7 @@ freshly-compiled program back to disk on miss.
 | Symptom                                                                                | Root cause                                                                              | What this patch does                                                                                              |
 |----------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | Every cold-start `parakeet --n-gpu-layers 1` re-compiles all 88 OpenCL kernels    | `build_program_from_source` always calls `clCreateProgramWithSource` + `clBuildProgram` | Look up `<cache_dir>/<key>.bin` first via `clCreateProgramWithBinary`; only fall through to source compile on miss |
-| Hosts already `setenv` `GGML_OPENCL_CACHE_DIR` for the same goal, but ggml-opencl ignores it | The env var is read **nowhere** in upstream ggml-opencl at this commit  | Resolves cache dir from `$GGML_OPENCL_CACHE_DIR` → `$XDG_CACHE_HOME/ggml/opencl` → `$HOME/.cache/ggml/opencl`. The downstream contract finally takes effect. |
+| Hosts already `setenv` `GGML_OPENCL_CACHE_DIR` for the same goal, but ggml-opencl ignores it | The env var is read **nowhere** in upstream ggml-opencl at this commit  | Resolves cache dir from `$GGML_OPENCL_CACHE_DIR` → `$XDG_CACHE_HOME/ggml/opencl` → `$HOME/.cache/ggml/opencl`, so the env-var contract takes effect. |
 
 ### Cache key
 
@@ -189,11 +235,11 @@ overwrites the bad blob.
 
 ### Measured impact
 
-This patch is **not benchmarked on a real Adreno device** in the
-current development cycle because the test workstation is NVIDIA-only
-and NVIDIA's OpenCL driver lacks the fp16 / OpenCL C 2.0 features
-ggml-opencl mandates -- the kernels never compile at all on this
-box, so there's nothing to cache. Expected impact:
+This patch is **not yet benchmarked on a real Adreno device**: the
+benchmark hosts the patch was developed on are NVIDIA-only, and
+NVIDIA's OpenCL driver lacks the fp16 / OpenCL C 2.0 features
+ggml-opencl mandates -- the kernels never compile at all there, so
+there is nothing to cache. Expected impact:
 
   * **Cold start (no cache)**: same as upstream -- multi-second
     shader compile wave on Adreno.

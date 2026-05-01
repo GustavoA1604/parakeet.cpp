@@ -2,26 +2,11 @@
 
 #include "parakeet_ctc.h"
 #include "parakeet_log.h"
+#include "backend_util.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
-#ifdef GGML_USE_BLAS
-#include "ggml-blas.h"
-#endif
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-#ifdef GGML_USE_METAL
-#include "ggml-metal.h"
-#endif
-#ifdef GGML_USE_VULKAN
-#include "ggml-vulkan.h"
-#endif
-#ifdef GGML_USE_OPENCL
-#include "ggml-opencl.h"
-#endif
 #include "gguf.h"
 
 #include <algorithm>
@@ -105,9 +90,7 @@ struct ParakeetCtcModel::Impl {
     gguf_context         * gguf           = nullptr;
     ggml_context         * ctx            = nullptr;
     ggml_backend_t         backend_cpu    = nullptr;
-#ifdef GGML_USE_BLAS
     ggml_backend_t         backend_blas   = nullptr;
-#endif
     ggml_backend_t         backend_gpu    = nullptr;
     ggml_backend_t         backend_active = nullptr;
     ggml_backend_buffer_t  weights_buffer = nullptr;
@@ -122,9 +105,7 @@ struct ParakeetCtcModel::Impl {
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         if (ctx)            ggml_free(ctx);
         if (gguf)           gguf_free(gguf);
-#ifdef GGML_USE_BLAS
         if (backend_blas)   ggml_backend_free(backend_blas);
-#endif
         if (backend_gpu)    ggml_backend_free(backend_gpu);
         if (backend_cpu)    ggml_backend_free(backend_cpu);
     }
@@ -141,65 +122,121 @@ ggml_context * ParakeetCtcModel::weights_ctx() const {
 
 namespace {
 
+// Trigger one-time discovery + load of every available ggml backend.
+// Idempotent: repeated calls inside the same process are no-ops once
+// the registry is populated. Routed through a static guard so we don't
+// pay the directory-walk cost on every model load.
+//
+// Why this instead of the per-backend ggml_backend_<x>_init() entry
+// points the cascade used to call directly: with GGML_BACKEND_DL=ON
+// (the dynamic-loader mode embedded host applications typically
+// ship with) the CUDA / Metal / Vulkan / OpenCL / BLAS / ggml-cpu
+// backends live in separate shared libraries that are dlopened at
+// runtime; their concrete init symbols are not linkable from
+// libparakeet, and the only supported entry point is the registry.
+// With GGML_BACKEND_DL=OFF the backends are statically linked into
+// libggml, registered at constructor time, and
+// ggml_backend_load_all() is a cheap no-op. Both modes therefore
+// reach the same registry walk below, matching the convention used
+// by llama.cpp and other ggml-based libraries.
+void ensure_backends_loaded() {
+    static const bool loaded = []() {
+        ggml_backend_load_all();
+        return true;
+    }();
+    (void) loaded;
+}
+
+bool is_adreno_6xx(const char * s) {
+    if (!s) return false;
+    if (!strstr(s, "Adreno")) return false;
+    for (const char * q = s; *q; ++q) {
+        if (*q == '6' && q[1] >= '0' && q[1] <= '9' && q[2] >= '0' && q[2] <= '9') {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char * dev_reg_name(ggml_backend_dev_t dev) {
+    if (!dev) return "";
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg ? ggml_backend_reg_name(reg) : "";
+}
+
+
 ggml_backend_t init_gpu_backend(int n_gpu_layers, bool verbose) {
     if (n_gpu_layers <= 0) return nullptr;
-#ifdef GGML_USE_CUDA
-    if (auto * b = ggml_backend_cuda_init(0)) {
-        if (verbose) PARAKEET_LOG_INFO("parakeet: using CUDA backend\n");
-        return b;
-    }
-#endif
-#ifdef GGML_USE_METAL
-    if (auto * b = ggml_backend_metal_init()) {
-        if (verbose) PARAKEET_LOG_INFO("parakeet: using Metal backend\n");
-        return b;
-    }
-#endif
-#ifdef GGML_USE_VULKAN
-    if (auto * b = ggml_backend_vk_init(0)) {
-        if (verbose) PARAKEET_LOG_INFO("parakeet: using Vulkan backend\n");
-        return b;
-    }
-#endif
-#ifdef GGML_USE_OPENCL
-    if (auto * b = ggml_backend_opencl_init()) {
-        const ggml_backend_dev_t dev = ggml_backend_get_device(b);
-        const char * name = dev ? ggml_backend_dev_name(dev)        : nullptr;
-        const char * desc = dev ? ggml_backend_dev_description(dev) : nullptr;
-        auto is_adreno_6xx = [](const char * s) -> bool {
-            if (!s) return false;
-            if (!strstr(s, "Adreno")) return false;
-            for (const char * q = s; *q; ++q) {
-                if (*q == '6' && q[1] >= '0' && q[1] <= '9' && q[2] >= '0' && q[2] <= '9') {
-                    return true;
-                }
-            }
-            return false;
-        };
-        if (is_adreno_6xx(name) || is_adreno_6xx(desc)) {
+
+    ensure_backends_loaded();
+
+    // Walk the registry in registration order and pick the first
+    // GPU/IGPU device. Registry order is defined by the ggml-backend
+    // registry's static init list (CUDA -> Metal -> Vulkan -> OpenCL
+    // -> ...), so this preserves the priority of the legacy direct-
+    // init cascade. The Adreno-6xx fallback policy stays on top:
+    // ggml-opencl produces incorrect results on Adreno 6xx; force-
+    // skip and continue the walk (or fall through to CPU) unless
+    // `PARAKEET_ALLOW_ADRENO_6XX=1` is set.
+    const size_t n_dev = ggml_backend_dev_count();
+    for (size_t i = 0; i < n_dev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+            type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        const char * name     = ggml_backend_dev_name(dev);
+        const char * desc     = ggml_backend_dev_description(dev);
+        const char * reg_name = dev_reg_name(dev);
+        const bool   is_opencl = std::strcmp(reg_name, "OpenCL") == 0;
+
+        if (is_opencl && (is_adreno_6xx(name) || is_adreno_6xx(desc))) {
             const char * reported = name ? name : (desc ? desc : "unknown");
-            if (verbose) PARAKEET_LOG_WARN(
-                "parakeet: OpenCL device '%s' is Adreno 6xx; "
-                "forcing CPU fallback (7xx/8xx/X1E supported, set "
-                "PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
-                reported);
             const char * override_env = getenv("PARAKEET_ALLOW_ADRENO_6XX");
             if (!override_env || override_env[0] != '1') {
-                ggml_backend_free(b);
-                return nullptr;
+                if (verbose) PARAKEET_LOG_WARN(
+                    "parakeet: OpenCL device '%s' is Adreno 6xx; "
+                    "skipping (7xx/8xx/X1E supported, set "
+                    "PARAKEET_ALLOW_ADRENO_6XX=1 to override)\n",
+                    reported);
+                continue;
             }
             if (verbose) PARAKEET_LOG_INFO(
                 "parakeet: PARAKEET_ALLOW_ADRENO_6XX=1 set; "
                 "keeping OpenCL backend on '%s' anyway\n", reported);
         }
-        if (verbose) {
-            PARAKEET_LOG_INFO("parakeet: using OpenCL backend (%s)\n",
-                              name ? name : (desc ? desc : "unknown"));
-        }
+
+        ggml_backend_t b = ggml_backend_dev_init(dev, nullptr);
+        if (!b) continue;
+        if (verbose) PARAKEET_LOG_INFO(
+            "parakeet: using %s backend (%s)\n",
+            reg_name && *reg_name ? reg_name : "GPU",
+            name ? name : (desc ? desc : "unknown"));
         return b;
     }
-#endif
-    if (verbose) PARAKEET_LOG_INFO("parakeet: no GPU backend compiled in, falling back to CPU\n");
+
+    if (verbose) PARAKEET_LOG_INFO("parakeet: no GPU backend available, falling back to CPU\n");
+    return nullptr;
+}
+
+ggml_backend_t init_cpu_backend() {
+    ensure_backends_loaded();
+    return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+}
+
+ggml_backend_t init_blas_backend() {
+    ensure_backends_loaded();
+    const size_t n_dev = ggml_backend_dev_count();
+    for (size_t i = 0; i < n_dev; ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (!dev) continue;
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) continue;
+        const char * reg_name = dev_reg_name(dev);
+        if (std::strcmp(reg_name, "BLAS") != 0) continue;
+        return ggml_backend_dev_init(dev, nullptr);
+    }
     return nullptr;
 }
 
@@ -264,9 +301,9 @@ int load_from_gguf(const std::string & gguf_path,
                    bool                verbose) {
     auto impl = std::make_shared<ParakeetCtcModel::Impl>();
 
-    impl->backend_cpu = ggml_backend_cpu_init();
+    impl->backend_cpu = init_cpu_backend();
     if (!impl->backend_cpu) {
-        PARAKEET_LOG_ERROR("gguf: ggml_backend_cpu_init failed\n");
+        PARAKEET_LOG_ERROR("gguf: failed to initialize CPU backend (no CPU device registered?)\n");
         return 10;
     }
     int resolved_threads = n_threads;
@@ -274,14 +311,12 @@ int load_from_gguf(const std::string & gguf_path,
         const unsigned hc = std::thread::hardware_concurrency();
         resolved_threads = hc > 0 ? (int) hc : 4;
     }
-    ggml_backend_cpu_set_n_threads(impl->backend_cpu, resolved_threads);
+    backend_set_n_threads(impl->backend_cpu, resolved_threads);
 
-#ifdef GGML_USE_BLAS
-    impl->backend_blas = ggml_backend_blas_init();
-    if (impl->backend_blas && resolved_threads > 0) {
-        ggml_backend_blas_set_n_threads(impl->backend_blas, resolved_threads);
+    impl->backend_blas = init_blas_backend();
+    if (impl->backend_blas) {
+        backend_set_n_threads(impl->backend_blas, resolved_threads);
     }
-#endif
 
     impl->backend_gpu    = init_gpu_backend(n_gpu_layers, verbose);
     impl->backend_active = impl->backend_gpu ? impl->backend_gpu : impl->backend_cpu;
@@ -504,11 +539,8 @@ int load_from_gguf(const std::string & gguf_path,
     // Metal stays unstacked here.)
     const bool gate_qkv_stack =
         impl->backend_active &&
-        !ggml_backend_is_cpu(impl->backend_active)
-#ifdef GGML_USE_METAL
-        && !ggml_backend_is_metal(impl->backend_active)
-#endif
-        ;
+        !backend_is_cpu(impl->backend_active) &&
+        !backend_is_metal(impl->backend_active);
 
     out_model.blocks.resize(out_model.encoder_cfg.n_layers);
     for (int i = 0; i < out_model.encoder_cfg.n_layers; ++i) {
@@ -632,12 +664,10 @@ int load_from_gguf(const std::string & gguf_path,
         out_model.tdt.joint_out_b  = require_tensor(impl->ctx, "tdt.joint.out.bias");
     }
 
-#ifdef GGML_USE_BLAS
     if (impl->backend_blas) {
         ggml_backend_free(impl->backend_blas);
         impl->backend_blas = nullptr;
     }
-#endif
 
     out_model.impl = impl;
 
@@ -946,7 +976,7 @@ ggml_tensor * rel_pos_mha_graph(ggml_context * ctx, ggml_tensor * xn,
         //
         // Whether `W.attn_qkv_w` was loaded at all is decided in the
         // model loader (gated to non-Apple-Metal backends — see the
-        // `ggml_backend_is_metal` branch in `load_model_gguf`).  M3
+        // `backend_is_metal` branch in `load_model_gguf`).  M3
         // Ultra Metal already saturates the un-stacked path's tile
         // grid (M=1024 / T=252 → 16 row × 8 col tiles ≈ 128 chunks vs
         // 60 cores: one wave fills the GPU); the stacked M=3072 path
@@ -1285,7 +1315,7 @@ static int build_encoder_graph_cached(const ParakeetCtcModel & model,
 
     // Metal / CUDA / Vulkan don't implement CONV_2D_DW yet; use the
     // im2col+matmul lowering on any non-CPU backend.
-    const bool use_conv2d_dw = ggml_backend_is_cpu(backend);
+    const bool use_conv2d_dw = backend_is_cpu(backend);
 
     auto sub_out_len = [&](int Lin) {
         return enc.causal_downsampling ? (Lin / 2 + 1) : _conv_out_len(Lin, 3, 2, 1);
@@ -1702,7 +1732,7 @@ static int build_substage_graph(const ParakeetCtcModel & model,
     if (stage == Substage::CONV || stage == Substage::FULL_BLOCK) {
         ggml_tensor * r = x;
         ggml_tensor * xn = layer_norm_affine(g.ctx, x, W.norm_conv_w, W.norm_conv_b, eps);
-        const bool use_conv2d_dw = ggml_backend_is_cpu(backend);
+        const bool use_conv2d_dw = backend_is_cpu(backend);
         ggml_tensor * y = conformer_conv_graph(g.ctx, xn, W, d_model, T, conv_kernel, use_conv2d_dw,
                                                enc.conv_norm_type, enc.conv_causal, eps);
         x = ggml_add(g.ctx, r, y);

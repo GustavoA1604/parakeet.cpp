@@ -22,7 +22,7 @@ The FastConformer encoder topology is shared across all four flavours; only
 the decoder / head tensors + metadata differ. EOU additionally swaps the
 conv module's BatchNorm for a LayerNorm and carries cache-aware streaming
 hyperparameters (att_context_size, subsampling-output cache lookback, and the
-chunk size used by the binding's reference EOU pipeline) in metadata.
+EOU reference chunk size) in metadata.
 
 Warning: the script's ``--hf-repo`` default is ``nvidia/parakeet-ctc-0.6b``.
 When ``--ckpt`` names a non-CTC file that is not present locally, pass ``--hf-repo``

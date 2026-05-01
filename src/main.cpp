@@ -362,7 +362,10 @@ extern "C" int parakeet_cli_main(int argc, char ** argv) {
             print_usage(argv[0]);
             return 0;
         } else if (a == "--version") {
-            std::printf("parakeet 0.1.0\n");
+#ifndef PARAKEET_VERSION
+#define PARAKEET_VERSION "unknown"
+#endif
+            std::printf("parakeet %s\n", PARAKEET_VERSION);
             return 0;
         } else if (a == "--model" && i + 1 < argc) {
             opts.model_gguf_path = argv[++i];

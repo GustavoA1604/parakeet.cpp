@@ -8,6 +8,13 @@
 # against.
 #
 # Patches we ship today:
+#   patches/ggml-backend-reg-filename-prefix.patch
+#       Teaches ggml_backend_load_best() to honour a compile-time
+#       GGML_BACKEND_DL_PROJECT_PREFIX macro so renaming the bundled
+#       backend .so/.dll files (PARAKEET_GGML_LIB_PREFIX=ON, the default,
+#       emits libparakeet-ggml-*.so) does not break runtime backend
+#       discovery under GGML_BACKEND_DL=ON. No-op when the macro is
+#       undefined.
 #   patches/ggml-opencl-allow-non-adreno.patch
 #       Lets the ggml-opencl backend run on non-Adreno/Intel GPUs
 #       (NVIDIA, AMD, Apple) so the build can be parity-tested on

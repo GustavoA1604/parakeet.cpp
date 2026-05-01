@@ -88,8 +88,8 @@ struct EncoderConfig {
     // EOU-specific (parakeet_realtime_eou_120m-v1).
     // Predictor + joint dims mirror TDT's, but EOU has 1 LSTM layer
     // (vs 2 for TDT) and no duration head. Cache shapes + chunk size
-    // come straight from the binding's `EOU_*` constants and the
-    // converter's metadata block.
+    // come from the converter's metadata block (matching the
+    // upstream NeMo `RNNTBPEModel.cache_aware_*` configuration).
     int  eou_pred_hidden              = 640;
     int  eou_pred_rnn_layers          = 1;
     int  eou_joint_hidden             = 640;
