@@ -1,27 +1,10 @@
 #pragma once
 
-// Speaker diarization primitives (Sortformer GGUFs).
+// Sortformer diarization: offline results and sliding-history streaming sessions.
 //
-// Two flavours, both produced by the `Engine` umbrella in
-// <parakeet/engine.h>:
-//
-//   - Offline: `Engine::diarize` / `Engine::diarize_samples` -> full audio
-//     in, list of `{speaker_id, start_s, end_s}` segments out, plus the
-//     raw per-frame `speaker_probs` matrix for callers who want to do
-//     their own thresholding.
-//
-//   - Streaming: `Engine::diarize_start` -> `SortformerStreamSession`
-//     (Phase 11.11.1 sliding-history implementation). Each chunk re-runs
-//     `Engine::diarize` over the trailing `history_ms` of audio, emits
-//     segments overlapping the new chunk, and slides the history pointer
-//     forward. See `SortformerStreamSession` for the cross-chunk
-//     speaker-ID stability caveat the sliding-history implementation
-//     carries.
-//
-// Sortformer streaming sessions also surface the cross-engine
-// `StreamEvent` callback (declared in <parakeet/streaming.h>) for
-// VAD transitions, with the dominant `speaker_id` reported on entering
-// Speaking.
+// Offline: segments plus per-frame speaker_probs. Streaming: push PCM; each step runs Sortformer
+// over the last `history_ms`, emits overlapping segments, advances the chunk cursor.
+// Optional StreamEvent VadStateChanged from speaker_probs (see <parakeet/streaming.h>).
 
 #include "export.h"
 #include "streaming.h"
@@ -87,29 +70,16 @@ struct SortformerStreamingOptions {
 
     bool  emit_partials   = true;
 
-    // Phase 13 -- per-event callback (independent of `on_segment`).
-    // Sortformer fires `StreamEventType::VadStateChanged` events at
-    // chunk granularity using `max(speaker_probs) > threshold` as the
-    // VAD signal, and reports the dominant speaker_id on entering
-    // Speaking. Defaults to `nullptr` (back-compat).
+    // Optional StreamEvent delivery (VadStateChanged from speaker_probs); nullptr disables.
     StreamEventCallback on_event = nullptr;
 };
 
 using SortformerSegmentCallback =
     std::function<void(const StreamingDiarizationSegment &)>;
 
-// Live speaker-diarization session. Phase 11.11.1 implementation:
-// sliding history window + per-chunk diarize(). Each feed_pcm_*()
-// pushes audio into a ring; whenever chunk_ms of new audio has arrived,
-// the engine runs Sortformer over the last `history_ms` of audio,
-// emits segments that overlap the new chunk's time range, and slides
-// the chunk pointer forward.
-//
-// Limitation (Phase 11.11.1): speaker IDs are derived from each
-// per-chunk diarize() call independently and may shift slowly across
-// chunks until the history window is full. With history_ms >> chunk_ms
-// the IDs stabilise quickly. Phase 11.11.2 will add proper NeMo-style
-// spkcache compression for fully stable cross-chunk speaker identity.
+// Live Sortformer session: ring buffer, periodic diarize over trailing history_ms,
+// segments overlapping the new audio window. Speaker ids come from each chunk pass and can
+// drift slightly until the history buffer is filled; larger history_ms stabilizes sooner.
 class PARAKEET_API SortformerStreamSession {
 public:
     struct Impl;

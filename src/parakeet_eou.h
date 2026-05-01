@@ -1,35 +1,10 @@
 #pragma once
 
-// Parakeet-EOU (FastConformer-RNN-T 120M with end-of-utterance token).
+// EOU (end-of-utterance) RNN-T decoder: joint emits `<EOU>` / `<EOB>` alongside speech tokens.
 //
-// EOU is a streaming-trained ASR model that emits a special `<EOU>`
-// token in the joint network's output vocabulary at end-of-utterance.
-// Architecture (parakeet_realtime_eou_120m-v1):
-//   - Encoder: cache-aware FastConformer, 17 layers, d_model=512,
-//              att_context_size=[70, 1] (chunked-limited),
-//              causal_downsampling + causal conv module + LayerNorm in
-//              the conv module. (Encoder graph lives in parakeet_ctc.cpp;
-//              the LN-in-conv + causal-conv switches are gated by the
-//              GGUF metadata loaded into EncoderConfig.)
-//   - Predictor: 1-layer LSTM, hidden=640, vocab=1026 (1024 BPE +
-//                <EOU> + <EOB>), embedding (1027, 640) including the
-//                blank-as-pad slot at index 1026.
-//   - Joint:  enc_proj(512->640) + pred_proj(640->640) + ReLU +
-//             out(640 -> 1027 = 1026 vocab + 1 blank).
-//   - Greedy decode: per encoder frame, emit at most
-//             `max_symbols_per_step` symbols (default 5, configurable
-//             via parakeet.eou.max_symbols_per_step in GGUF metadata);
-//             `<blank>` advances the encoder, `<EOU>` flushes the
-//             current utterance segment with a `\n` separator and
-//             resets LSTM h/c to zero; `<EOB>` is treated as a
-//             no-op block boundary and skipped.
-//
-// Weights live in the loaded ParakeetCtcModel (EouWeights struct, see
-// parakeet_ctc.h) as ggml_tensor pointers. They are dequantized into
-// std::vector<float> once at Engine load time via
-// `eou_prepare_runtime`. The runtime layout mirrors TDT's so the same
-// `gemv_f32` / `lstm_step` style helpers can be reused -- with one
-// LSTM layer instead of two and no duration head.
+// Single-layer predictor LSTM, joint network, and greedy decode with per-frame symbol caps.
+// Encoder topology (cache-aware FastConformer, LayerNorm-in-conv when metadata says so) is in
+// parakeet_ctc.cpp; weights are dequantized at load into host buffers for the CPU decode path.
 
 #include "parakeet_ctc.h"
 #include "parakeet_tdt.h"

@@ -1,43 +1,20 @@
 #pragma once
 
-// Persistent Parakeet engine -- CTC, TDT, EOU and Sortformer behind
-// one umbrella.
+// Loaded GGUF inference: transcribe, stream, diarize, and backend metadata behind one Engine class.
 //
-// Loads the GGUF once and keeps the preprocessor filterbank + encoder
-// weights + decoder (CTC head, TDT/EOU prediction+joint, or Sortformer
-// transformer+head) + tokenizer (when applicable) + backend resident so
-// subsequent calls pay only the mel extraction + encoder + decode cost.
-// The Engine class auto-detects the model type at load time and
-// dispatches to the right decoder; consumers see a single uniform API
-// across all four engine families.
+// Loads weights once; subsequent calls pay mel + encoder + decode only. Model kind (CTC, TDT,
+// EOU, Sortformer) comes from GGUF metadata.
 //
-// Transcription entry points (CTC, TDT, EOU GGUFs):
+// Transcription:
+//   - transcribe / transcribe_samples — one-shot wav or PCM to text.
+//   - transcribe_stream — full audio up front; segments via callback (offline encoder, chunked output).
+//   - stream_start — push PCM over time with left/right context windows (live streaming).
 //
-//   1. transcribe()                - full audio in, full text out (one-shot).
-//   2. transcribe_stream()         - Mode 2: full audio in up front, segments
-//                                    streamed out via callback as they're
-//                                    produced. Zero accuracy delta vs
-//                                    transcribe().
-//   3. stream_start() -> StreamSession
-//                                  - Mode 3: true duplex push API. Caller
-//                                    pushes PCM over time via feed_pcm_*;
-//                                    each chunk runs cache-aware inference
-//                                    over [left_context + chunk +
-//                                    right_lookahead] using the existing
-//                                    offline-trained GGUF (Phase 8). No
-//                                    new model checkpoint is required.
+// Diarization (Sortformer GGUFs):
+//   - diarize / diarize_samples — offline segments + speaker_probs.
+//   - diarize_start — sliding-history streaming diarization (push PCM).
 //
-// Diarization entry points (Sortformer GGUFs):
-//
-//   4. diarize()                   - full audio in, list of {speaker, start,
-//                                    end} segments out.
-//   5. diarize_start() -> SortformerStreamSession
-//                                  - Phase 11.11.1 sliding-history live
-//                                    diarization push API.
-//
-// Combined ASR + diarization is exposed as a free function in
-// <parakeet/attributed.h>:
-//   `transcribe_with_speakers(sortformer_engine, asr_engine, ...)`.
+// Combined ASR + diarization: transcribe_with_speakers in <parakeet/attributed.h>.
 //
 // Usage (transcription):
 //
@@ -84,8 +61,6 @@
 //     `is_final=true` terminator is not emitted (Sortformer), and the
 //     final partial-chunk tail segment is not emitted (CTC/TDT
 //     Mode 3). Always call `finalize()` if you care about those.
-//
-// Implementation in src/parakeet_engine.cpp.
 
 #include "export.h"
 #include "streaming.h"
@@ -200,10 +175,8 @@ public:
                                       int sample_rate,
                                       const DiarizationOptions & opts = {});
 
-    // Live diarization session. Throws if the loaded GGUF is not a
-    // Sortformer model. See SortformerStreamSession for the limitation
-    // on cross-chunk speaker-ID stability in this Phase 11.11.1
-    // implementation.
+    // Live Sortformer session (push PCM). See SortformerStreamSession for how speaker
+    // IDs behave across overlapping chunk passes.
     std::unique_ptr<SortformerStreamSession> diarize_start(
         const SortformerStreamingOptions & opts,
         SortformerSegmentCallback on_segment);

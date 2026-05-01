@@ -1,12 +1,8 @@
 #pragma once
 
-// Sortformer (4-speaker offline diarization) decoder/head.
+// Sortformer diarization head: encoder projection, transformer stack, sigmoid speaker logits.
 //
-// Builds a ggml compute graph for the full Sortformer head and dispatches
-// it through `ggml_backend_graph_compute`, so the computation runs on
-// whatever backend the model was loaded into (Vulkan, CUDA, Metal, or CPU).
-//
-// Pipeline:
+// Data flow (ggml graph on the model backend):
 //
 //   encoder_out (T, D_enc)
 //     -> encoder_proj  : Linear(D_enc -> tf_d)

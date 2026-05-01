@@ -1,25 +1,14 @@
 #pragma once
 
-// Parakeet-TDT (Token-and-Duration Transducer) decoder.
+// TDT (token-and-duration transducer) decoder on FastConformer encoder output (run_encoder).
 //
-// The TDT decoder runs on top of the existing Conformer encoder output
-// exposed by run_encoder() (EncoderOutputs::encoder_out, shape [T_enc, D_enc]).
+// Prediction LSTM, joint MLP, duration head, and greedy decode over encoder frames.
+// GPU paths run per-step ops as ggml graphs on the loaded backend; CPU decode uses
+// host GEMV/LSTM with weights prepared at load time.
 //
-// Architecture (parakeet-tdt-0.6b-v3):
-//   - Prediction network: 2-layer LSTM, hidden=640, vocab=8192 (+ blank_as_pad)
-//   - Joint network:      enc_proj(1024->640) + pred_proj(640->640) + ReLU +
-//                         out(640 -> 8192 + 1 blank + 5 durations = 8198)
-//   - Greedy decode:      TDT loop that advances encoder frame pointer by the
-//                         predicted duration each step (durations typically
-//                         [0,1,2,3,4]), emits non-blank tokens, updates LSTM
-//                         state on each non-blank emission.
-//
-// Phase 13 (TDT decoder Metal port): the per-step LSTM, joint and the
-// full-window encoder-side projection now run as ggml graphs on the model's
-// active backend (Metal / CUDA / Vulkan / CPU), reusing the GGUF-resident
-// quantised weights directly. `TdtRuntimeWeights` therefore holds graph
-// scaffolding rather than dequantised host vectors. See parakeet_tdt.cpp for
-// the graph topology.
+// Typical layout (e.g. parakeet-tdt-0.6b-v3): 2-layer LSTM (hidden 640), joint with
+// enc/pred projections and duration logits, greedy loop advancing the encoder index
+// by predicted duration.
 
 #include "parakeet_ctc.h"
 
@@ -86,19 +75,13 @@ struct TdtRuntimeWeights {
     // ---- GPU graph scaffolding (populated only when use_graphs) ----
     ggml_context * gctx = nullptr;
 
-    // Phase 14 — Persistent decoder state on the backend.
+    // Persistent decoder state on the GPU backend (Metal/CUDA/Vulkan).
     //
-    // Each emission step on Metal is dominated by command-buffer commit +
-    // wait latency (~150 us / compute_graph). Phase 13 ran two compute_graph
-    // calls per non-blank step (joint, then LSTM) and one per blank step;
-    // the joint readback was 32 KB but the dispatch floor was the real
-    // cost.
-    //
-    // Phase 14 keeps `h`, `c`, `pred` and the full-window `enc_proj` resident
-    // in `persist_buffer`, plumbs them as in-graph inputs/outputs via
-    // ggml_cpy, and adds a fused `g_lstm_joint` graph used after a non-blank
-    // emission (LSTM update + joint forward in one commit). Net effect:
-    // 247 + 95 = 342 commits drops to 247 + 1, saving ~95 commits per call.
+    // Each emission step pays command-buffer submit/wait overhead; splitting
+    // joint and LSTM into separate graphs per step doubled that cost. Here
+    // h, c, pred, and full-window enc_proj stay in persist_buffer, wired with
+    // ggml_cpy, plus a fused `g_lstm_joint` graph after non-blank emissions
+    // so LSTM update and joint run in one graph commit when possible.
     ggml_context *           persist_ctx    = nullptr;
     ggml_backend_buffer_t    persist_buffer = nullptr;
     ggml_tensor *            h_persist        = nullptr;  // [H_pred, L]

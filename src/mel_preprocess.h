@@ -1,12 +1,8 @@
 #pragma once
 
-// 16 kHz wav -> 80-channel log-mel spectrogram with per-feature (per-bin)
-// CMVN, matching NeMo's AudioToMelSpectrogramPreprocessor.  The mel
-// filterbank is loaded from a GGUF tensor (bit-exact with NeMo) rather
-// than recomputed in C++, so parity with the PyTorch reference is
-// independent of whatever Slaney/HTK rounding the local libm does.
+// Log-mel preprocessing: STFT, mel filterbank from GGUF, optional per-bin CMVN (NeMo-style).
 //
-// Implementation in src/mel_preprocess.cpp.
+// Filterbank weights come from the checkpoint so mel matches training without recomputing bins in C++.
 
 #include <cstddef>
 #include <cstdint>

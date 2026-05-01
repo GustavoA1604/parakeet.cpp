@@ -1,9 +1,6 @@
 #pragma once
 
-// Phase 13 -- minimal energy-VAD fallback for ASR streaming sessions whose
-// underlying engine has no native VAD source (CTC, TDT). EOU has its own
-// `<EOU>` end-of-turn signal and Sortformer has its any-speaker-prob signal;
-// neither uses this class.
+// RMS energy voice-activity detector for streaming when the model has no built-in VAD (e.g. CTC/TDT).
 //
 // Design:
 //   - Sliding RMS over a `window_ms` window of mono f32 PCM samples.

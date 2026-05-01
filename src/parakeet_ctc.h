@@ -1,9 +1,8 @@
 #pragma once
 
-// Parakeet-CTC model: GGUF loader + FastConformer encoder graph + CTC head
-// + greedy decoder.  Phase 1 wires the loader; phase 3 the encoder graph.
+// GGUF-backed FastConformer encoder: loader, ggml encoder graph, CTC head, greedy decode.
 //
-// Implementation in src/parakeet_ctc.cpp.
+// Holds shared configuration and tensor handles for CTC, TDT, EOU, and Sortformer GGUFs.
 
 #include "mel_preprocess.h"
 #include "sentencepiece_bpe.h"
@@ -38,10 +37,6 @@ namespace parakeet {
 //     same two dimensions; treat them as synonyms for `sortformer_fc_d_model`
 //     and `sortformer_tf_d_model` respectively.)
 //
-// A planned follow-up will split this into `EncoderConfig`,
-// `TdtConfig`, and `SortformerConfig` so that the encoder struct
-// stops carrying decoder-specific fields. See parakeet_ctc.h note on
-// `ParakeetModel`.
 // Conv-module normalisation in a Conformer block.
 //   - BatchNorm  -- pre-fused into (scale, shift) at convert time
 //                   (CTC, TDT, offline Sortformer). Inference graph is

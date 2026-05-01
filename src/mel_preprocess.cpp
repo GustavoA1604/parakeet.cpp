@@ -1,3 +1,5 @@
+// WAV load, Hann window, RFFT mel pipeline, MelState buffering for streaming.
+
 #include "mel_preprocess.h"
 #include "parakeet_log.h"
 

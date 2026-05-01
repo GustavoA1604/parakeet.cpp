@@ -1,3 +1,5 @@
+// TDT greedy decode, runtime weight prep, and ggml or CPU decoder paths.
+
 #include "parakeet_tdt.h"
 #include "parakeet_log.h"
 #include "sentencepiece_bpe.h"
@@ -907,15 +909,12 @@ int tdt_decode_window(const ParakeetCtcModel & model,
         state.carry_frames -= t;
     }
 
-    // Phase 15 state machine: when we just emitted a non-blank token, the
-    // *next* iteration must run the fused LSTM+joint graph (one commit)
-    // to update pred_persist before joint reads it. Blank emissions leave
-    // pred_persist untouched, so the next iteration uses joint-only.
+    // After a non-blank emission the next iteration runs the fused LSTM+joint
+    // graph so pred_persist is updated before the joint reads it. Blank steps
+    // leave pred_persist unchanged (joint-only graph next).
     //
-    // GPU path returns token + dur argmax i32 indices straight from the
-    // graph (8 B per step instead of V_out * 4 B logits readback); CPU
-    // fallback path stays scalar argmax over the full host-side logits
-    // buffer.
+    // GPU path returns token + duration argmax indices from the graph; CPU
+    // fallback argmaxes full host logits.
     int  pending_lstm_token = -1;  // < 0 means "no pending LSTM update"
     while (t < n_frames) {
         int best_token = 0;

@@ -1,3 +1,5 @@
+// BPE detokenize(): merges pieces, SentencePiece space markers, strips specials.
+
 #include "sentencepiece_bpe.h"
 
 #include <string>

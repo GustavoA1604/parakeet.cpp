@@ -1,3 +1,5 @@
+// Sliding-window RMS, hangover state machine, transition timestamps.
+
 #include "energy_vad.h"
 
 #include <algorithm>

@@ -1,23 +1,8 @@
 #pragma once
 
-// Host-supplied log sink for libparakeet.
+// Install a ggml_log_callback for libparakeet; nullptr restores stderr.
 //
-// `parakeet_log_set` mirrors `llama_log_set` from the
-// qvac-fabric-llm.cpp sibling so addons can demux every (level, text)
-// emission from libparakeet into their own structured logging
-// without scraping stderr. Pass `cb = nullptr` to revert to the default
-// sink (stderr).
-//
-// The signature is `ggml_log_callback`, the same one `ggml_log_set`
-// already accepts, so a single host shim can fan one log pipe out
-// across both libraries (and the bundled ggml itself). Default is no
-// callback installed (stderr fallback), matching pre-shim behaviour
-// byte-for-byte.
-//
-// `ggml.h` is intentionally exposed in this header: the callback
-// signature is owned by ggml, hosts wiring up logging will have ggml
-// available anyway, and decoupling the signature would force every
-// consumer to write a trampoline. Same shape as whisper.cpp / llama.cpp.
+// Also forwards to ggml_log_set so ggml and parakeet share one sink. Uses ggml.h types.
 
 #include "export.h"
 

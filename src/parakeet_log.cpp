@@ -1,3 +1,5 @@
+// log_impl and log_set_callback; installs hook and forwards to ggml_log_set.
+
 #include "parakeet_log.h"
 
 #include "parakeet/log.h"
@@ -20,11 +22,6 @@ void * g_user_data = nullptr;
 void log_set_callback(ggml_log_callback cb, void * user_data) {
     g_user_data = user_data;
     g_callback.store(cb, std::memory_order_release);
-    // Forward to ggml so its backend / scheduler diagnostics flow
-    // through the same hook the consumer just installed. Mirrors
-    // `llama_log_set` in the qvac-fabric-llm.cpp sibling: a single
-    // host callback fans out to logs from both libraries (and
-    // ggml's internal layer) without scraping stderr.
     ggml_log_set(cb, user_data);
 }
 

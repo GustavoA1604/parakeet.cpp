@@ -1,3 +1,5 @@
+// Sortformer ggml graph build, speaker probabilities, and thresholded segments.
+
 #include "parakeet_sortformer.h"
 
 #include "ggml.h"

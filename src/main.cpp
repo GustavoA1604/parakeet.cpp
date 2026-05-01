@@ -1,3 +1,5 @@
+// CLI executable: flags, WAV/model paths, transcribe/diarize/streaming modes.
+
 #include "parakeet/cli.h"
 #include "parakeet/engine.h"
 #include "parakeet/streaming.h"

@@ -1,3 +1,5 @@
+// EOU runtime preparation and greedy decoding.
+
 #include "parakeet_eou.h"
 #include "parakeet_log.h"
 #include "sentencepiece_bpe.h"

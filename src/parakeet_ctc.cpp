@@ -1,3 +1,5 @@
+// FastConformer encoder ggml graph, GGUF load, CTC head, and encoder execution.
+
 #include "parakeet_ctc.h"
 #include "parakeet_log.h"
 
@@ -496,18 +498,10 @@ int load_from_gguf(const std::string & gguf_path,
     out_model.subsampling.out_w      = require_tensor(impl->ctx, "encoder.subsampling.out.weight");
     out_model.subsampling.out_b      = maybe_tensor(impl->ctx, "encoder.subsampling.out.bias");
 
-    // Phase 15.7: gate the converter-side pre-stacked encoder.blk.*.attn.qkv
-    // weight on backend.  The wider M=3 * n_embd mat-mul wins on backends
-    // where the un-stacked Q / K / V mat-muls under-saturate the GPU's
-    // tile grid (predicted: CUDA / Vulkan with higher per-dispatch overhead
-    // and proportionally smaller per-SM tile counts than Apple Silicon),
-    // and is measured neutral-to-slightly-bad on Apple Metal where the
-    // un-stacked path already saturates the 60-core M3 Ultra in one tile
-    // wave at M=1024 / T=252.
-    //
-    // CPU stays un-stacked unconditionally: ggml-cpu's per-kernel dispatch
-    // is essentially free, the wider mat-mul drops cache locality, and the
-    // qkv weight would otherwise just bloat the working set.
+    // Use converter-pre-stacked encoder.blk.*.attn.qkv on GPU when the wide
+    // M=3*n_embd matmul helps; keep unstacked Q/K/V on CPU for cache locality.
+    // (Heuristic: stacked wins where separate matmuls under-fill the device;
+    // Metal stays unstacked here.)
     const bool gate_qkv_stack =
         impl->backend_active &&
         !ggml_backend_is_cpu(impl->backend_active)

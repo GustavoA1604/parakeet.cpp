@@ -1,15 +1,8 @@
 #pragma once
 
-// Minimal SentencePiece BPE detokenizer for Parakeet-CTC.
+// SentencePiece-style BPE detokenizer: maps token IDs from GGUF vocab tables to UTF-8 text.
 //
-// The SentencePiece model file is embedded into the GGUF as
-// `tokenizer.ggml.model_type = "sentencepiece"` + `tokenizer.ggml.pieces`
-// + `tokenizer.ggml.scores` + `tokenizer.ggml.piece_types` arrays
-// (same schema used by llama.cpp).  For CTC, we only need the reverse
-// direction (id -> text), so this file implements just that: given a
-// decoded sequence of token ids, emit the NeMo-equivalent transcription.
-//
-// Implementation in src/sentencepiece_bpe.cpp.
+// Consumes piece strings and special IDs loaded from GGUF (llama.cpp-compatible tokenizer blocks).
 
 #include <cstdint>
 #include <string>

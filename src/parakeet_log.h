@@ -1,17 +1,6 @@
 #pragma once
 
-// Internal logging shim for parakeet.
-//
-// Routes diagnostic output through a host-supplied `ggml_log_callback`
-// when one has been installed via `parakeet_log_set` (declared in
-// the public umbrella header). When no callback is installed the
-// shim falls through to `std::fprintf(stderr, ...)` so existing
-// standalone CLI / examples behave exactly as before.
-//
-// Mirrors the shape `qvac-fabric-llm.cpp` (llama_log_set) ships --
-// addons hosting libparakeet alongside libllama can pin one
-// callback per library and demux the output into structured logs
-// (level + text), with no buffering or locking inside the library.
+// Logging: optional ggml-style callback or stderr; macros PARAKEET_LOG_*.
 
 #include "ggml.h"
 

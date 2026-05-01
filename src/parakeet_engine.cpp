@@ -1,3 +1,5 @@
+// Engine: GGUF load, transcribe, streaming sessions, diarization, timing and options.
+
 #include "parakeet/engine.h"
 #include "parakeet/streaming.h"
 #include "parakeet/diarization.h"
@@ -478,8 +480,7 @@ EngineResult Engine::transcribe_samples_stream(const float * samples,
             on_segment(seg);
         }
 
-        // Phase 13: EOU sessions also emit `EndOfTurn` events out of
-        // Mode 2, mirroring the Mode 3 wiring in `process_window`.
+        // EOU Mode 2: emit EndOfTurn when EOU boundaries appear in this chunk (same idea as Mode 3).
         if (opts.on_event && eou_boundaries_in_chunk > 0) {
             StreamEvent ev;
             ev.type           = StreamEventType::EndOfTurn;
@@ -732,8 +733,7 @@ struct StreamSession::Impl {
     bool finalized = false;
     bool cancelled = false;
 
-    // Phase 13 -- energy-VAD fallback for CTC/TDT (only constructed if
-    // opts.enable_energy_vad and the engine has no native VAD source).
+    // Optional EnergyVad for CTC/TDT when enable_energy_vad and no native VAD exists.
     std::unique_ptr<EnergyVad> energy_vad;
     int64_t total_pcm_seen = 0;
 
@@ -870,11 +870,7 @@ void StreamSession::Impl::process_window(const float * window_samples, int windo
         on_segment(seg);
     }
 
-    // Phase 13: fire `EndOfTurn` event(s) for EOU sessions when the
-    // decoder emitted at least one `<EOU>` token in this chunk. Confidence
-    // is fixed at 1.0 because the model emitted the boundary token (a
-    // discrete signal); future engines (e.g. whisper.cpp's NER-style
-    // turn-detection heuristic) will populate a real 0..1 confidence.
+    // EOU: EndOfTurn when `<EOU>` appears this chunk. Confidence is 1.0 for this discrete signal.
     if (opts.on_event && eou_boundaries_in_chunk > 0) {
         StreamEvent ev;
         ev.type           = StreamEventType::EndOfTurn;
@@ -951,9 +947,7 @@ const StreamingOptions & StreamSession::options() const {
     return pimpl_->opts;
 }
 
-// Phase 13 helper: feed `n_samples` of f32 PCM into the energy-VAD (if any)
-// and fire a single `VadStateChanged` event when its state transitions.
-// `start_sample` is the absolute sample index where these samples begin.
+// Feed PCM into optional EnergyVad and emit VadStateChanged when its state flips.
 static void stream_drive_energy_vad(StreamSession::Impl & impl,
                                     const float * samples, int n_samples,
                                     int64_t start_sample) {
@@ -1052,10 +1046,7 @@ std::unique_ptr<StreamSession> Engine::stream_start(const StreamingOptions & opt
     if (pimpl_->model.model_type == ParakeetModelType::TDT) {
         tdt_init_state(pimpl_->tdt_rt, (int) pimpl_->model.blank_id, impl->tdt_state);
     }
-    // Phase 13: spin up the energy-VAD only for engines without a native
-    // VAD source (CTC and TDT). EOU's `<EOU>` token already drives
-    // `OnEndOfTurn` directly out of `process_window`; Sortformer is
-    // handled by SortformerStreamSession, not StreamSession.
+    // Optional EnergyVad for CTC/TDT only (EOU uses `<EOU>`; Sortformer uses SortformerStreamSession).
     if (opts.enable_energy_vad &&
         pimpl_->model.model_type != ParakeetModelType::EOU) {
         impl->energy_vad = std::make_unique<EnergyVad>(
@@ -1090,10 +1081,8 @@ struct SortformerStreamSession::Impl {
 
     std::vector<StreamingDiarizationSegment> last_pending;
 
-    // Phase 13 -- VAD state tracking across chunks. We treat
-    // `max(speaker_probs) > opts.threshold` (the same threshold the
-    // diarization head uses) as the speaking signal. Initial state is
-    // `Unknown` so the first chunk always produces a transition.
+    // Speaking vs silent from Sortformer probs: max probability above opts.threshold.
+    // Initial Unknown forces a transition on the first chunk.
     VadState vad_state = VadState::Unknown;
 
     void try_emit_chunks();
@@ -1153,12 +1142,8 @@ void SortformerStreamSession::Impl::process_chunk(int64_t window_start_sample,
     }
     last_pending = std::move(emitted);
 
-    // Phase 13: per-chunk VAD state from the speaker-prob tensor. A frame
-    // is "speaking" iff any speaker's prob exceeds opts.threshold; the
-    // chunk is "speaking" iff at least one frame in the *emit* range
-    // (not the full window, which can include carry-over from earlier
-    // history) is speaking. The dominant speaker is the argmax across
-    // the speaker dimension of the per-chunk-mean probability.
+    // VadStateChanged from speaker_probs: a frame speaks if any speaker exceeds threshold;
+    // the chunk speaks if any emitting-frame qualifies; dominant speaker from mean probs.
     if (opts.on_event) {
         const int num_spks = diar.num_spks;
         const int n_frames = diar.n_frames;

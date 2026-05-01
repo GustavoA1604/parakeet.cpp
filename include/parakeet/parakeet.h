@@ -1,9 +1,6 @@
 #pragma once
 
-// Top-level Parakeet library aggregator.
-//
-// Single-include convenience header; each per-concern header is also
-// usable directly when consumers want to be selective:
+// Umbrella include for libparakeet (each header below can also be included alone).
 //
 //   <parakeet/export.h>      - PARAKEET_API visibility macro
 //   <parakeet/cli.h>         - parakeet_cli_main C entry point
@@ -29,8 +26,7 @@
 //     punctuation and capitalisation, RNN-T (LSTM prediction + joint MLP)
 //   - Parakeet-EOU 120M (`parakeet_realtime_eou_120m-v1`) -- low-latency
 //     streaming ASR with native `<EOU>` end-of-utterance token
-//   - Sortformer 4spk v1 / v2 -- 4-speaker diarization (offline; v2 also
-//     has Phase 11.11.1 sliding-history live streaming)
+//   - Sortformer 4-spk — offline diarization; v2 adds sliding-history streaming.
 
 #include "export.h"
 #include "cli.h"
